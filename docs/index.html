@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aura — Cognitive Memory for AI Agents</title>
+    <meta name="description" content="Pure Rust memory SDK for AI agents. No LLM required. No embeddings. 2.7 MB binary. Works offline.">
+    <style>
+        :root {
+            --bg: #0a0a0f;
+            --surface: #12121a;
+            --border: #1e1e2e;
+            --text: #e0e0e8;
+            --text-dim: #8888a0;
+            --accent: #6c63ff;
+            --accent-glow: rgba(108, 99, 255, 0.15);
+            --green: #4ade80;
+            --red: #f87171;
+            --orange: #fb923c;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+        }
+        .container { max-width: 960px; margin: 0 auto; padding: 0 24px; }
+
+        /* Hero */
+        .hero {
+            padding: 80px 0 60px;
+            text-align: center;
+        }
+        .hero h1 {
+            font-size: 3.5rem;
+            font-weight: 700;
+            letter-spacing: -0.03em;
+            margin-bottom: 16px;
+        }
+        .hero h1 span { color: var(--accent); }
+        .hero .subtitle {
+            font-size: 1.25rem;
+            color: var(--text-dim);
+            max-width: 600px;
+            margin: 0 auto 32px;
+        }
+        .hero-stats {
+            display: flex;
+            justify-content: center;
+            gap: 40px;
+            margin-bottom: 40px;
+            flex-wrap: wrap;
+        }
+        .stat {
+            text-align: center;
+        }
+        .stat .number {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--accent);
+            font-variant-numeric: tabular-nums;
+        }
+        .stat .label {
+            font-size: 0.85rem;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .cta-row {
+            display: flex;
+            justify-content: center;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+        .btn {
+            display: inline-block;
+            padding: 12px 28px;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.2s;
+        }
+        .btn-primary {
+            background: var(--accent);
+            color: #fff;
+        }
+        .btn-primary:hover { filter: brightness(1.15); }
+        .btn-secondary {
+            background: var(--surface);
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+        .btn-secondary:hover { border-color: var(--accent); }
+
+        /* Code block */
+        .code-section {
+            padding: 40px 0;
+        }
+        pre {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            overflow-x: auto;
+            font-size: 0.9rem;
+            line-height: 1.7;
+            font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+        }
+        .kw { color: #c792ea; }
+        .fn { color: #82aaff; }
+        .str { color: #c3e88d; }
+        .cmt { color: #546e7a; }
+        .num { color: #f78c6c; }
+
+        /* Comparison table */
+        .compare {
+            padding: 60px 0;
+        }
+        .compare h2 {
+            font-size: 2rem;
+            text-align: center;
+            margin-bottom: 8px;
+        }
+        .compare .sub {
+            text-align: center;
+            color: var(--text-dim);
+            margin-bottom: 32px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+        }
+        th, td {
+            padding: 12px 16px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+        th {
+            color: var(--text-dim);
+            font-weight: 500;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        td:first-child { font-weight: 600; }
+        .yes { color: var(--green); }
+        .no { color: var(--red); }
+        .partial { color: var(--orange); }
+        .highlight-col {
+            background: var(--accent-glow);
+        }
+
+        /* Features grid */
+        .features {
+            padding: 60px 0;
+        }
+        .features h2 {
+            font-size: 2rem;
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+        }
+        .feature-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+        }
+        .feature-card h3 {
+            font-size: 1.05rem;
+            margin-bottom: 8px;
+        }
+        .feature-card p {
+            color: var(--text-dim);
+            font-size: 0.9rem;
+        }
+
+        /* Performance */
+        .perf {
+            padding: 60px 0;
+        }
+        .perf h2 {
+            font-size: 2rem;
+            text-align: center;
+            margin-bottom: 8px;
+        }
+        .perf .sub {
+            text-align: center;
+            color: var(--text-dim);
+            margin-bottom: 32px;
+        }
+        .perf-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+        }
+        .perf-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            text-align: center;
+        }
+        .perf-card .value {
+            font-size: 1.8rem;
+            font-weight: 700;
+            color: var(--accent);
+            font-variant-numeric: tabular-nums;
+        }
+        .perf-card .metric {
+            font-size: 0.85rem;
+            color: var(--text-dim);
+        }
+
+        /* Use cases */
+        .usecases {
+            padding: 60px 0;
+        }
+        .usecases h2 {
+            font-size: 2rem;
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        .usecase-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+        }
+        .usecase-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+        }
+        .usecase-card h3 {
+            margin-bottom: 8px;
+        }
+        .usecase-card p {
+            color: var(--text-dim);
+            font-size: 0.9rem;
+        }
+        .usecase-card code {
+            display: block;
+            margin-top: 12px;
+            background: var(--bg);
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--green);
+        }
+
+        /* Footer */
+        .footer {
+            padding: 40px 0;
+            text-align: center;
+            color: var(--text-dim);
+            font-size: 0.85rem;
+            border-top: 1px solid var(--border);
+        }
+        .footer a { color: var(--accent); text-decoration: none; }
+        .footer a:hover { text-decoration: underline; }
+
+        /* Install banner */
+        .install {
+            padding: 60px 0;
+            text-align: center;
+        }
+        .install-cmd {
+            display: inline-block;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px 32px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.2rem;
+            color: var(--green);
+            letter-spacing: 0.02em;
+        }
+        .install p {
+            color: var(--text-dim);
+            margin-top: 12px;
+            font-size: 0.9rem;
+        }
+
+        @media (max-width: 640px) {
+            .hero h1 { font-size: 2.2rem; }
+            .hero-stats { gap: 24px; }
+            .stat .number { font-size: 1.5rem; }
+        }
+    </style>
+</head>
+<body>
+
+<section class="hero">
+    <div class="container">
+        <h1><span>Aura</span></h1>
+        <p class="subtitle">Cognitive memory for AI agents. Pure Rust, no embeddings required. One pip install, works offline, 2.7 MB.</p>
+        <div class="hero-stats">
+            <div class="stat">
+                <div class="number">&lt;1ms</div>
+                <div class="label">Recall latency</div>
+            </div>
+            <div class="stat">
+                <div class="number">2.7 MB</div>
+                <div class="label">Binary size</div>
+            </div>
+            <div class="stat">
+                <div class="number">$0</div>
+                <div class="label">Per operation</div>
+            </div>
+            <div class="stat">
+                <div class="number">225+</div>
+                <div class="label">Tests passing</div>
+            </div>
+        </div>
+        <div class="cta-row">
+            <a href="https://github.com/teolex2020/AuraSDK" class="btn btn-primary">GitHub</a>
+            <a href="https://github.com/teolex2020/AuraSDK/blob/main/docs/API.md" class="btn btn-secondary">API Docs</a>
+        </div>
+    </div>
+</section>
+
+<section class="code-section">
+    <div class="container">
+<pre><span class="kw">from</span> aura <span class="kw">import</span> Aura, Level
+
+brain = Aura(<span class="str">"./my_agent"</span>)
+
+<span class="cmt"># Store memories at different importance levels</span>
+brain.store(<span class="str">"User prefers dark mode"</span>, level=Level.Identity, tags=[<span class="str">"preference"</span>])
+brain.store(<span class="str">"Deploy to staging first"</span>, level=Level.Decisions, tags=[<span class="str">"workflow"</span>])
+
+<span class="cmt"># Recall with RRF Fusion (no LLM, no embeddings, no network)</span>
+context = brain.recall(<span class="str">"deployment workflow"</span>, token_budget=<span class="num">2000</span>)
+
+<span class="cmt"># Inject into LLM system prompt</span>
+response = llm.chat(system=<span class="str">f"You have memory:\n{context}"</span>, user=message)</pre>
+    </div>
+</section>
+
+<section class="compare">
+    <div class="container">
+        <h2>How Aura compares</h2>
+        <p class="sub">The only memory SDK that works without LLM calls or embedding APIs</p>
+        <table>
+            <thead>
+                <tr>
+                    <th></th>
+                    <th class="highlight-col">Aura</th>
+                    <th>Mem0</th>
+                    <th>Zep</th>
+                    <th>Letta</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>LLM required</td>
+                    <td class="highlight-col yes">No</td>
+                    <td class="no">Yes</td>
+                    <td class="no">Yes</td>
+                    <td class="no">Yes</td>
+                </tr>
+                <tr>
+                    <td>Embedding model</td>
+                    <td class="highlight-col yes">Optional</td>
+                    <td class="no">Required</td>
+                    <td class="no">Required</td>
+                    <td class="partial">No</td>
+                </tr>
+                <tr>
+                    <td>Works offline</td>
+                    <td class="highlight-col yes">Yes</td>
+                    <td class="partial">Partial</td>
+                    <td class="no">No</td>
+                    <td class="partial">With local LLM</td>
+                </tr>
+                <tr>
+                    <td>Recall latency</td>
+                    <td class="highlight-col yes">&lt;1ms</td>
+                    <td>~200ms+</td>
+                    <td>~200ms</td>
+                    <td>LLM-bound</td>
+                </tr>
+                <tr>
+                    <td>Cost per operation</td>
+                    <td class="highlight-col yes">$0</td>
+                    <td>API billing</td>
+                    <td>Credits</td>
+                    <td>LLM cost</td>
+                </tr>
+                <tr>
+                    <td>Memory decay/promote</td>
+                    <td class="highlight-col yes">Built-in</td>
+                    <td class="no">Via LLM</td>
+                    <td class="no">Via LLM</td>
+                    <td class="no">Via LLM</td>
+                </tr>
+                <tr>
+                    <td>Trust scoring</td>
+                    <td class="highlight-col yes">Built-in</td>
+                    <td class="no">No</td>
+                    <td class="no">No</td>
+                    <td class="no">No</td>
+                </tr>
+                <tr>
+                    <td>Encryption at rest</td>
+                    <td class="highlight-col yes">ChaCha20</td>
+                    <td class="no">No</td>
+                    <td class="no">No</td>
+                    <td class="no">No</td>
+                </tr>
+                <tr>
+                    <td>Language</td>
+                    <td class="highlight-col">Rust</td>
+                    <td>Python</td>
+                    <td>Proprietary</td>
+                    <td>Python</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<section class="features">
+    <div class="container">
+        <h2>Built for real agents</h2>
+        <div class="feature-grid">
+            <div class="feature-card">
+                <h3>RRF Fusion Recall</h3>
+                <p>4 parallel ranked lists (SDR + MinHash + Tag Jaccard + optional embeddings) fused with Reciprocal Rank Fusion, k=60. Graph walk expands results via typed connections.</p>
+            </div>
+            <div class="feature-card">
+                <h3>Living Memory</h3>
+                <p>8-phase background maintenance: decay, reflection, insights, consolidation, cross-connections, archival, health check, persistence. No LLM needed for any phase.</p>
+            </div>
+            <div class="feature-card">
+                <h3>4-Level Hierarchy</h3>
+                <p>Working (0.80) &rarr; Decisions (0.90) &rarr; Domain (0.95) &rarr; Identity (0.99). Records promote on repeated access, demote through decay. Like human memory.</p>
+            </div>
+            <div class="feature-card">
+                <h3>Trust &amp; Provenance</h3>
+                <p>Source authority scoring with automatic provenance stamping. Credibility tracking for 60+ domains. Trust-weighted recall ranking.</p>
+            </div>
+            <div class="feature-card">
+                <h3>Auto-Protect Guards</h3>
+                <p>Regex-based PII detection: phone numbers, emails, crypto wallets, API keys, passwords. Automatic protective tagging prevents data loss during consolidation.</p>
+            </div>
+            <div class="feature-card">
+                <h3>Pluggable Embeddings</h3>
+                <p>Works without embeddings. Optionally plug in any embedding function (OpenAI, Ollama, sentence-transformers) as a 4th RRF signal for semantic boost.</p>
+            </div>
+            <div class="feature-card">
+                <h3>Typed Connections</h3>
+                <p>Causal, reflective, associative, coactivation links between memories. 2-hop graph walk with damping. Causal chain following for reasoning context.</p>
+            </div>
+            <div class="feature-card">
+                <h3>Research Orchestrator</h3>
+                <p>Start research projects, collect findings with source credibility, synthesize results. Built-in domain credibility scoring for 60+ sources.</p>
+            </div>
+            <div class="feature-card">
+                <h3>Circuit Breaker</h3>
+                <p>Per-tool failure tracking with automatic open/close. Prevents cascading failures when external tools go down. Built-in cooldown and health reporting.</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section class="perf">
+    <div class="container">
+        <h2>Performance</h2>
+        <p class="sub">Benchmarked with 1,000 records. Pure local computation, no network calls.</p>
+        <div class="perf-grid">
+            <div class="perf-card">
+                <div class="value">0.09ms</div>
+                <div class="metric">Store</div>
+            </div>
+            <div class="perf-card">
+                <div class="value">0.74ms</div>
+                <div class="metric">Recall (structured)</div>
+            </div>
+            <div class="perf-card">
+                <div class="value">0.48&micro;s</div>
+                <div class="metric">Recall (cached)</div>
+            </div>
+            <div class="perf-card">
+                <div class="value">0.01ms</div>
+                <div class="metric">Search by tag</div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section class="usecases">
+    <div class="container">
+        <h2>Use cases</h2>
+        <div class="usecase-grid">
+            <div class="usecase-card">
+                <h3>Local AI Assistant</h3>
+                <p>Aura + Ollama = fully local AI with persistent memory. No cloud, no API keys, no data leaves your machine.</p>
+                <code>pip install aura &amp;&amp; ollama pull llama3.2</code>
+            </div>
+            <div class="usecase-card">
+                <h3>Edge / IoT / Embedded</h3>
+                <p>2.7 MB binary with encryption. Smart home hubs, industrial sensors, medical devices, air-gapped systems.</p>
+                <code>brain = Aura("./data", password="key")</code>
+            </div>
+            <div class="usecase-card">
+                <h3>Multi-Agent Systems</h3>
+                <p>Each agent gets its own Aura brain. Trust scoring ensures agent-generated content is weighted differently from user input.</p>
+                <code>tc.source_trust = {"agent": 0.7, "user": 1.0}</code>
+            </div>
+            <div class="usecase-card">
+                <h3>Research &amp; Knowledge</h3>
+                <p>Research orchestrator with source credibility tracking. Collect findings from multiple sources, synthesize with trust weighting.</p>
+                <code>brain.start_research("Quantum Computing")</code>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section class="install">
+    <div class="container">
+        <div class="install-cmd">pip install aura</div>
+        <p>Python 3.9+ &middot; Linux, macOS, Windows &middot; Pre-built wheels &middot; MIT License</p>
+    </div>
+</section>
+
+<footer class="footer">
+    <div class="container">
+        <p>
+            <a href="https://github.com/teolex2020/AuraSDK">GitHub</a> &middot;
+            <a href="https://github.com/teolex2020/AuraSDK/blob/main/docs/API.md">API Docs</a> &middot;
+            <a href="https://github.com/teolex2020/AuraSDK/tree/main/examples">Examples</a>
+        </p>
+        <p style="margin-top: 8px;">Built with Rust. MIT License. &copy; 2025 AuraSDK.</p>
+    </div>
+</footer>
+
+</body>
+</html>

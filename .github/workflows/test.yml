@@ -1,0 +1,46 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-tests:
+    name: Rust Tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --features "encryption,audit"
+      - run: cargo clippy --features "encryption,audit" -- -D warnings
+        if: matrix.os == 'ubuntu-latest'
+
+  python-tests:
+    name: Python Integration Tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install maturin and test deps
+        run: pip install maturin pytest
+      - name: Build and install
+        run: maturin develop --features "pyo3/extension-module,encryption"
+      - name: Run Python tests
+        run: pytest tests/ -v
