@@ -91,6 +91,7 @@ pub struct Aura {
     embedding_fn: RwLock<Option<PyObject>>,
 
     // ── Config ──
+    #[allow(dead_code)]
     path: PathBuf,
 }
 
@@ -911,6 +912,7 @@ impl Aura {
 
     /// Collect embedding similarity signal for recall pipeline.
     /// Returns None if no embeddings are stored or no query embedding is available.
+    #[allow(unused_variables)]
     fn collect_embedding_signal(&self, _query: &str, top_k: usize) -> Option<Vec<(String, f32)>> {
         if !self.embedding_store.is_active() {
             return None;
