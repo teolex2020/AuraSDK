@@ -57,9 +57,7 @@ impl NGramIndex {
         let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
 
         if clean.len() < 3 {
-            if clean.len() == 2 {
-                return vec![Self::hash_str(&clean)];
-            } else if clean.len() == 1 {
+            if !clean.is_empty() {
                 return vec![Self::hash_str(&clean)];
             }
             return vec![];
@@ -96,10 +94,10 @@ impl NGramIndex {
         let mut sig = vec![u64::MAX; self.num_hashes];
 
         for &s in shingles {
-            for i in 0..self.num_hashes {
+            for (i, val) in sig.iter_mut().enumerate() {
                 let h = (self.a[i].wrapping_mul(s).wrapping_add(self.b[i])) % PRIME;
-                if h < sig[i] {
-                    sig[i] = h;
+                if h < *val {
+                    *val = h;
                 }
             }
         }

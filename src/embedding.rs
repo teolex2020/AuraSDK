@@ -40,6 +40,11 @@ impl EmbeddingStore {
         self.embeddings.read().len()
     }
 
+    /// Check if empty.
+    pub fn is_empty(&self) -> bool {
+        self.embeddings.read().is_empty()
+    }
+
     /// Find top-k most similar records to a query embedding via cosine similarity.
     pub fn query(&self, query_embedding: &[f32], top_k: usize) -> Vec<(String, f32)> {
         let store = self.embeddings.read();

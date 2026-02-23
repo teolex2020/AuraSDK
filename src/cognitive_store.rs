@@ -24,6 +24,7 @@ const SNAP_MAGIC: &[u8; 4] = b"CSN1";
 
 /// Append-only cognitive record storage with snapshot-accelerated loading.
 pub struct CognitiveStore {
+    #[allow(dead_code)]
     path: PathBuf,
     log_path: PathBuf,
     snap_path: PathBuf,

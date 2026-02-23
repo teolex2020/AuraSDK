@@ -64,9 +64,11 @@ pub struct Aura {
     tag_index: RwLock<HashMap<String, HashSet<String>>>,
     synonym_ring: RwLock<SynonymRing>,
     session_tracker: RwLock<SessionTracker>,
+    #[allow(dead_code)]
     learner: RwLock<Option<SemanticLearnerEngine>>,
 
     // ── Shared ──
+    #[allow(dead_code)]
     canonical: RwLock<Option<CanonicalProjector>>,
     encryption_key: Option<EncryptionKey>,
     audit_log: Option<AuditLog>,

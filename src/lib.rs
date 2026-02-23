@@ -12,6 +12,12 @@
 //! - `embedded` - Minimal footprint for IoT/Edge
 //! - `lite` - Reduced SDR resolution (16k bits vs 256k)
 
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::useless_conversion)]
+#![allow(clippy::redundant_guards)]
+
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 

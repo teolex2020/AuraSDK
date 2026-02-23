@@ -318,6 +318,7 @@ impl AuraStorage {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&file_path)?;
 
         let writer = Mutex::new(BufWriter::new(writer_file));
