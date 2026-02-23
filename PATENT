@@ -1,0 +1,35 @@
+PATENT NOTICE
+
+The core cognitive architecture of Aura is protected by a pending United States
+patent application:
+
+  Title:    Autonomous Dynamic Cognitive Memory Management System for Large
+            (LLM) and Small (SLM) Language Models
+  Application No.: US 63/969,703
+  Filed:    January 28, 2026
+  Inventor: Oleksandr Tepliuk
+  Status:   Patent Pending
+
+The patent covers the following architectural concepts:
+  - DNA Memory Layering (hierarchical memory partitioning)
+  - Cognitive Crystallization (autonomous memory promotion)
+  - Flash-Crystallization (interrupt-driven priority storage)
+  - Synaptic Synthesis (SDR-based semantic deduplication)
+  - Deterministic Low-Latency SDR Indexing (O(k) search complexity)
+  - Adaptive Kinetic Decay (entropy-weighted memory pruning)
+
+OPEN SOURCE LICENSE
+
+The Aura SDK source code is licensed under the MIT License (see LICENSE file).
+You are free to use, modify, and distribute the software under its terms for
+non-commercial, academic, research, and standard agent integration purposes.
+
+COMMERCIAL USE
+
+Commercial integration of the patented architectural concepts described above
+into enterprise products or competing memory systems requires a separate
+commercial license. Contact: aura@aurasdk.dev
+
+This notice does not restrict your rights under the MIT License for the
+software itself. It serves as notice of the patent rights in the underlying
+architecture and methods.

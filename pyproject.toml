@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "aura"
+version = "1.0.0"
+authors = [{name = "AuraSDK", email = "aura@aurasdk.dev"}]
+description = "Cognitive memory for AI agents. Pure Rust, no embeddings."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+keywords = ["ai", "memory", "cognitive", "llm", "agent", "rust"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://aurasdk.dev"
+Repository = "https://github.com/teolex2020/AuraSDK"
+Documentation = "https://github.com/teolex2020/AuraSDK/blob/main/docs/API.md"
+
+[tool.maturin]
+features = ["pyo3/extension-module", "encryption"]
+python-source = "python"
+module-name = "aura._core"

@@ -1,0 +1,55 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Aura data files
+*.aura
+*.aura.enc
+*.aura.bak
+*.aura.wal
+
+# Environment / secrets
+.env
+.env.local
+*.key
+*.pem
+
+# Test artifacts
+test_data/
+tmp/
+memory_data/
+
+# Internal docs (not for public)
+SPEC.md
+docs/LAUNCH.md
+
+# Claude Code local config
+.claude/

@@ -1,0 +1,180 @@
+//! Aura — Unified Cognitive Memory SDK
+//!
+//! A high-performance cognitive memory system for AI agents.
+//! Combines SDR-based retrieval with hierarchical decay and RRF Fusion recall.
+//!
+//! # Features
+//! - `full` - Complete feature set (default)
+//! - `python` - Python bindings via PyO3
+//! - `server` - HTTP/REST API server
+//! - `encryption` - ChaCha20-Poly1305 at-rest encryption
+//! - `sync` - P2P synchronization with CRDT merge
+//! - `embedded` - Minimal footprint for IoT/Edge
+//! - `lite` - Reduced SDR resolution (16k bits vs 256k)
+
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+
+// ── FROM aura-memory (already Rust) ──
+mod types;
+pub mod sdr;
+pub mod storage;
+pub mod index;
+mod salience;
+mod anchors;
+mod cortex;
+pub mod semantic;
+pub mod versioning;
+pub mod neuromorphic;
+pub mod federated;
+pub mod canonical;
+pub mod learner;
+pub mod backup;
+pub mod rbac;
+
+#[cfg(feature = "encryption")]
+pub mod crypto;
+
+#[cfg(not(feature = "encryption"))]
+pub mod crypto {
+    //! Crypto stub for builds without encryption
+    use anyhow::{anyhow, Result};
+
+    #[derive(Clone)]
+    pub struct EncryptionKey;
+
+    impl EncryptionKey {
+        pub fn generate() -> Self { Self }
+        pub fn from_password(_: &str, _: &[u8; 16]) -> Result<Self> {
+            Err(anyhow!("Encryption not enabled - rebuild with 'encryption' feature"))
+        }
+        pub fn as_bytes(&self) -> &[u8; 32] { &[0u8; 32] }
+        pub fn save_to_file(&self, _: &std::path::Path, _: &str) -> Result<()> {
+            Err(anyhow!("Encryption not enabled"))
+        }
+        pub fn load_from_file(_: &std::path::Path, _: &str) -> Result<Self> {
+            Err(anyhow!("Encryption not enabled"))
+        }
+    }
+
+    pub fn encrypt_data(_: &[u8], _: &EncryptionKey) -> Result<Vec<u8>> {
+        Err(anyhow!("Encryption not enabled"))
+    }
+    pub fn decrypt_data(_: &[u8], _: &EncryptionKey) -> Result<Vec<u8>> {
+        Err(anyhow!("Encryption not enabled"))
+    }
+}
+
+pub mod audit;
+pub mod tenant;
+
+pub mod sync {
+    //! Sync stub for builds without sync feature
+    use anyhow::{anyhow, Result};
+
+    #[derive(Clone, Debug, Default)]
+    pub struct SyncConfig;
+
+    pub struct SyncManager;
+
+    impl SyncManager {
+        pub async fn new(_: &str, _: SyncConfig) -> Result<Self> {
+            Err(anyhow!("Sync not enabled - rebuild with 'sync' feature"))
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+pub mod server;
+
+#[cfg(not(feature = "server"))]
+pub mod server {
+    //! Server stub for builds without server feature
+    use anyhow::{anyhow, Result};
+    pub fn start_server(_port: u16, _path: &str) -> Result<()> {
+        Err(anyhow!("Server not enabled - rebuild with 'server' feature"))
+    }
+}
+
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
+pub mod license;
+
+// ── FROM aura-cognitive (rewritten to Rust) ──
+pub mod levels;
+pub mod record;
+pub mod cognitive_store;
+pub mod ngram;
+pub mod synonym;
+pub mod graph;
+pub mod recall;
+pub mod insights;
+pub mod consolidation;
+pub mod semantic_learner;
+pub mod scheduler;
+pub mod retention;
+
+// ── SDK Wrapper (from brain_tools.py — generic parts) ──
+pub mod trust;
+pub mod guards;
+pub mod cache;
+pub mod circuit_breaker;
+pub mod credibility;
+pub mod research;
+pub mod identity;
+
+// ── Optional Embedding Support ──
+pub mod embedding;
+
+// ── Living Memory (Background Brain) ──
+pub mod background_brain;
+
+// ── Main orchestrator (merges both) ──
+pub mod aura;
+
+// ── Legacy aura-memory API ──
+mod memory;
+pub use memory::AuraMemory;
+
+// ── Unified API ──
+pub use aura::Aura;
+pub use levels::Level;
+pub use record::Record;
+
+// Enforce license at module load
+#[ctor::ctor]
+fn init_license_check() {
+    license::enforce_license();
+}
+
+// ============= PYTHON BINDINGS =============
+#[cfg(feature = "python")]
+#[pymodule]
+fn _core(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Main API
+    m.add_class::<aura::Aura>()?;
+    m.add_class::<levels::Level>()?;
+    m.add_class::<record::Record>()?;
+
+    // Tag & Trust Configuration
+    m.add_class::<trust::TagTaxonomy>()?;
+    m.add_class::<trust::TrustConfig>()?;
+
+    // Living Memory (Background Maintenance)
+    m.add_class::<background_brain::MaintenanceConfig>()?;
+    m.add_class::<background_brain::MaintenanceReport>()?;
+    m.add_class::<background_brain::ArchivalRule>()?;
+    m.add_class::<background_brain::DecayReport>()?;
+    m.add_class::<background_brain::ReflectReport>()?;
+    m.add_class::<background_brain::ConsolidationReport>()?;
+
+    // Identity
+    m.add_class::<identity::AgentPersona>()?;
+    m.add_class::<identity::PersonaTraits>()?;
+
+    // Circuit Breaker
+    m.add_class::<circuit_breaker::CircuitBreakerConfig>()?;
+
+    Ok(())
+}
