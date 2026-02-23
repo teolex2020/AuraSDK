@@ -11,7 +11,6 @@
 //! 5. Check Expiry against current date
 
 use sha2::{Sha256, Digest};
-use std::process::Command;
 use chrono::{NaiveDate, Utc};
 use std::fs;
 use std::env;
@@ -58,6 +57,7 @@ pub fn get_system_id() -> String {
     
     #[cfg(target_os = "windows")]
     {
+        use std::process::Command;
         if let Ok(output) = Command::new("wmic").args(["cpu", "get", "processorid"]).output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
