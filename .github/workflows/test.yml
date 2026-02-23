@@ -42,9 +42,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install deps
-        run: pip install maturin pytest
+      - name: Create venv and install deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install maturin pytest
+        if: runner.os != 'Windows'
+      - name: Create venv and install deps (Windows)
+        run: |
+          python -m venv .venv
+          .venv\Scripts\pip install maturin pytest
+        if: runner.os == 'Windows'
       - name: Build and install
-        run: maturin develop --features "pyo3/extension-module,encryption"
+        run: .venv/bin/maturin develop --features "pyo3/extension-module,encryption"
+        if: runner.os != 'Windows'
+      - name: Build and install (Windows)
+        run: .venv\Scripts\maturin develop --features "pyo3/extension-module,encryption"
+        if: runner.os == 'Windows'
       - name: Run Python tests
-        run: pytest tests/ -v
+        run: .venv/bin/pytest tests/ -v
+        if: runner.os != 'Windows'
+      - name: Run Python tests (Windows)
+        run: .venv\Scripts\pytest tests/ -v
+        if: runner.os == 'Windows'
