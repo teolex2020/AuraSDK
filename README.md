@@ -1,5 +1,8 @@
 # Aura
 
+[![CI](https://github.com/teolex2020/AuraSDK/actions/workflows/test.yml/badge.svg)](https://github.com/teolex2020/AuraSDK/actions/workflows/test.yml)
+[![PyPI](https://img.shields.io/pypi/v/aura-memory.svg)](https://pypi.org/project/aura-memory/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Patent Pending](https://img.shields.io/badge/Patent_Pending-US_63%2F969%2C703-blue.svg)](https://www.uspto.gov/)
 
 Cognitive memory for AI agents. Pure Rust, no embeddings required.
@@ -61,7 +64,7 @@ report = brain.run_maintenance()
 ## Installation
 
 ```bash
-pip install aura
+pip install aura-memory
 ```
 
 Requires Python 3.9+. Pre-built wheels for Linux, macOS, and Windows.
