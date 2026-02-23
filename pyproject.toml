@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "aura"
+name = "aura-memory"
 version = "1.0.0"
 authors = [{name = "AuraSDK", email = "aura@aurasdk.dev"}]
 description = "Cognitive memory for AI agents. Pure Rust, no embeddings."
