@@ -129,7 +129,7 @@ impl SalienceScorer {
         let psi = self.alpha * intensity + self.beta * entropy + self.gamma * resonance;
 
         // Scale to [0, 10] range
-        let normalized = (psi * 2.5).min(10.0).max(0.0);
+        let normalized = (psi * 2.5).clamp(0.0, 10.0);
 
         SalienceResult {
             total: (normalized * 100.0).round() / 100.0,

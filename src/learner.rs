@@ -534,15 +534,13 @@ impl SemanticLearner {
         sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let window = self.config.temporal_window_secs;
-        for i in 0..sorted.len() {
-            let mut pairs_from_i = 0;
-            for j in (i + 1)..sorted.len() {
-                let dt = sorted[j].1 - sorted[i].1;
+        for (i, item_i) in sorted.iter().enumerate() {
+            for (pairs_from_i, item_j) in sorted.iter().skip(i + 1).enumerate() {
+                let dt = item_j.1 - item_i.1;
                 if dt > window || pairs_from_i > 50 {
                     break;
                 }
-                cooc.add(sorted[i].0, sorted[j].0);
-                pairs_from_i += 1;
+                cooc.add(item_i.0, item_j.0);
             }
         }
 

@@ -207,11 +207,7 @@ impl InvertedIndex {
         let mut bit_index = self.bit_index.write();
         bit_index.clear();
         use byteorder::{ReadBytesExt, LittleEndian};
-        loop {
-            let bit = match reader.read_u16::<LittleEndian>() {
-                Ok(b) => b,
-                Err(_) => break,
-            };
+        while let Ok(bit) = reader.read_u16::<LittleEndian>() {
             let size = reader.read_u64::<LittleEndian>()?;
             let mut buf = vec![0u8; size as usize];
             use std::io::Read;
