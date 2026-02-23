@@ -22,9 +22,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --features "encryption,audit"
+        run: cargo test --no-default-features --features "encryption,audit"
       - name: Clippy
-        run: cargo clippy --features "encryption,audit" -- -D warnings
+        run: cargo clippy --no-default-features --features "encryption,audit" -- -D warnings
         if: matrix.os == 'ubuntu-latest'
 
   python-tests:
