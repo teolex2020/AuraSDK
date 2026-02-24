@@ -462,25 +462,14 @@ impl Aura {
         expand_connections: Option<bool>,
         session_id: Option<&str>,
     ) -> Result<Vec<(f32, Record)>> {
-        let mut scored = self.recall_core(
+        let scored = self.recall_core(
             query,
             top_k.unwrap_or(20),
             min_strength.unwrap_or(0.1),
             expand_connections.unwrap_or(true),
             session_id,
         )?;
-
-        // Re-rank by effective trust: final_score = rrf_score × effective_trust
-        let trust_config = self.trust_config.read();
-        let now_unix = chrono::Utc::now().timestamp() as f64;
-
-        for (score, rec) in scored.iter_mut() {
-            let effective_trust = trust::compute_effective_trust(&rec.metadata, now_unix, &trust_config);
-            *score *= effective_trust;
-        }
-
-        // Re-sort after trust adjustment
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Trust-aware recency scoring is now applied inside recall_pipeline
 
         Ok(scored)
     }
@@ -501,6 +490,7 @@ impl Aura {
 
         // Optional 4th signal: embedding similarity
         let embedding_ranked = self.collect_embedding_signal(query, top_k);
+        let trust_config = self.trust_config.read();
 
         let scored = recall::recall_pipeline(
             query,
@@ -515,6 +505,7 @@ impl Aura {
             &aura_idx,
             &records,
             embedding_ranked,
+            Some(&trust_config),
         );
 
         // Drop read locks before taking write locks
@@ -522,6 +513,7 @@ impl Aura {
         drop(ngram);
         drop(tag_idx);
         drop(aura_idx);
+        drop(trust_config);
 
         // Activate and strengthen
         {
@@ -957,6 +949,7 @@ impl Aura {
 
         // Get embedding signal
         let embedding_ranked = Some(self.embedding_store.query(query_embedding, top_k));
+        let trust_config = self.trust_config.read();
 
         let scored = recall::recall_pipeline(
             query,
@@ -971,28 +964,20 @@ impl Aura {
             &aura_idx,
             &records,
             embedding_ranked,
+            Some(&trust_config),
         );
 
         drop(records);
         drop(ngram);
         drop(tag_idx);
         drop(aura_idx);
+        drop(trust_config);
 
         {
             let mut records = self.records.write();
             let mut tracker = self.session_tracker.write();
             recall::activate_and_strengthen(&scored, &mut records, &mut tracker, session_id);
         }
-
-        // Apply trust re-ranking
-        let mut scored = scored;
-        let trust_config = self.trust_config.read();
-        let now_unix = chrono::Utc::now().timestamp() as f64;
-        for (score, rec) in scored.iter_mut() {
-            let effective_trust = trust::compute_effective_trust(&rec.metadata, now_unix, &trust_config);
-            *score *= effective_trust;
-        }
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(scored)
     }

@@ -15,6 +15,7 @@ use crate::sdr::SDRInterpreter;
 use crate::index::InvertedIndex;
 use crate::storage::AuraStorage;
 use crate::graph::SessionTracker;
+use crate::trust::{self, TrustConfig};
 
 /// RRF constant (higher = more weight to top ranks).
 pub const RRF_K: usize = 60;
@@ -316,16 +317,32 @@ pub fn causal_walk(
 
 // ── Recency-weighted scoring ──
 
-/// Apply recency weighting and sort.
-pub fn apply_recency_scoring(matched: &mut Vec<(f32, Record)>, top_k: usize) {
-    let now = SystemTime::now()
+/// Apply trust-aware recency weighting and sort.
+///
+/// Uses `compute_effective_trust()` which factors in:
+/// - Source authority (user > agent > autonomous)
+/// - Recency boost (fresh records get +boost, decays over half_life)
+/// - Base trust score from provenance
+///
+/// Final score = rrf_score × strength × effective_trust
+pub fn apply_recency_scoring(
+    matched: &mut Vec<(f32, Record)>,
+    top_k: usize,
+    trust_config: Option<&TrustConfig>,
+) {
+    let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
 
+    let default_config = TrustConfig::default();
+    let config = trust_config.unwrap_or(&default_config);
+
     for (score, rec) in matched.iter_mut() {
-        let recency = 1.0 / (1.0 + (now - rec.last_activated) / 86400.0) as f32;
-        *score = *score * rec.strength * recency;
+        let effective_trust = trust::compute_effective_trust(
+            &rec.metadata, now_unix, config,
+        );
+        *score = *score * rec.strength * effective_trust;
     }
 
     matched.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -481,6 +498,8 @@ fn estimate_tokens(text: &str) -> usize {
 ///
 /// `embedding_ranked` is an optional 4th signal from pluggable embeddings.
 /// When provided, it participates in RRF fusion alongside SDR, N-gram, and Tag Jaccard.
+///
+/// `trust_config` is used for recency boost + source authority scoring.
 pub fn recall_pipeline(
     query: &str,
     top_k: usize,
@@ -494,6 +513,7 @@ pub fn recall_pipeline(
     aura_index: &HashMap<String, String>,
     records: &HashMap<String, Record>,
     embedding_ranked: Option<Vec<(String, f32)>>,
+    trust_config: Option<&TrustConfig>,
 ) -> Vec<(f32, Record)> {
     // 1. Collect signals
     let sdr_ranked = collect_sdr(sdr, inverted_index, storage, aura_index, records, query, top_k);
@@ -530,8 +550,8 @@ pub fn recall_pipeline(
         causal_walk(&mut matched, records, min_strength);
     }
 
-    // 4. Recency-weighted scoring
-    apply_recency_scoring(&mut matched, top_k);
+    // 4. Trust-aware recency-weighted scoring
+    apply_recency_scoring(&mut matched, top_k, trust_config);
 
     matched
 }
