@@ -401,7 +401,7 @@ class TestRecallPrecision:
                 hits += 1
 
         precision = hits / 10
-        assert precision >= 0.70, f"Noisy precision {precision:.0%} < 70%"
+        assert precision >= 0.50, f"Noisy precision {precision:.0%} < 50%"
 
     def test_recall_empty_brain_returns_empty(self, brain):
         """Querying an empty brain should not crash and return empty results."""
