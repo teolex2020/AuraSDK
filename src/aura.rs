@@ -200,10 +200,11 @@ impl Aura {
         deduplicate: Option<bool>,
         caused_by_id: Option<&str>,
     ) -> Result<Record> {
-        self.store_with_channel(content, level, tags, pin, content_type, metadata, deduplicate, caused_by_id, None)
+        self.store_with_channel(content, level, tags, pin, content_type, metadata, deduplicate, caused_by_id, None, None)
     }
 
     /// Store with explicit channel for provenance stamping.
+    /// `auto_promote`: if Some(false), disables surprise-based level promotion.
     pub fn store_with_channel(
         &self,
         content: &str,
@@ -215,6 +216,7 @@ impl Aura {
         deduplicate: Option<bool>,
         caused_by_id: Option<&str>,
         channel: Option<&str>,
+        auto_promote: Option<bool>,
     ) -> Result<Record> {
         // Validation
         if content.is_empty() {
@@ -266,9 +268,9 @@ impl Aura {
             }
         }
 
-        // Surprise detection
+        // Surprise detection (skipped when auto_promote=false)
         let mut effective_level = level;
-        {
+        if auto_promote.unwrap_or(true) {
             let records = self.records.read();
             if records.len() >= 5 {
                 let ngram = self.ngram_index.read();
@@ -1528,7 +1530,7 @@ impl Aura {
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
     }
 
-    #[pyo3(name = "store", signature = (content, level=None, tags=None, pin=None, content_type=None, metadata=None, deduplicate=None, caused_by_id=None, channel=None))]
+    #[pyo3(name = "store", signature = (content, level=None, tags=None, pin=None, content_type=None, metadata=None, deduplicate=None, caused_by_id=None, channel=None, auto_promote=None))]
     fn py_store(
         &self,
         content: &str,
@@ -1540,8 +1542,9 @@ impl Aura {
         deduplicate: Option<bool>,
         caused_by_id: Option<&str>,
         channel: Option<&str>,
+        auto_promote: Option<bool>,
     ) -> PyResult<String> {
-        let rec = self.store_with_channel(content, level, tags, pin, content_type, metadata, deduplicate, caused_by_id, channel)
+        let rec = self.store_with_channel(content, level, tags, pin, content_type, metadata, deduplicate, caused_by_id, channel, auto_promote)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(rec.id.clone())
     }
@@ -1977,6 +1980,7 @@ mod tests {
             None,
             None, None, None, Some(false), None,
             Some("telegram"),
+            None,
         )?;
 
         assert_eq!(rec.metadata.get("source").unwrap(), "user-telegram");
