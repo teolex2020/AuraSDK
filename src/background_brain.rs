@@ -286,6 +286,18 @@ pub fn guarded_reflect(
     ReflectReport { promoted: promoted.saturating_sub(restored), archived }
 }
 
+/// Truncate a string to at most `max_bytes` on a valid UTF-8 char boundary.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Phase 5: Knowledge synthesis — 2-hop graph walk for cross-connections.
 pub fn discover_cross_connections(
     records: &HashMap<String, Record>,
@@ -312,9 +324,9 @@ pub fn discover_cross_connections(
                         if let Some(hop2) = records.get(hop2_id) {
                             discoveries.push(format!(
                                 "{} ← {} → {} (indirect connection)",
-                                &rec.content[..rec.content.len().min(50)],
-                                &neighbor.content[..neighbor.content.len().min(30)],
-                                &hop2.content[..hop2.content.len().min(50)],
+                                truncate_utf8(&rec.content, 50),
+                                truncate_utf8(&neighbor.content, 30),
+                                truncate_utf8(&hop2.content, 50),
                             ));
                         }
                     }
@@ -596,5 +608,50 @@ mod tests {
         assert!(config.reflect_enabled);
         assert_eq!(config.level_fix_interval, 10);
         assert!(!config.archival_rules.is_empty());
+    }
+
+    #[test]
+    fn test_truncate_utf8() {
+        // ASCII — exact boundary
+        assert_eq!(truncate_utf8("hello world", 5), "hello");
+        // Cyrillic (2 bytes per char) — cut inside char
+        let cyrillic = "Обговорено"; // 10 chars × 2 bytes = 20 bytes
+        assert_eq!(truncate_utf8(cyrillic, 5), "Об"); // 5 → backs up to 4 (2 full chars)
+        // Short string — returned as-is
+        assert_eq!(truncate_utf8("hi", 50), "hi");
+        // Empty
+        assert_eq!(truncate_utf8("", 10), "");
+    }
+
+    #[test]
+    fn test_discover_cross_connections_cyrillic() {
+        // Regression: content with Cyrillic must not panic on truncation
+        let mut records = HashMap::new();
+
+        let long_ukr = "Обговорено та заплановано триденне SEO-дослідження для проєкту. До пам'яті збережено графік завдань.";
+        let mut r1 = Record::new(long_ukr.into(), Level::Domain);
+        let mut r2 = Record::new("Зв'язаний запис із кириличним текстом номер два".into(), Level::Domain);
+        let mut r3 = Record::new("Третій запис — ще один кириличний текст для тесту".into(), Level::Domain);
+
+        let id1 = r1.id.clone();
+        let id2 = r2.id.clone();
+        let id3 = r3.id.clone();
+
+        // r1 → r2 → r3 (2-hop)
+        r1.connections.insert(id2.clone(), 1.0);
+        r2.connections.insert(id1.clone(), 1.0);
+        r2.connections.insert(id3.clone(), 1.0);
+        r3.connections.insert(id2.clone(), 1.0);
+
+        records.insert(id1, r1);
+        records.insert(id2, r2);
+        records.insert(id3, r3);
+
+        // Should NOT panic — this was the production crash
+        let discoveries = discover_cross_connections(&records, 5);
+        assert!(!discoveries.is_empty());
+        for d in &discoveries {
+            assert!(d.contains("indirect connection"));
+        }
     }
 }
