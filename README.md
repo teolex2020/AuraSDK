@@ -7,7 +7,11 @@
 
 Cognitive memory for AI agents. Pure Rust, no embeddings required.
 
+> If you find Aura useful, please consider giving it a :star: — it helps others discover the project!
+
 Aura gives your AI agent persistent, hierarchical memory that decays, consolidates, and evolves — like human memory. No LLM calls. No embedding API. No cloud. One `pip install`, 2.7 MB binary, works offline.
+
+[![YouTube Channel](https://img.shields.io/badge/YouTube-TechVanguard-red?logo=youtube)](https://www.youtube.com/@TechVanguard435)
 
 ```python
 from aura import Aura, Level
@@ -254,6 +258,17 @@ Rust    ------------------------------------------
 ## API Reference
 
 See [docs/API.md](docs/API.md) for the complete API reference (40+ methods).
+
+## Community & Resources
+
+- [YouTube — TechVanguard](https://www.youtube.com/@TechVanguard435) — Video tutorials and demos (Ukrainian)
+- [API Reference](docs/API.md) — Complete API docs (40+ methods)
+- [Examples](examples/) — Ready-to-run scripts
+- [Landing Page](https://aurasdk.dev) — Project overview
+
+## Contributing
+
+Contributions are welcome! Check out the [open issues](https://github.com/teolex2020/AuraSDK/issues) for ideas, or open a new one to discuss your proposal.
 
 ## License & Intellectual Property
 
