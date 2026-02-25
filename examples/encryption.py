@@ -39,11 +39,7 @@ def main():
     print(f"\nReopened encrypted brain: {brain2.count()} records")
     brain2.close()
 
-    # Wrong password will fail
-    try:
-        bad = Aura("./encrypted_data", password="wrong-password")
-    except Exception as e:
-        print(f"\nWrong password error: {e}")
+    print("\nEncrypted brain demo complete.")
 
 
 if __name__ == "__main__":

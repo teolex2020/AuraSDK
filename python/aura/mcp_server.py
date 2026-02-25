@@ -211,8 +211,10 @@ class AuraMcpServer:
         params = msg.get("params", {})
 
         if method == "initialize":
+            # Echo back the client's requested protocol version
+            client_version = params.get("protocolVersion", "2024-11-05")
             return self._result(msg_id, {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": client_version,
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {
                     "name": "aura",
@@ -273,28 +275,60 @@ class AuraMcpServer:
             try:
                 line = self._read_message()
                 if line is None:
+                    log("EOF on stdin, shutting down")
                     break
 
+                log(f"<< {line[:200]}")
                 msg = json.loads(line)
                 response = self.handle_request(msg)
                 if response is not None:
                     self._write_message(response)
+                    log(f">> id={response.get('id')}")
             except json.JSONDecodeError as e:
                 log(f"JSON parse error: {e}")
             except Exception as e:
                 log(f"Error: {e}")
+                import traceback
+                traceback.print_exc(file=sys.stderr)
 
         self.brain.close()
         log("Aura MCP server stopped")
 
-    def _read_message(self) -> str | None:
-        """Read a JSON-RPC message using Content-Length header framing."""
-        headers = {}
+    def _read_line(self) -> str | None:
+        """Read a single line from stdin, byte by byte to avoid buffering issues."""
+        buf = bytearray()
         while True:
-            line = sys.stdin.buffer.readline()
-            if not line:
+            b = sys.stdin.buffer.read(1)
+            if not b:
+                return None if not buf else buf.decode("utf-8")
+            if b == b"\n":
+                return buf.decode("utf-8").rstrip("\r")
+            buf.extend(b)
+
+    def _read_message(self) -> str | None:
+        """Read a JSON-RPC message.
+
+        Supports both Content-Length header framing (spec) and bare JSON lines.
+        """
+        first_line = self._read_line()
+        if first_line is None:
+            return None
+
+        # If it starts with '{', it's a bare JSON message (no framing)
+        if first_line.startswith("{"):
+            return first_line
+
+        # Otherwise, parse as Content-Length header framing
+        headers = {}
+        if ":" in first_line:
+            key, value = first_line.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+
+        # Read remaining headers until empty line
+        while True:
+            line = self._read_line()
+            if line is None:
                 return None
-            line = line.decode("utf-8").rstrip("\r\n")
             if line == "":
                 break
             if ":" in line:
@@ -309,11 +343,10 @@ class AuraMcpServer:
         return body.decode("utf-8")
 
     def _write_message(self, msg: dict):
-        """Write a JSON-RPC message with Content-Length header framing."""
+        """Write a JSON-RPC message as a single JSON line."""
         body = json.dumps(msg)
-        header = f"Content-Length: {len(body.encode('utf-8'))}\r\n\r\n"
-        sys.stdout.buffer.write(header.encode("utf-8"))
         sys.stdout.buffer.write(body.encode("utf-8"))
+        sys.stdout.buffer.write(b"\n")
         sys.stdout.buffer.flush()
 
 

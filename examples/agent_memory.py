@@ -106,7 +106,8 @@ def main():
     if brain.is_tool_available("weather_api"):
         print("\nWeather API is available")
     else:
-        print(f"\nWeather API circuit is {brain.tool_health('weather_api')}")
+        health = brain.tool_health()
+        print(f"\nWeather API circuit: {health.get('weather_api', 'unknown')}")
         print("  Using cached data instead...")
 
     # After the API recovers
@@ -134,10 +135,10 @@ def main():
 
     # ── 10. Check user profile and persona ──
     profile = brain.get_user_profile()
-    persona = brain.get_persona()
+    persona_obj = brain.get_persona()
     print(f"\n--- Identity ---")
-    print(f"  User: {profile}")
-    print(f"  Agent: {persona}")
+    print(f"  User: {profile.get('name', 'N/A') if profile else 'N/A'}")
+    print(f"  Agent: {persona_obj.name if persona_obj else 'N/A'}")
 
     brain.close()
 

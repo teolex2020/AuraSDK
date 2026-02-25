@@ -3,15 +3,22 @@
 No cloud. No API keys. No embeddings. Everything runs on your machine.
 
 Requirements:
-    pip install aura requests
-    ollama pull llama3.2  # or any model you prefer
+    pip install aura-memory requests
+    ollama pull gemma3n:e4b  # or any model you prefer
 
 Run:
     python examples/ollama_agent.py
 """
 
 import json
+import sys
+import os
 import requests
+
+# Fix Windows console encoding for emoji/unicode
+if sys.platform == "win32":
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from aura import Aura, Level, AgentPersona
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
