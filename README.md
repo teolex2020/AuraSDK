@@ -173,6 +173,30 @@ brain.store("Top secret information")
 assert brain.is_encrypted()
 ```
 
+## Dashboard UI
+
+Aura includes a standalone web dashboard for visual memory management. Download the binary from [GitHub Releases](https://github.com/teolex2020/AuraSDK/releases) — no extra dependencies needed.
+
+```bash
+# Download for your platform, then:
+./aura-dashboard ./my_brain --port 8000
+```
+
+Opens `http://localhost:8000` in your browser with:
+- **Analytics** — total memories, plasticity stats, DNA distribution
+- **Memory Explorer** — paginated table with filtering, edit, delete, batch operations
+- **Recall Console** — test RRF Fusion search with live scoring
+- **Ingest** — add single or batch memories
+
+| Platform | Binary |
+|----------|--------|
+| Windows x64 | `aura-dashboard-windows-x64.exe` |
+| Linux x64 | `aura-dashboard-linux-x64` |
+| macOS ARM | `aura-dashboard-macos-arm64` |
+| macOS x64 | `aura-dashboard-macos-x64` |
+
+Environment variables: `AURA_API_KEY`, `AURA_CORS_ORIGINS`, `AURA_TLS_CERT`/`AURA_TLS_KEY`. See `--help` for details.
+
 ## Use Cases
 
 ### Aura + Ollama (fully local AI with memory)

@@ -19,6 +19,11 @@ name = "aura-mcp"
 path = "src/bin/aura-mcp.rs"
 required-features = ["mcp"]
 
+[[bin]]
+name = "aura-dashboard"
+path = "src/bin/aura-dashboard.rs"
+required-features = ["server"]
+
 [features]
 default = ["full"]
 full = ["python", "encryption", "server", "audit"]
