@@ -1,6 +1,6 @@
 [package]
 name = "aura"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 authors = ["AuraSDK <aura@aurasdk.dev>"]
 description = "Cognitive memory for AI agents. Pure Rust, no embeddings."
@@ -13,6 +13,11 @@ categories = ["science", "algorithms"]
 [lib]
 name = "aura"
 crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "aura-mcp"
+path = "src/bin/aura-mcp.rs"
+required-features = ["mcp"]
 
 [features]
 default = ["full"]

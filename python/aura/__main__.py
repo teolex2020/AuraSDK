@@ -146,6 +146,12 @@ def cmd_status(args: argparse.Namespace) -> None:
     brain.close()
 
 
+def cmd_mcp(args: argparse.Namespace) -> None:
+    """Run Aura as an MCP server over stdio."""
+    from aura.mcp_server import run_mcp
+    run_mcp(path=args.path, password=args.password)
+
+
 def cmd_shell(args: argparse.Namespace) -> None:
     """Interactive REPL for store/recall/search."""
     brain = Aura(args.path)
@@ -248,6 +254,12 @@ def main():
     p_shell = subparsers.add_parser("shell", help="Interactive REPL")
     p_shell.add_argument("path", help="Path to brain data directory")
 
+    # mcp
+    p_mcp = subparsers.add_parser("mcp", help="Run MCP server (stdio)")
+    p_mcp.add_argument("path", nargs="?", default="./aura_brain",
+                        help="Path to brain data directory (default: ./aura_brain)")
+    p_mcp.add_argument("--password", help="Encryption password")
+
     args = parser.parse_args()
 
     if args.command == "maintain":
@@ -256,6 +268,8 @@ def main():
         cmd_status(args)
     elif args.command == "shell":
         cmd_shell(args)
+    elif args.command == "mcp":
+        cmd_mcp(args)
     else:
         parser.print_help()
         sys.exit(1)
