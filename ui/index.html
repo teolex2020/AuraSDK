@@ -1,1 +1,266 @@
-<html><body>Aura UI placeholder</body></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AuraSDK - Memory Management</title>
+    <!-- Google Fonts: Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Main Styles -->
+    <link rel="stylesheet" href="style.css">
+    <!-- Phosphor Icons (for UI elements) -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+</head>
+<body class="dark-theme">
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <nav class="sidebar">
+            <div class="brand">
+                <div class="brand-logo">
+                    <i class="ph-fill ph-brain"></i>
+                </div>
+                <h2>Aura</h2>
+                <span class="badge version-badge" id="version-badge">v2.0</span>
+            </div>
+            
+            <ul class="nav-links">
+                <li>
+                    <a href="#dashboard" class="nav-item active" data-target="dashboard">
+                        <i class="ph ph-squares-four"></i>
+                        Dashboard
+                    </a>
+                </li>
+                <li>
+                    <a href="#memories" class="nav-item" data-target="memories">
+                        <i class="ph ph-list-dashes"></i>
+                        Memories
+                    </a>
+                </li>
+                <li>
+                    <a href="#recall" class="nav-item" data-target="recall">
+                        <i class="ph ph-magnifying-glass"></i>
+                        Recall / Search
+                    </a>
+                </li>
+                <li>
+                    <a href="#process" class="nav-item" data-target="process">
+                        <i class="ph ph-plus-circle"></i>
+                        Process Memory
+                    </a>
+                </li>
+            </ul>
+
+            <div class="sidebar-footer">
+                <div class="server-status online">
+                    <span class="status-dot"></span>
+                    <span id="connection-status">Connected</span>
+                </div>
+                <div class="license-info" id="license-info">Checking License...</div>
+            </div>
+        </nav>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <header class="top-nav">
+                <h1 id="page-title">Dashboard</h1>
+                <div class="header-actions">
+                    <button id="refresh-btn" class="btn icon-btn" title="Refresh Data">
+                        <i class="ph ph-arrows-clockwise"></i>
+                    </button>
+                    <!-- For Rate Limit / Auth Status later if needed -->
+                    <div class="auth-status" id="auth-status" style="display: none;">
+                        <i class="ph ph-lock-key"></i> Auth Required
+                    </div>
+                </div>
+            </header>
+
+            <div class="content-wrapper">
+                <!-- VIEW 1: Dashboard / Analytics -->
+                <section id="view-dashboard" class="view active">
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <i class="ph ph-database stat-icon"></i>
+                            <div class="stat-value" id="stat-total-memories">-</div>
+                            <div class="stat-label">Total Memories</div>
+                        </div>
+                        <div class="stat-card">
+                            <i class="ph ph-trend-up stat-icon pulse"></i>
+                            <div class="stat-value" id="stat-plasticity-boosts">-</div>
+                            <div class="stat-label">Plasticity Boosts</div>
+                        </div>
+                        <div class="stat-card">
+                            <i class="ph ph-trend-down stat-icon"></i>
+                            <div class="stat-value" id="stat-plasticity-decays">-</div>
+                            <div class="stat-label">Plasticity Decays</div>
+                        </div>
+                        <div class="stat-card">
+                            <i class="ph ph-ghost stat-icon"></i>
+                            <div class="stat-value" id="stat-phantoms">-</div>
+                            <div class="stat-label">Phantoms</div>
+                        </div>
+                    </div>
+
+                    <div class="analytics-row">
+                        <div class="panel dna-distribution">
+                            <div class="panel-header">
+                                <h3>DNA Distribution</h3>
+                            </div>
+                            <div class="panel-content">
+                                <!-- Temporary placeholder, will be filled via JS -->
+                                <ul id="dna-list" class="dna-list">
+                                    <li class="loading-text">Loading analytics...</li>
+                                </ul>
+                            </div>
+                        </div>
+                        <div class="panel system-overview">
+                            <div class="panel-header">
+                                <h3>System Parameters</h3>
+                            </div>
+                            <div class="panel-content">
+                                <ul class="param-list">
+                                    <li><span>Server Architecture</span> <strong>SDR + MinHash (Rust)</strong></li>
+                                    <li><span>Retention</span> <strong>Hierarchical Decay Lifecycle</strong></li>
+                                    <li><span>Oldest Memory</span> <strong id="param-oldest">-</strong></li>
+                                    <li><span>Newest Memory</span> <strong id="param-newest">-</strong></li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- VIEW 2: Memories Explorer -->
+                <section id="view-memories" class="view">
+                    <div class="toolbar">
+                        <div class="filter-group">
+                            <label for="dna-filter">Filter DNA:</label>
+                            <select id="dna-filter" class="form-control">
+                                <option value="all">All Records</option>
+                                <option value="user_core">User Core</option>
+                                <option value="general">General</option>
+                                <option value="phantom">Phantom</option>
+                            </select>
+                        </div>
+                        <div class="action-group">
+                            <button class="btn danger-btn" id="batch-delete-btn" disabled>
+                                <i class="ph ph-trash"></i> Delete Selected
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="table-container panel">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th width="40"><input type="checkbox" id="select-all"></th>
+                                    <th>Content</th>
+                                    <th width="120">DNA / Level</th>
+                                    <th width="100">Intensity</th>
+                                    <th width="150">Date</th>
+                                    <th width="80">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="memories-table-body">
+                                <tr>
+                                    <td colspan="6" class="text-center loading-text">Loading memories...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="pagination">
+                        <button class="btn outline-btn" id="prev-page" disabled><i class="ph ph-caret-left"></i> Prev</button>
+                        <span id="page-info">Page 1</span>
+                        <button class="btn outline-btn" id="next-page" disabled>Next <i class="ph ph-caret-right"></i></button>
+                    </div>
+                </section>
+
+                <!-- VIEW 3: Recall / Search -->
+                <section id="view-recall" class="view">
+                    <div class="panel search-panel">
+                        <div class="search-box">
+                            <i class="ph ph-magnifying-glass search-icon"></i>
+                            <input type="text" id="recall-input" class="form-control search-input" placeholder="What do you want to remember..." autofocus>
+                            <button class="btn primary-btn" id="run-recall-btn">Recall</button>
+                        </div>
+                        <div class="search-options">
+                            <label>
+                                <span>Top K returns:</span>
+                                <input type="number" id="recall-top-k" class="form-control short-input" value="5" min="1" max="50">
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="results-container">
+                        <h3>Cognitive Results</h3>
+                        <div id="recall-results" class="results-list">
+                            <div class="empty-state">
+                                <i class="ph ph-brain"></i>
+                                <p>Enter a query above to initiate memory fusion recall.</p>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- VIEW 4: Process / Ingest Memory -->
+                <section id="view-process" class="view">
+                    <div class="panel form-panel">
+                        <h3>New Memory</h3>
+                        <div class="form-group">
+                            <label for="process-text">Memory Content</label>
+                            <textarea id="process-text" class="form-control" rows="4" placeholder="Enter information to store in memory..."></textarea>
+                        </div>
+                        <div class="form-group inline-checkbox">
+                            <input type="checkbox" id="process-pin">
+                            <label for="process-pin">Pin this memory (Immune to decay)</label>
+                        </div>
+                        <div class="form-actions">
+                            <button class="btn primary-btn" id="submit-memory-btn">
+                                <i class="ph ph-upload-simple"></i> Store in Cortex
+                            </button>
+                        </div>
+                        <div id="process-message" class="toast-message"></div>
+                    </div>
+
+                    <div class="panel form-panel mt-4">
+                        <h3>Batch Ingest / Import</h3>
+                        <p class="text-muted mb-2">Each line will be processed as a separate memory record.</p>
+                        <div class="form-group">
+                            <textarea id="batch-text" class="form-control" rows="6" placeholder="Item 1&#10;Item 2&#10;Item 3"></textarea>
+                        </div>
+                        <div class="form-actions">
+                            <button class="btn outline-btn" id="submit-batch-btn">
+                                <i class="ph ph-stack"></i> Batch Process
+                            </button>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <!-- Edit Modal -->
+    <div id="edit-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Edit Memory</h2>
+                <button class="close-modal"><i class="ph ph-x"></i></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="edit-id">
+                <textarea id="edit-text" class="form-control" rows="5"></textarea>
+            </div>
+            <div class="modal-footer">
+                <button class="btn outline-btn close-modal-btn">Cancel</button>
+                <button class="btn primary-btn" id="save-edit-btn">Save Changes</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Toast Notification Container -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- Main Logic -->
+    <script src="app.js"></script>
+</body>
+</html>
