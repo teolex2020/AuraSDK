@@ -248,12 +248,45 @@ Rust    ------------------------------------------
         +---------------------------------------------+
 ```
 
+## MCP Server (Claude Desktop)
+
+Aura works as an MCP server for Claude Desktop — giving Claude persistent memory across conversations:
+
+```bash
+pip install aura-memory
+```
+
+Add to your Claude Desktop config (Settings > Developer > Edit Config):
+
+```json
+{
+  "mcpServers": {
+    "aura": {
+      "command": "python",
+      "args": ["-m", "aura", "mcp", "C:\\Users\\YOUR_NAME\\aura_brain"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop. Aura provides 8 tools: `recall`, `recall_structured`, `store`, `store_code`, `store_decision`, `search`, `insights`, `consolidate`.
+
 ## Examples
 
+**Core:**
 - [`basic_usage.py`](examples/basic_usage.py) — Store, recall, search, update, delete
-- [`ollama_agent.py`](examples/ollama_agent.py) — Fully local AI assistant with persistent memory
+- [`encryption.py`](examples/encryption.py) — Encrypted memory with ChaCha20-Poly1305
+- [`agent_memory.py`](examples/agent_memory.py) — Trust, provenance, research, circuit breaker
+- [`edge_device.py`](examples/edge_device.py) — IoT/edge: encryption, auto-protect, benchmarks
+- [`maintenance_daemon.py`](examples/maintenance_daemon.py) — Background maintenance thread
+
+**Integrations:**
+- [`ollama_agent.py`](examples/ollama_agent.py) — Fully local AI assistant (Ollama, no API key)
+- [`langchain_agent.py`](examples/langchain_agent.py) — LangChain: system prompt injection
+- [`openai_agents.py`](examples/openai_agents.py) — OpenAI Agents SDK: dynamic instructions
+- [`crewai_agent.py`](examples/crewai_agent.py) — CrewAI: tool-based recall/store
+- [`autogen_agent.py`](examples/autogen_agent.py) — AutoGen: Memory protocol implementation
 - [`research_bot.py`](examples/research_bot.py) — Research orchestrator with trust scoring
-- [`edge_device.py`](examples/edge_device.py) — IoT/edge: encryption, auto-protect, circuit breaker
 
 ## API Reference
 

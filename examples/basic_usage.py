@@ -58,7 +58,7 @@ print(f"  {updated.content}")
 print(f"  Tags: {updated.tags}")
 
 # ── Connect related memories ──
-brain.connect(id2, id3, relationship="causal")  # Rust knowledge → deployment workflow
+brain.connect(id2, id3)  # Rust knowledge → deployment workflow
 
 # ── Stats ──
 stats = brain.stats()

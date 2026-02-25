@@ -8,7 +8,7 @@ import signal
 import sys
 import time
 
-from aura import Aura, MaintenanceConfig, ArchivalRule
+from aura import Aura, MaintenanceConfig
 
 
 def example_builtin_background():
@@ -23,15 +23,15 @@ def example_builtin_background():
 
     # Start background thread (runs every 60 seconds)
     brain.start_background(interval_secs=60)
-    print(f"Background maintenance started: {brain.is_background_running()}")
+    print("Background maintenance started")
 
     # Your agent does work here...
     brain.store("Example data being stored while maintenance runs")
-    time.sleep(5)
+    time.sleep(2)
 
     # Stop when done
     brain.stop_background()
-    print(f"Background maintenance stopped: {not brain.is_background_running()}")
+    print("Background maintenance stopped")
     brain.close()
 
 
