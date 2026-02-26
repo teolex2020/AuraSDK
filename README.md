@@ -31,6 +31,11 @@ results = brain.recall_structured("user preferences", top_k=5)
 for r in results:
     print(f"  [{r['level']}] score={r['score']:.3f} — {r['content'][:60]}")
 
+# Unified recall: RRF + substring + failure search in one call
+results = brain.recall_full("auth bug", top_k=10, include_failures=True)
+for r in results:
+    print(f"  score={r['score']:.3f}  [{r['level']}] {r['content'][:60]}")
+
 # Run maintenance (decay, consolidation, insights, archival)
 report = brain.run_maintenance()
 ```
@@ -54,6 +59,7 @@ report = brain.run_maintenance()
 ## Features
 
 - **RRF Fusion Recall** — Multi-signal ranking: SDR + MinHash + Tag Jaccard (+ optional embeddings), k=60
+- **Unified Recall** — `recall_full()`: RRF + substring fallback + failure search in 2 lock passes instead of 3
 - **4-Level Hierarchical Decay** — Working (0.80), Decisions (0.90), Domain (0.95), Identity (0.99) retention rates
 - **Living Memory** — 8-phase background maintenance: decay, reflect, insights, consolidation, cross-connections, archival
 - **Trust & Provenance** — Source authority scoring, provenance stamping, credibility tracking for 60+ domains
