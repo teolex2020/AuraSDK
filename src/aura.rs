@@ -969,6 +969,165 @@ impl Aura {
         }
     }
 
+    // ── Two-Tier API (Cognitive / Core) ──
+
+    /// Search only the cognitive tier (WORKING + DECISIONS).
+    ///
+    /// Returns records from the ephemeral working memory — session notes,
+    /// recent decisions, temporary context. These decay fast (hours to days).
+    pub fn recall_cognitive(
+        &self,
+        query: Option<&str>,
+        limit: Option<usize>,
+    ) -> Vec<Record> {
+        let records = self.records.read();
+        let limit = limit.unwrap_or(20);
+
+        let mut results: Vec<Record> = records
+            .values()
+            .filter(|r| r.level.is_cognitive())
+            .filter(|r| {
+                if let Some(q) = query {
+                    r.content.to_lowercase().contains(&q.to_lowercase())
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+
+        results.sort_by(|a, b| {
+            b.importance()
+                .partial_cmp(&a.importance())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(limit);
+        results
+    }
+
+    /// Search only the core tier (DOMAIN + IDENTITY).
+    ///
+    /// Returns records from the permanent knowledge base — established facts,
+    /// user profile, domain expertise. These decay slowly (weeks to months).
+    pub fn recall_core_tier(
+        &self,
+        query: Option<&str>,
+        limit: Option<usize>,
+    ) -> Vec<Record> {
+        let records = self.records.read();
+        let limit = limit.unwrap_or(20);
+
+        let mut results: Vec<Record> = records
+            .values()
+            .filter(|r| r.level.is_core())
+            .filter(|r| {
+                if let Some(q) = query {
+                    r.content.to_lowercase().contains(&q.to_lowercase())
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+
+        results.sort_by(|a, b| {
+            b.importance()
+                .partial_cmp(&a.importance())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(limit);
+        results
+    }
+
+    /// Get memory statistics broken down by tier.
+    ///
+    /// Returns a structured breakdown:
+    /// - `cognitive_total`: WORKING + DECISIONS count
+    /// - `cognitive_working`: WORKING count
+    /// - `cognitive_decisions`: DECISIONS count
+    /// - `core_total`: DOMAIN + IDENTITY count
+    /// - `core_domain`: DOMAIN count
+    /// - `core_identity`: IDENTITY count
+    /// - `total`: all records
+    pub fn tier_stats(&self) -> HashMap<String, usize> {
+        let records = self.records.read();
+
+        let working = records.values().filter(|r| r.level == Level::Working).count();
+        let decisions = records.values().filter(|r| r.level == Level::Decisions).count();
+        let domain = records.values().filter(|r| r.level == Level::Domain).count();
+        let identity = records.values().filter(|r| r.level == Level::Identity).count();
+
+        let mut stats = HashMap::new();
+        stats.insert("cognitive_total".into(), working + decisions);
+        stats.insert("cognitive_working".into(), working);
+        stats.insert("cognitive_decisions".into(), decisions);
+        stats.insert("core_total".into(), domain + identity);
+        stats.insert("core_domain".into(), domain);
+        stats.insert("core_identity".into(), identity);
+        stats.insert("total".into(), working + decisions + domain + identity);
+        stats
+    }
+
+    /// Find cognitive records that are candidates for promotion to core.
+    ///
+    /// A record qualifies when:
+    /// - It's in the cognitive tier (WORKING or DECISIONS)
+    /// - activation_count >= `min_activations` (default 5)
+    /// - strength >= `min_strength` (default 0.7)
+    ///
+    /// These are records that started as ephemeral but proved important
+    /// through repeated recall — they should graduate to permanent memory.
+    pub fn promotion_candidates(
+        &self,
+        min_activations: Option<u32>,
+        min_strength: Option<f32>,
+    ) -> Vec<Record> {
+        let records = self.records.read();
+        let min_act = min_activations.unwrap_or(5);
+        let min_str = min_strength.unwrap_or(0.7);
+
+        let mut candidates: Vec<Record> = records
+            .values()
+            .filter(|r| {
+                r.level.is_cognitive()
+                    && r.activation_count >= min_act
+                    && r.strength >= min_str
+            })
+            .cloned()
+            .collect();
+
+        candidates.sort_by(|a, b| {
+            b.activation_count
+                .cmp(&a.activation_count)
+                .then_with(|| {
+                    b.strength
+                        .partial_cmp(&a.strength)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        candidates
+    }
+
+    /// Promote a record to the next cognitive level.
+    ///
+    /// WORKING → DECISIONS → DOMAIN → IDENTITY.
+    /// Returns the new level, or None if already at IDENTITY or record not found.
+    pub fn promote_record(&self, record_id: &str) -> Option<Level> {
+        let mut records = self.records.write();
+        if let Some(rec) = records.get_mut(record_id) {
+            if rec.promote() {
+                // Persist the change
+                let _ = self.cognitive_store.append_update(rec);
+                self.recall_cache.clear();
+                Some(rec.level)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
     // ── Optional Embedding Support ──
 
     /// Store an embedding vector for a record.
@@ -2004,6 +2163,37 @@ impl Aura {
         self.has_embeddings()
     }
 
+    // ── Two-Tier API PyO3 Bindings ──
+
+    #[pyo3(name = "recall_cognitive", signature = (query=None, limit=None))]
+    fn py_recall_cognitive(&self, query: Option<&str>, limit: Option<usize>) -> Vec<Record> {
+        self.recall_cognitive(query, limit)
+    }
+
+    #[pyo3(name = "recall_core_tier", signature = (query=None, limit=None))]
+    fn py_recall_core_tier(&self, query: Option<&str>, limit: Option<usize>) -> Vec<Record> {
+        self.recall_core_tier(query, limit)
+    }
+
+    #[pyo3(name = "tier_stats")]
+    fn py_tier_stats(&self) -> HashMap<String, usize> {
+        self.tier_stats()
+    }
+
+    #[pyo3(name = "promotion_candidates", signature = (min_activations=None, min_strength=None))]
+    fn py_promotion_candidates(
+        &self,
+        min_activations: Option<u32>,
+        min_strength: Option<f32>,
+    ) -> Vec<Record> {
+        self.promotion_candidates(min_activations, min_strength)
+    }
+
+    #[pyo3(name = "promote_record")]
+    fn py_promote_record(&self, record_id: &str) -> Option<Level> {
+        self.promote_record(record_id)
+    }
+
     fn __repr__(&self) -> String {
         let records = self.records.read();
         format!(
@@ -2292,6 +2482,131 @@ mod tests {
 
         aura.set_credibility_override("my-company.com", 0.95);
         assert_eq!(aura.get_credibility("https://my-company.com/docs"), 0.95);
+
+        Ok(())
+    }
+
+    // ── Two-Tier API Tests ──
+
+    #[test]
+    fn test_recall_cognitive() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        aura.store("session note", Some(Level::Working), None, None, None, None, Some(false), None)?;
+        aura.store("recent decision", Some(Level::Decisions), None, None, None, None, Some(false), None)?;
+        aura.store("domain fact", Some(Level::Domain), None, None, None, None, Some(false), None)?;
+        aura.store("core identity", Some(Level::Identity), None, None, None, None, Some(false), None)?;
+
+        let cognitive = aura.recall_cognitive(None, None);
+        assert_eq!(cognitive.len(), 2);
+        assert!(cognitive.iter().all(|r| r.level.is_cognitive()));
+
+        let filtered = aura.recall_cognitive(Some("session"), None);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].content, "session note");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_recall_core_tier() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        aura.store("session note", Some(Level::Working), None, None, None, None, Some(false), None)?;
+        aura.store("recent decision", Some(Level::Decisions), None, None, None, None, Some(false), None)?;
+        aura.store("domain fact", Some(Level::Domain), None, None, None, None, Some(false), None)?;
+        aura.store("core identity", Some(Level::Identity), None, None, None, None, Some(false), None)?;
+
+        let core = aura.recall_core_tier(None, None);
+        assert_eq!(core.len(), 2);
+        assert!(core.iter().all(|r| r.level.is_core()));
+
+        let filtered = aura.recall_core_tier(Some("domain"), None);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].content, "domain fact");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tier_stats() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        aura.store("w1", Some(Level::Working), None, None, None, None, Some(false), None)?;
+        aura.store("w2", Some(Level::Working), None, None, None, None, Some(false), None)?;
+        aura.store("d1", Some(Level::Decisions), None, None, None, None, Some(false), None)?;
+        aura.store("dom1", Some(Level::Domain), None, None, None, None, Some(false), None)?;
+        aura.store("id1", Some(Level::Identity), None, None, None, None, Some(false), None)?;
+        aura.store("id2", Some(Level::Identity), None, None, None, None, Some(false), None)?;
+
+        let ts = aura.tier_stats();
+        assert_eq!(ts["cognitive_total"], 3);
+        assert_eq!(ts["cognitive_working"], 2);
+        assert_eq!(ts["cognitive_decisions"], 1);
+        assert_eq!(ts["core_total"], 3);
+        assert_eq!(ts["core_domain"], 1);
+        assert_eq!(ts["core_identity"], 2);
+        assert_eq!(ts["total"], 6);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_promotion_candidates() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        // Store a working-level record
+        let rec = aura.store("frequently recalled fact", Some(Level::Working), None, None, None, None, Some(false), None)?;
+
+        // Simulate frequent recalls to bump activation_count
+        {
+            let mut records = aura.records.write();
+            if let Some(r) = records.get_mut(&rec.id) {
+                r.activation_count = 10;
+                r.strength = 0.9;
+            }
+        }
+
+        let candidates = aura.promotion_candidates(None, None);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, rec.id);
+
+        // No candidates with high threshold
+        let none = aura.promotion_candidates(Some(20), None);
+        assert_eq!(none.len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_promote_record() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let rec = aura.store("promotable", Some(Level::Working), None, None, None, None, Some(false), None)?;
+        assert_eq!(rec.level, Level::Working);
+
+        let new_level = aura.promote_record(&rec.id);
+        assert_eq!(new_level, Some(Level::Decisions));
+
+        let updated = aura.get(&rec.id).unwrap();
+        assert_eq!(updated.level, Level::Decisions);
+
+        // Promote again
+        let new_level = aura.promote_record(&rec.id);
+        assert_eq!(new_level, Some(Level::Domain));
+
+        // Promote to Identity
+        let new_level = aura.promote_record(&rec.id);
+        assert_eq!(new_level, Some(Level::Identity));
+
+        // Can't promote beyond Identity
+        let new_level = aura.promote_record(&rec.id);
+        assert_eq!(new_level, None);
 
         Ok(())
     }

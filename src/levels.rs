@@ -89,6 +89,28 @@ impl Level {
             Level::Identity => "IDENTITY",
         }
     }
+
+    /// Memory tier: "cognitive" (Working/Decisions) or "core" (Domain/Identity).
+    ///
+    /// Two-tier logical separation:
+    /// - **Cognitive**: ephemeral working memory — session notes, recent decisions. Fast decay.
+    /// - **Core**: permanent knowledge base — facts, profile, domain expertise. Slow decay.
+    pub fn tier(&self) -> &'static str {
+        match self {
+            Level::Working | Level::Decisions => "cognitive",
+            Level::Domain | Level::Identity => "core",
+        }
+    }
+
+    /// Check if this level belongs to the cognitive tier (Working + Decisions).
+    pub fn is_cognitive(&self) -> bool {
+        matches!(self, Level::Working | Level::Decisions)
+    }
+
+    /// Check if this level belongs to the core tier (Domain + Identity).
+    pub fn is_core(&self) -> bool {
+        matches!(self, Level::Domain | Level::Identity)
+    }
 }
 
 
@@ -111,6 +133,24 @@ impl Level {
     #[getter]
     fn get_dna(&self) -> &str {
         self.to_dna()
+    }
+
+    /// Get the memory tier: "cognitive" or "core".
+    #[getter]
+    fn get_tier(&self) -> &str {
+        self.tier()
+    }
+
+    /// Check if this level is in the cognitive tier.
+    #[getter]
+    fn get_is_cognitive(&self) -> bool {
+        self.is_cognitive()
+    }
+
+    /// Check if this level is in the core tier.
+    #[getter]
+    fn get_is_core(&self) -> bool {
+        self.is_core()
     }
 
     fn __repr__(&self) -> String {
@@ -154,5 +194,26 @@ mod tests {
         assert!(Level::Working < Level::Decisions);
         assert!(Level::Decisions < Level::Domain);
         assert!(Level::Domain < Level::Identity);
+    }
+
+    #[test]
+    fn test_tier() {
+        assert_eq!(Level::Working.tier(), "cognitive");
+        assert_eq!(Level::Decisions.tier(), "cognitive");
+        assert_eq!(Level::Domain.tier(), "core");
+        assert_eq!(Level::Identity.tier(), "core");
+    }
+
+    #[test]
+    fn test_is_cognitive_core() {
+        assert!(Level::Working.is_cognitive());
+        assert!(Level::Decisions.is_cognitive());
+        assert!(!Level::Domain.is_cognitive());
+        assert!(!Level::Identity.is_cognitive());
+
+        assert!(!Level::Working.is_core());
+        assert!(!Level::Decisions.is_core());
+        assert!(Level::Domain.is_core());
+        assert!(Level::Identity.is_core());
     }
 }

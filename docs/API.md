@@ -197,6 +197,84 @@ Get total number of records.
 
 ---
 
+## Two-Tier Memory API
+
+Aura organizes memory into two logical tiers:
+
+| Tier | Levels | Decay | Purpose |
+|------|--------|-------|---------|
+| **Cognitive** | Working + Decisions | 0.80–0.90/day | Ephemeral working memory — session notes, recent decisions, temporary context |
+| **Core** | Domain + Identity | 0.95–0.99/day | Permanent knowledge base — facts, profile, domain expertise |
+
+### `recall_cognitive(query=None, limit=None) -> list[Record]`
+
+Search only the cognitive tier (WORKING + DECISIONS). Returns records sorted by importance.
+
+```python
+# All cognitive records
+recent = brain.recall_cognitive()
+
+# Search within cognitive tier
+notes = brain.recall_cognitive("meeting notes", limit=10)
+```
+
+### `recall_core_tier(query=None, limit=None) -> list[Record]`
+
+Search only the core tier (DOMAIN + IDENTITY). Returns records sorted by importance.
+
+```python
+# All core knowledge
+knowledge = brain.recall_core_tier()
+
+# Search within core tier
+facts = brain.recall_core_tier("user preferences", limit=10)
+```
+
+### `tier_stats() -> dict`
+
+Get memory statistics broken down by tier.
+
+```python
+stats = brain.tier_stats()
+# {'cognitive_total': 15, 'cognitive_working': 10, 'cognitive_decisions': 5,
+#  'core_total': 27, 'core_domain': 20, 'core_identity': 7,
+#  'total': 42}
+```
+
+### `promotion_candidates(min_activations=None, min_strength=None) -> list[Record]`
+
+Find cognitive records that qualify for promotion to core. A record qualifies when it has been recalled frequently (activation_count >= threshold) and maintains high strength.
+
+```python
+candidates = brain.promotion_candidates()
+for rec in candidates:
+    print(f"  {rec.content[:50]}  (activations={rec.activation_count})")
+    brain.promote_record(rec.id)
+```
+
+### `promote_record(record_id) -> Level | None`
+
+Manually promote a record to the next level. Returns the new level, or None if already at IDENTITY.
+
+```python
+# WORKING → DECISIONS → DOMAIN → IDENTITY
+new_level = brain.promote_record(record_id)
+```
+
+### `Level` tier properties
+
+```python
+Level.Working.tier        # "cognitive"
+Level.Decisions.tier      # "cognitive"
+Level.Domain.tier         # "core"
+Level.Identity.tier       # "core"
+
+Level.Working.is_cognitive  # True
+Level.Domain.is_core        # True
+```
+
+---
+
 ### `close()`
 
 Flush and close the brain. Called automatically on garbage collection.
@@ -481,12 +559,19 @@ Check if synonyms are loaded.
 
 ### `Level`
 
-Memory importance levels.
+Memory importance levels with two-tier grouping.
 
-- `Level.Working` — Short-term memory (hours). Retention: 0.80/cycle.
-- `Level.Decisions` — Medium-term (days). Retention: 0.90/cycle.
-- `Level.Domain` — Long-term (weeks). Retention: 0.95/cycle.
-- `Level.Identity` — Near-permanent (months+). Retention: 0.99/cycle.
+- `Level.Working` — Short-term memory (hours). Retention: 0.80/cycle. **Cognitive tier.**
+- `Level.Decisions` — Medium-term (days). Retention: 0.90/cycle. **Cognitive tier.**
+- `Level.Domain` — Long-term (weeks). Retention: 0.95/cycle. **Core tier.**
+- `Level.Identity` — Near-permanent (months+). Retention: 0.99/cycle. **Core tier.**
+
+**Properties:**
+- `tier` (str) — `"cognitive"` or `"core"`
+- `is_cognitive` (bool) — True for Working/Decisions
+- `is_core` (bool) — True for Domain/Identity
+- `decay_rate` (float) — Daily decay multiplier
+- `dna` (str) — SDR classification (`"general"` or `"user_core"`)
 
 ---
 
