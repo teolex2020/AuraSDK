@@ -60,6 +60,7 @@ report = brain.run_maintenance()
 
 ## Features
 
+- **Two-Tier Memory** — Cognitive (ephemeral) + Core (permanent) tiers with dedicated recall, stats, and promotion API
 - **RRF Fusion Recall** — Multi-signal ranking: SDR + MinHash + Tag Jaccard (+ optional embeddings), k=60
 - **Unified Recall** — `recall_full()`: RRF + substring fallback + failure search in 2 lock passes instead of 3
 - **4-Level Hierarchical Decay** — Working (0.80), Decisions (0.90), Domain (0.95), Identity (0.99) retention rates
@@ -107,6 +108,38 @@ print(context)
 results = brain.recall_structured("rust", top_k=3)
 for r in results:
     print(f"  score={r['score']:.3f}  {r['content']}")
+```
+
+### Two-Tier Memory (Cognitive / Core)
+
+```python
+from aura import Aura, Level
+
+brain = Aura("./data")
+
+# Store across tiers
+brain.store("Meeting notes from today", level=Level.Working, tags=["meeting"])
+brain.store("Decided to use PostgreSQL", level=Level.Decisions, tags=["db"])
+brain.store("Python uses GIL for thread safety", level=Level.Domain, tags=["python"])
+brain.store("User prefers Ukrainian language", level=Level.Identity, tags=["preference"])
+
+# Query only cognitive tier (recent context)
+recent = brain.recall_cognitive("meeting")
+
+# Query only core tier (permanent knowledge)
+knowledge = brain.recall_core_tier("python")
+
+# Tier statistics
+stats = brain.tier_stats()
+print(f"Cognitive: {stats['cognitive_total']}  Core: {stats['core_total']}")
+
+# Find and promote frequent cognitive records to core
+for rec in brain.promotion_candidates():
+    brain.promote_record(rec.id)
+
+# Level properties
+print(Level.Working.tier)        # "cognitive"
+print(Level.Domain.is_core)      # True
 ```
 
 ### Pluggable Embeddings (Optional)
@@ -244,16 +277,19 @@ Benchmarked on Windows 10 / Ryzen 7 / 1000 records:
 
 *Mem0 recall requires embedding API call (~200ms+) + vector search. Aura recall is pure local computation.
 
-## Memory Levels
+## Memory Levels & Tiers
 
-| Level | Retention | Use Case |
-|-------|-----------|----------|
-| `Level.Working` | 0.80/cycle | Short-term: current tasks, recent messages |
-| `Level.Decisions` | 0.90/cycle | Medium-term: choices made, action items |
-| `Level.Domain` | 0.95/cycle | Long-term: learned facts, domain knowledge |
-| `Level.Identity` | 0.99/cycle | Permanent: user preferences, core identity |
+| Tier | Level | Retention | Use Case |
+|------|-------|-----------|----------|
+| **Cognitive** | `Level.Working` | 0.80/cycle | Short-term: current tasks, recent messages |
+| **Cognitive** | `Level.Decisions` | 0.90/cycle | Medium-term: choices made, action items |
+| **Core** | `Level.Domain` | 0.95/cycle | Long-term: learned facts, domain knowledge |
+| **Core** | `Level.Identity` | 0.99/cycle | Permanent: user preferences, core identity |
 
-Records are automatically promoted based on access patterns and demoted through decay.
+**Cognitive tier** = ephemeral working memory (fast decay, hours to days).
+**Core tier** = permanent knowledge base (slow decay, weeks to months).
+
+Records are automatically promoted based on access patterns and demoted through decay. Use `promotion_candidates()` to find cognitive records ready for core, and `promote_record()` to move them up.
 
 ## Architecture
 
@@ -263,20 +299,29 @@ Python  --  from aura import Aura  -->  aura._core (PyO3)
 Rust    ------------------------------------------
         +---------------------------------------------+
         |  Aura (orchestrator)                         |
-        |  +-- SDR Engine (256k bits, xxHash3)         |
-        |  +-- RRF Fusion Recall (k=60)                |
-        |      +-- Signal 1: SDR similarity            |
+        |                                              |
+        |  Two-Tier Memory                             |
+        |  +-- Cognitive Tier (Working + Decisions)    |
+        |  |   recall_cognitive(), promotion_candidates |
+        |  +-- Core Tier (Domain + Identity)           |
+        |  |   recall_core_tier(), tier_stats()        |
+        |  |   promote_record()                        |
+        |                                              |
+        |  Recall Engine                               |
+        |  +-- RRF Fusion (k=60)                       |
+        |      +-- Signal 1: SDR similarity (256k bit) |
         |      +-- Signal 2: MinHash N-gram            |
         |      +-- Signal 3: Tag Jaccard               |
         |      +-- Signal 4: Embedding (optional)      |
-        |  +-- Knowledge Graph (typed connections)      |
-        |  +-- Living Memory (8-phase maintenance)      |
-        |  +-- Trust & Provenance                       |
-        |  +-- Guards (auto-protect sensitive data)     |
-        |  +-- Circuit Breaker (per-tool)               |
-        |  +-- Research Orchestrator                    |
-        |  +-- Identity (profile + persona)             |
-        |  +-- Encryption (ChaCha20 + Argon2id)         |
+        |                                              |
+        |  Knowledge Graph (typed connections)          |
+        |  Living Memory (8-phase maintenance)          |
+        |  Trust & Provenance                           |
+        |  Guards (auto-protect sensitive data)         |
+        |  Circuit Breaker (per-tool)                   |
+        |  Research Orchestrator                        |
+        |  Identity (profile + persona)                 |
+        |  Encryption (ChaCha20 + Argon2id)             |
         +---------------------------------------------+
 ```
 
