@@ -44,8 +44,15 @@ Thumbs.db
 
 # Test artifacts
 test_data/
+test_brain/
 tmp/
 memory_data/
+
+# Build artifacts (standalone binaries)
+aura-server-bin/
+
+# Runtime brain data
+aura_brain/
 
 # Internal docs (not for public)
 SPEC.md
