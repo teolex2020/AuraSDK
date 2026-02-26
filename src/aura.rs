@@ -476,6 +476,89 @@ impl Aura {
         Ok(scored)
     }
 
+    /// Unified recall: recall_core (RRF) + substring fallback + failure records in fewer lock passes.
+    ///
+    /// Combines what Python previously did in 3 separate calls:
+    /// 1. recall_structured (RRF semantic)
+    /// 2. search (substring fallback)
+    /// 3. search with tags=["outcome-failure"]
+    ///
+    /// Stage 1 runs recall_core as-is (it needs write lock for activation).
+    /// Stages 2+3 are merged into a single read lock pass.
+    pub fn recall_full(
+        &self,
+        query: &str,
+        top_k: Option<usize>,
+        include_failures: Option<bool>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<(f32, Record)>> {
+        let top_k = top_k.unwrap_or(20);
+        let include_failures = include_failures.unwrap_or(true);
+        let min_strength_v = min_strength.unwrap_or(0.1);
+
+        // Stage 1: RRF pipeline (has its own lock cycle — read + write for activation)
+        let mut scored = self.recall_core(
+            query,
+            top_k,
+            min_strength_v,
+            expand_connections.unwrap_or(true),
+            session_id,
+        )?;
+
+        // Stage 2+3: Merge substring matches + failure records in ONE read lock
+        {
+            let records = self.records.read();
+            let seen_ids: std::collections::HashSet<String> =
+                scored.iter().map(|(_, r)| r.id.clone()).collect();
+            let query_lower = query.to_lowercase();
+
+            for rec in records.values() {
+                if seen_ids.contains(&rec.id) {
+                    continue;
+                }
+                if rec.strength < min_strength_v {
+                    continue;
+                }
+
+                let content_lower = rec.content.to_lowercase();
+                let matches_query = content_lower.contains(&query_lower);
+
+                // Substring match (stage 2)
+                if matches_query {
+                    let is_failure = rec.tags.contains(&"outcome-failure".to_string());
+                    let score = if is_failure { 0.8 } else { 0.6 };
+                    scored.push((score, rec.clone()));
+                    continue;
+                }
+
+                // Failure-only match: tag "outcome-failure" but content didn't substring-match
+                if include_failures && rec.tags.contains(&"outcome-failure".to_string()) {
+                    let query_words: Vec<&str> = query_lower
+                        .split_whitespace()
+                        .filter(|w| w.len() > 3)
+                        .collect();
+                    if query_words
+                        .iter()
+                        .any(|w| content_lower.contains(w))
+                    {
+                        scored.push((0.8, rec.clone()));
+                    }
+                }
+            }
+        }
+
+        // Re-sort by score desc, truncate
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(top_k + 15);
+
+        Ok(scored)
+    }
+
     /// Core recall pipeline.
     fn recall_core(
         &self,
@@ -1597,6 +1680,42 @@ impl Aura {
         Ok(py_results)
     }
 
+    #[pyo3(name = "recall_full", signature = (query, top_k=None, include_failures=None, min_strength=None, expand_connections=None, session_id=None))]
+    fn py_recall_full(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        top_k: Option<usize>,
+        include_failures: Option<bool>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+    ) -> PyResult<Vec<PyObject>> {
+        let results = self
+            .recall_full(query, top_k, include_failures, min_strength, expand_connections, session_id)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let mut py_results = Vec::new();
+        for (score, rec) in results {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("id", &rec.id)?;
+            dict.set_item("content", &rec.content)?;
+            dict.set_item("score", score)?;
+            dict.set_item("level", rec.level.name())?;
+            dict.set_item("strength", rec.strength)?;
+            dict.set_item("tags", &rec.tags)?;
+            dict.set_item("metadata", &rec.metadata)?;
+            if let Some(trust) = rec.metadata.get("trust_score") {
+                dict.set_item("trust", trust)?;
+            }
+            if let Some(source) = rec.metadata.get("source") {
+                dict.set_item("source", source)?;
+            }
+            py_results.push(dict.unbind().into_any());
+        }
+        Ok(py_results)
+    }
+
     #[pyo3(name = "search", signature = (query=None, level=None, tags=None, limit=None, content_type=None))]
     fn py_search(
         &self,
@@ -2003,6 +2122,44 @@ mod tests {
 
         // Store invalidates cache
         aura.store("Teo is 25 years old", None, None, None, None, None, Some(false), None)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_recall_full() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        // Store a normal record
+        aura.store(
+            "Teo loves Rust programming",
+            Some(Level::Domain),
+            Some(vec!["fact".into()]),
+            None, None, None, Some(false), None,
+        )?;
+
+        // Store a failure record
+        aura.store(
+            "Failed to register on site X: captcha required",
+            Some(Level::Decisions),
+            Some(vec!["outcome-failure".into()]),
+            None, None, None, Some(false), None,
+        )?;
+
+        // recall_full should find records matching "Teo Rust"
+        let results = aura.recall_full("Teo Rust", None, Some(true), None, None, None)?;
+        assert!(!results.is_empty(), "recall_full should find at least one record");
+
+        // recall_full with include_failures=true should find failure records
+        let results_fail = aura.recall_full("register site captcha", None, Some(true), None, None, None)?;
+        let has_failure = results_fail.iter().any(|(_, r)| r.tags.contains(&"outcome-failure".to_string()));
+        assert!(has_failure, "recall_full with include_failures=true should find failure records");
+
+        // recall_full with include_failures=false should still work
+        let results_no_fail = aura.recall_full("register site", None, Some(false), None, None, None)?;
+        // Should not crash — just verify it returns
+        drop(results_no_fail);
 
         Ok(())
     }
