@@ -971,28 +971,40 @@ impl Aura {
 
     // ── Two-Tier API (Cognitive / Core) ──
 
-    /// Search only the cognitive tier (WORKING + DECISIONS).
+    /// Recall from the cognitive tier only (WORKING + DECISIONS).
     ///
-    /// Returns records from the ephemeral working memory — session notes,
-    /// recent decisions, temporary context. These decay fast (hours to days).
+    /// When `query` is provided, runs the full RRF Fusion pipeline (SDR + MinHash +
+    /// Tag Jaccard + optional embeddings) and then filters results to cognitive-tier
+    /// records. This gives the same ranking quality as `recall_structured()`.
+    ///
+    /// When `query` is None, returns all cognitive records sorted by importance.
     pub fn recall_cognitive(
         &self,
         query: Option<&str>,
         limit: Option<usize>,
     ) -> Vec<Record> {
-        let records = self.records.read();
         let limit = limit.unwrap_or(20);
 
+        if let Some(q) = query {
+            // RRF pipeline → filter to cognitive tier
+            // Request more from pipeline to compensate for tier filtering
+            let pipeline_limit = limit * 3;
+            if let Ok(scored) = self.recall_core(q, pipeline_limit, 0.1, true, None) {
+                let results: Vec<Record> = scored
+                    .into_iter()
+                    .filter(|(_, r)| r.level.is_cognitive())
+                    .take(limit)
+                    .map(|(_, r)| r)
+                    .collect();
+                return results;
+            }
+        }
+
+        // No query or pipeline error → list all cognitive by importance
+        let records = self.records.read();
         let mut results: Vec<Record> = records
             .values()
             .filter(|r| r.level.is_cognitive())
-            .filter(|r| {
-                if let Some(q) = query {
-                    r.content.to_lowercase().contains(&q.to_lowercase())
-                } else {
-                    true
-                }
-            })
             .cloned()
             .collect();
 
@@ -1005,28 +1017,39 @@ impl Aura {
         results
     }
 
-    /// Search only the core tier (DOMAIN + IDENTITY).
+    /// Recall from the core tier only (DOMAIN + IDENTITY).
     ///
-    /// Returns records from the permanent knowledge base — established facts,
-    /// user profile, domain expertise. These decay slowly (weeks to months).
+    /// When `query` is provided, runs the full RRF Fusion pipeline (SDR + MinHash +
+    /// Tag Jaccard + optional embeddings) and then filters results to core-tier
+    /// records. This gives the same ranking quality as `recall_structured()`.
+    ///
+    /// When `query` is None, returns all core records sorted by importance.
     pub fn recall_core_tier(
         &self,
         query: Option<&str>,
         limit: Option<usize>,
     ) -> Vec<Record> {
-        let records = self.records.read();
         let limit = limit.unwrap_or(20);
 
+        if let Some(q) = query {
+            // RRF pipeline → filter to core tier
+            let pipeline_limit = limit * 3;
+            if let Ok(scored) = self.recall_core(q, pipeline_limit, 0.1, true, None) {
+                let results: Vec<Record> = scored
+                    .into_iter()
+                    .filter(|(_, r)| r.level.is_core())
+                    .take(limit)
+                    .map(|(_, r)| r)
+                    .collect();
+                return results;
+            }
+        }
+
+        // No query or pipeline error → list all core by importance
+        let records = self.records.read();
         let mut results: Vec<Record> = records
             .values()
             .filter(|r| r.level.is_core())
-            .filter(|r| {
-                if let Some(q) = query {
-                    r.content.to_lowercase().contains(&q.to_lowercase())
-                } else {
-                    true
-                }
-            })
             .cloned()
             .collect();
 
@@ -2493,18 +2516,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("session note", Some(Level::Working), None, None, None, None, Some(false), None)?;
-        aura.store("recent decision", Some(Level::Decisions), None, None, None, None, Some(false), None)?;
-        aura.store("domain fact", Some(Level::Domain), None, None, None, None, Some(false), None)?;
-        aura.store("core identity", Some(Level::Identity), None, None, None, None, Some(false), None)?;
+        aura.store("session note about testing", Some(Level::Working), None, None, None, None, Some(false), None)?;
+        aura.store("recent decision on architecture", Some(Level::Decisions), None, None, None, None, Some(false), None)?;
+        aura.store("domain fact about Rust language", Some(Level::Domain), None, None, None, None, Some(false), None)?;
+        aura.store("core identity preferences", Some(Level::Identity), None, None, None, None, Some(false), None)?;
 
+        // No query — returns all cognitive records
         let cognitive = aura.recall_cognitive(None, None);
         assert_eq!(cognitive.len(), 2);
         assert!(cognitive.iter().all(|r| r.level.is_cognitive()));
 
-        let filtered = aura.recall_cognitive(Some("session"), None);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].content, "session note");
+        // With query — RRF pipeline, filtered to cognitive tier only
+        let filtered = aura.recall_cognitive(Some("session note about testing"), None);
+        assert!(!filtered.is_empty());
+        assert!(filtered.iter().all(|r| r.level.is_cognitive()));
+        // Best match should be the session note
+        assert_eq!(filtered[0].content, "session note about testing");
 
         Ok(())
     }
@@ -2514,18 +2541,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("session note", Some(Level::Working), None, None, None, None, Some(false), None)?;
-        aura.store("recent decision", Some(Level::Decisions), None, None, None, None, Some(false), None)?;
-        aura.store("domain fact", Some(Level::Domain), None, None, None, None, Some(false), None)?;
-        aura.store("core identity", Some(Level::Identity), None, None, None, None, Some(false), None)?;
+        aura.store("session note about testing", Some(Level::Working), None, None, None, None, Some(false), None)?;
+        aura.store("recent decision on architecture", Some(Level::Decisions), None, None, None, None, Some(false), None)?;
+        aura.store("domain fact about Rust language", Some(Level::Domain), None, None, None, None, Some(false), None)?;
+        aura.store("core identity preferences", Some(Level::Identity), None, None, None, None, Some(false), None)?;
 
+        // No query — returns all core records
         let core = aura.recall_core_tier(None, None);
         assert_eq!(core.len(), 2);
         assert!(core.iter().all(|r| r.level.is_core()));
 
-        let filtered = aura.recall_core_tier(Some("domain"), None);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].content, "domain fact");
+        // With query — RRF pipeline, filtered to core tier only
+        let filtered = aura.recall_core_tier(Some("domain fact about Rust language"), None);
+        assert!(!filtered.is_empty());
+        assert!(filtered.iter().all(|r| r.level.is_core()));
+        // Best match should be the domain fact
+        assert_eq!(filtered[0].content, "domain fact about Rust language");
 
         Ok(())
     }
