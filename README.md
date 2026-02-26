@@ -2,12 +2,14 @@
 
 [![CI](https://github.com/teolex2020/AuraSDK/actions/workflows/test.yml/badge.svg)](https://github.com/teolex2020/AuraSDK/actions/workflows/test.yml)
 [![PyPI](https://img.shields.io/pypi/v/aura-memory.svg)](https://pypi.org/project/aura-memory/)
+[![Downloads](https://img.shields.io/pypi/dm/aura-memory.svg)](https://pypi.org/project/aura-memory/)
+[![GitHub stars](https://img.shields.io/github/stars/teolex2020/AuraSDK?style=social)](https://github.com/teolex2020/AuraSDK/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Patent Pending](https://img.shields.io/badge/Patent_Pending-US_63%2F969%2C703-blue.svg)](https://www.uspto.gov/)
 
 Cognitive memory for AI agents. Pure Rust, no embeddings required.
 
-> If you find Aura useful, please consider giving it a :star: — it helps others discover the project!
+> **:star: Like what you see?** A GitHub star helps others discover Aura and keeps the project going. [Star this repo](https://github.com/teolex2020/AuraSDK) — it takes 1 second!
 
 Aura gives your AI agent persistent, hierarchical memory that decays, consolidates, and evolves — like human memory. No LLM calls. No embedding API. No cloud. One `pip install`, 2.7 MB binary, works offline.
 
@@ -332,6 +334,16 @@ See [docs/API.md](docs/API.md) for the complete API reference (40+ methods).
 ## Contributing
 
 Contributions are welcome! Check out the [open issues](https://github.com/teolex2020/AuraSDK/issues) for ideas, or open a new one to discuss your proposal.
+
+## Support the Project
+
+If Aura saves you time or you find it useful, the best way to support it is:
+
+1. **:star: [Star this repo](https://github.com/teolex2020/AuraSDK)** — helps others discover Aura
+2. **Share** — tell your team, tweet about it, post in Discord
+3. **Contribute** — open an issue or PR, we welcome all contributions
+
+Every star makes a difference. Thank you!
 
 ## License & Intellectual Property
 
