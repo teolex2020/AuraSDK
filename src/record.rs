@@ -46,6 +46,18 @@ pub struct Record {
     pub aura_id: Option<String>,
     /// Causal parent record ID (for decision rationale chains).
     pub caused_by_id: Option<String>,
+    /// Isolation namespace. Records in different namespaces are invisible to each
+    /// other during recall/search unless explicitly requested.
+    /// Default: "default". Empty string is NOT valid.
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+}
+
+/// Default namespace for records.
+pub const DEFAULT_NAMESPACE: &str = "default";
+
+fn default_namespace() -> String {
+    DEFAULT_NAMESPACE.to_string()
 }
 
 impl Record {
@@ -73,6 +85,7 @@ impl Record {
             metadata: HashMap::new(),
             aura_id: None,
             caused_by_id: None,
+            namespace: DEFAULT_NAMESPACE.to_string(),
         }
     }
 
@@ -166,6 +179,22 @@ impl Record {
         (now - self.created_at) / 86400.0
     }
 
+    /// Validate a namespace string.
+    ///
+    /// Rules: non-empty, max 64 chars, ASCII alphanumeric + hyphens + underscores.
+    pub fn validate_namespace(ns: &str) -> Result<(), String> {
+        if ns.is_empty() {
+            return Err("Namespace cannot be empty".into());
+        }
+        if ns.len() > 64 {
+            return Err("Namespace cannot exceed 64 characters".into());
+        }
+        if !ns.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err("Namespace must contain only ASCII alphanumeric, hyphens, or underscores".into());
+        }
+        Ok(())
+    }
+
     /// Days since last activation.
     pub fn days_since_activation(&self) -> f64 {
         let now = SystemTime::now()
@@ -208,14 +237,22 @@ impl Record {
     #[getter]
     fn get_caused_by_id(&self) -> Option<String> { self.caused_by_id.clone() }
     #[getter]
+    fn get_namespace(&self) -> &str { &self.namespace }
+    #[getter]
     fn get_importance(&self) -> f32 { self.importance() }
 
     fn __repr__(&self) -> String {
+        let ns_suffix = if self.namespace == DEFAULT_NAMESPACE {
+            String::new()
+        } else {
+            format!(", ns='{}'", self.namespace)
+        };
         format!(
-            "Record(id='{}', level={}, strength={:.2}, content='{}...')",
+            "Record(id='{}', level={}, strength={:.2}{}, content='{}...')",
             self.id,
             self.level.name(),
             self.strength,
+            ns_suffix,
             &self.content.chars().take(40).collect::<String>()
         )
     }
@@ -329,5 +366,52 @@ mod tests {
         assert_eq!(restored.connections.len(), 1);
         assert!(restored.connection_types.is_empty()); // #[serde(default)] ensures this
         assert_eq!(restored.connection_type("other"), None);
+    }
+
+    // ── Namespace tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_default_namespace() {
+        let rec = Record::new("test".into(), Level::Working);
+        assert_eq!(rec.namespace, "default");
+    }
+
+    #[test]
+    fn test_custom_namespace() {
+        let mut rec = Record::new("test".into(), Level::Working);
+        rec.namespace = "project-x".to_string();
+        assert_eq!(rec.namespace, "project-x");
+    }
+
+    #[test]
+    fn test_backward_compat_no_namespace() {
+        // Old records without namespace field should deserialize with "default"
+        let rec = Record::new("old record".into(), Level::Working);
+        let mut json_val: serde_json::Value = serde_json::to_value(&rec).unwrap();
+        json_val.as_object_mut().unwrap().remove("namespace");
+        let restored: Record = serde_json::from_value(json_val).unwrap();
+        assert_eq!(restored.namespace, "default");
+    }
+
+    #[test]
+    fn test_namespace_serialization_roundtrip() {
+        let mut rec = Record::new("test".into(), Level::Working);
+        rec.namespace = "custom-ns".to_string();
+        let json = serde_json::to_string(&rec).unwrap();
+        let restored: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.namespace, "custom-ns");
+    }
+
+    #[test]
+    fn test_validate_namespace() {
+        assert!(Record::validate_namespace("default").is_ok());
+        assert!(Record::validate_namespace("project-x").is_ok());
+        assert!(Record::validate_namespace("test_ns").is_ok());
+        assert!(Record::validate_namespace("ns123").is_ok());
+        assert!(Record::validate_namespace("").is_err());
+        assert!(Record::validate_namespace("ab cd").is_err());
+        assert!(Record::validate_namespace("ns/path").is_err());
+        assert!(Record::validate_namespace(&"a".repeat(65)).is_err());
+        assert!(Record::validate_namespace(&"a".repeat(64)).is_ok());
     }
 }

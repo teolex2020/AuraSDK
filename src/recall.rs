@@ -92,15 +92,18 @@ pub fn collect_sdr(
     results
 }
 
-/// Collect N-gram fuzzy match results.
+/// Collect N-gram fuzzy match results, filtered to namespace-scoped records.
 pub fn collect_ngram(
     ngram_index: &NGramIndex,
+    records: &HashMap<String, Record>,
     query: &str,
     top_k: usize,
 ) -> Vec<(String, f32)> {
     ngram_index
-        .query(query, top_k * 2)
+        .query(query, top_k * 4)
         .into_iter()
+        .filter(|(_, rid)| records.contains_key(rid))
+        .take(top_k)
         .map(|(sim, rid)| (rid, sim))
         .collect()
 }
@@ -517,7 +520,7 @@ pub fn recall_pipeline(
 ) -> Vec<(f32, Record)> {
     // 1. Collect signals
     let sdr_ranked = collect_sdr(sdr, inverted_index, storage, aura_index, records, query, top_k);
-    let ngram_ranked = collect_ngram(ngram_index, query, top_k);
+    let ngram_ranked = collect_ngram(ngram_index, records, query, top_k);
     let tag_ranked = collect_tags(tag_index, records, query, top_k);
 
     // 2. RRF Fuse

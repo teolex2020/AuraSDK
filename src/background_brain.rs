@@ -315,6 +315,10 @@ pub fn discover_cross_connections(
         // 1-hop neighbors
         for neighbor_id in rec.connections.keys() {
             if let Some(neighbor) = records.get(neighbor_id) {
+                // Namespace guard: skip cross-namespace connections
+                if neighbor.namespace != rec.namespace {
+                    continue;
+                }
                 // 2-hop: neighbor's connections
                 for hop2_id in neighbor.connections.keys() {
                     if hop2_id != &rec.id
@@ -322,6 +326,10 @@ pub fn discover_cross_connections(
                         && discoveries.len() < max_discoveries
                     {
                         if let Some(hop2) = records.get(hop2_id) {
+                            // Namespace guard: skip cross-namespace 2-hop
+                            if hop2.namespace != rec.namespace {
+                                continue;
+                            }
                             discoveries.push(format!(
                                 "{} ← {} → {} (indirect connection)",
                                 truncate_utf8(&rec.content, 50),
