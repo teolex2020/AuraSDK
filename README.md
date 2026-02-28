@@ -55,11 +55,13 @@ report = brain.run_maintenance()
 | Memory lifecycle (decay/promote) | **Built-in** | Via LLM | Via LLM | Via LLM |
 | Trust & provenance scoring | **Built-in** | No | No | No |
 | Background maintenance (8 phases) | **Built-in** | No | No | No |
+| Namespace isolation | **Built-in** | No | No | No |
 | Encryption at rest | **ChaCha20** | No | No | No |
 | Language | **Rust** | Python | Proprietary | Python |
 
 ## Features
 
+- **Namespace Isolation** — `namespace="sandbox"` keeps test data invisible to production recall. Multi-namespace queries, move, stats
 - **Two-Tier Memory** — Cognitive (ephemeral) + Core (permanent) tiers with dedicated recall, stats, and promotion API
 - **RRF Fusion Recall** — Multi-signal ranking: SDR + MinHash + Tag Jaccard (+ optional embeddings), k=60
 - **Unified Recall** — `recall_full()`: RRF + substring fallback + failure search in 2 lock passes instead of 3
@@ -141,6 +143,34 @@ for rec in brain.promotion_candidates():
 print(Level.Working.tier)        # "cognitive"
 print(Level.Domain.is_core)      # True
 ```
+
+### Namespace Isolation
+
+```python
+from aura import Aura
+
+brain = Aura("./data")
+
+# Store in separate namespaces — they never mix during recall
+brain.store("Real user preference: dark mode", namespace="default")
+brain.store("Test case: user likes light mode", namespace="sandbox")
+
+# Recall only sees "default" namespace (default behavior)
+results = brain.recall_structured("user preference", top_k=5)
+# -> only "Real user preference: dark mode"
+
+# Query multiple namespaces at once
+results = brain.recall_structured("user", namespace=["default", "sandbox"], top_k=10)
+
+# Move a record between namespaces
+brain.move_record(record_id, "sandbox")
+
+# Namespace statistics
+print(brain.namespace_stats())    # {"default": 1, "sandbox": 1}
+print(brain.list_namespaces())    # ["default", "sandbox"]
+```
+
+Namespaces also enforce isolation for deduplication, consolidation, auto-connect, and co-activation — no cross-namespace side effects.
 
 ### Pluggable Embeddings (Optional)
 

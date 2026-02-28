@@ -33,8 +33,16 @@ pub fn consolidate(
 ) -> ConsolidationResult {
     let mut result = ConsolidationResult::default();
 
-    // Find similar pairs
-    let pairs = ngram_index.find_similar_pairs(CONSOLIDATION_THRESHOLD);
+    // Build namespace lookup for O(1) filtering
+    let ns_map: HashMap<&str, &str> = records.iter()
+        .map(|(id, r)| (id.as_str(), r.namespace.as_str()))
+        .collect();
+
+    // Find similar pairs (global MinHash) and pre-filter to same-namespace only
+    let all_pairs = ngram_index.find_similar_pairs(CONSOLIDATION_THRESHOLD);
+    let pairs: Vec<_> = all_pairs.into_iter()
+        .filter(|(id_a, id_b, _)| ns_map.get(id_a.as_str()) == ns_map.get(id_b.as_str()))
+        .collect();
     result.checked = pairs.len();
 
     // Process pairs (avoid double-processing)

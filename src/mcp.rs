@@ -34,6 +34,8 @@ pub struct RecallParams {
     query: String,
     /// Maximum tokens in output (default: 2048).
     token_budget: Option<usize>,
+    /// Namespace to search in (default: "default").
+    namespace: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -42,6 +44,8 @@ pub struct RecallStructuredParams {
     query: String,
     /// Maximum number of results (default: 20).
     top_k: Option<usize>,
+    /// Namespace to search in (default: "default").
+    namespace: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -56,6 +60,8 @@ pub struct StoreParams {
     content_type: Option<String>,
     /// ID of the record that caused this one.
     caused_by_id: Option<String>,
+    /// Namespace to store in (default: "default").
+    namespace: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -68,6 +74,8 @@ pub struct StoreCodeParams {
     filename: Option<String>,
     /// Tags for categorization.
     tags: Option<Vec<String>>,
+    /// Namespace to store in (default: "default").
+    namespace: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -82,6 +90,8 @@ pub struct StoreDecisionParams {
     tags: Option<Vec<String>>,
     /// ID of the record that caused this decision.
     caused_by_id: Option<String>,
+    /// Namespace to store in (default: "default").
+    namespace: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -94,6 +104,8 @@ pub struct SearchParams {
     tags: Option<Vec<String>>,
     /// Filter by content type.
     content_type: Option<String>,
+    /// Namespace to search in (default: "default").
+    namespace: Option<String>,
 }
 
 // ── Helper ──
@@ -144,16 +156,20 @@ impl AuraMcpServer {
 
     #[tool(description = "Retrieve relevant memories as context for a query. Call BEFORE answering to check existing knowledge. Returns formatted context for LLM injection.")]
     async fn recall(&self, Parameters(p): Parameters<RecallParams>) -> Result<CallToolResult, McpError> {
+        let ns_vec: Option<Vec<&str>> = p.namespace.as_ref().map(|s| vec![s.as_str()]);
+        let ns_slice: Option<&[&str]> = ns_vec.as_deref();
         let result = self.brain
-            .recall(&p.query, p.token_budget, None, None, None)
+            .recall(&p.query, p.token_budget, None, None, None, ns_slice)
             .map_err(|e| err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
     #[tool(description = "Retrieve memories as structured data with scores. Use when you need individual records with scores, levels, and metadata.")]
     async fn recall_structured(&self, Parameters(p): Parameters<RecallStructuredParams>) -> Result<CallToolResult, McpError> {
+        let ns_vec: Option<Vec<&str>> = p.namespace.as_ref().map(|s| vec![s.as_str()]);
+        let ns_slice: Option<&[&str]> = ns_vec.as_deref();
         let results = self.brain
-            .recall_structured(&p.query, p.top_k, None, None, None)
+            .recall_structured(&p.query, p.top_k, None, None, None, ns_slice)
             .map_err(|e| err(e.to_string()))?;
         let items: Vec<serde_json::Value> = results.iter().map(|(score, rec)| {
             serde_json::json!({
@@ -173,7 +189,7 @@ impl AuraMcpServer {
     async fn store(&self, Parameters(p): Parameters<StoreParams>) -> Result<CallToolResult, McpError> {
         let level = p.level.as_deref().and_then(parse_level);
         let rec = self.brain
-            .store(&p.content, level, p.tags, None, p.content_type.as_deref(), None, None, p.caused_by_id.as_deref())
+            .store(&p.content, level, p.tags, None, p.content_type.as_deref(), None, None, p.caused_by_id.as_deref(), p.namespace.as_deref())
             .map_err(|e| err(e.to_string()))?;
         let resp = serde_json::json!({"id": rec.id, "level": format!("{:?}", rec.level)});
         Ok(CallToolResult::success(vec![Content::text(resp.to_string())]))
@@ -189,7 +205,7 @@ impl AuraMcpServer {
         }
         let content = format!("```{}\n{}\n```", p.language, p.code);
         let rec = self.brain
-            .store(&content, Some(Level::Domain), Some(tags), None, Some("code"), None, None, None)
+            .store(&content, Some(Level::Domain), Some(tags), None, Some("code"), None, None, None, p.namespace.as_deref())
             .map_err(|e| err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::json!({"id": rec.id, "level": "DOMAIN"}).to_string()
@@ -208,7 +224,7 @@ impl AuraMcpServer {
         let mut tags = p.tags.unwrap_or_default();
         tags.push("decision".into());
         let rec = self.brain
-            .store(&content, Some(Level::Decisions), Some(tags), None, Some("decision"), None, None, p.caused_by_id.as_deref())
+            .store(&content, Some(Level::Decisions), Some(tags), None, Some("decision"), None, None, p.caused_by_id.as_deref(), p.namespace.as_deref())
             .map_err(|e| err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::json!({"id": rec.id, "level": "DECISIONS"}).to_string()
@@ -218,7 +234,9 @@ impl AuraMcpServer {
     #[tool(description = "Search memory by filters (exact/tag-based, not ranked). Use for browsing or counting.")]
     async fn search(&self, Parameters(p): Parameters<SearchParams>) -> Result<CallToolResult, McpError> {
         let level = p.level.as_deref().and_then(parse_level);
-        let results = self.brain.search(p.query.as_deref(), level, p.tags, None, p.content_type.as_deref());
+        let ns_vec: Option<Vec<&str>> = p.namespace.as_ref().map(|s| vec![s.as_str()]);
+        let ns_slice: Option<&[&str]> = ns_vec.as_deref();
+        let results = self.brain.search(p.query.as_deref(), level, p.tags, None, p.content_type.as_deref(), ns_slice);
         let items: Vec<serde_json::Value> = results.iter().map(|r| {
             serde_json::json!({
                 "id": r.id, "content": r.content,

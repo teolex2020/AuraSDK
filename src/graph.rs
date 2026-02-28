@@ -97,6 +97,15 @@ impl SessionTracker {
                 let id_a = &ids[i];
                 let id_b = &ids[j];
 
+                // Namespace guard: skip cross-namespace co-activation
+                let same_ns = match (records.get(id_a), records.get(id_b)) {
+                    (Some(a), Some(b)) => a.namespace == b.namespace,
+                    _ => false,
+                };
+                if !same_ns {
+                    continue;
+                }
+
                 // Get current weight
                 let current = records
                     .get(id_a)
@@ -172,6 +181,13 @@ pub fn auto_connect(
     for (candidate_id, shared_count) in &candidates {
         if new_record.connections.len() >= MAX_CONNECTIONS {
             break;
+        }
+
+        // Namespace guard: never auto-connect records across namespaces
+        if let Some(candidate) = records.get(candidate_id) {
+            if candidate.namespace != new_record.namespace {
+                continue;
+            }
         }
 
         let weight = (0.2 + 0.15 * *shared_count as f32).min(0.8);

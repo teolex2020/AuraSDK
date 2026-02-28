@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "aura-memory"
-version = "1.0.6"
+version = "1.1.0"
 authors = [{name = "AuraSDK", email = "aura@aurasdk.dev"}]
 description = "Cognitive memory for AI agents. Pure Rust, no embeddings."
 readme = "README.md"
