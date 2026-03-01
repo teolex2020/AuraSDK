@@ -7,12 +7,20 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Patent Pending](https://img.shields.io/badge/Patent_Pending-US_63%2F969%2C703-blue.svg)](https://www.uspto.gov/)
 
-Cognitive memory for AI agents. Pure Rust, no embeddings required.
+**Agent memory in 3 lines of Python. <1ms recall. No LLM. No cloud.**
 
 > **:star: Like what you see?** A GitHub star helps others discover Aura and keeps the project going. [Star this repo](https://github.com/teolex2020/AuraSDK) — it takes 1 second!
 
 Aura gives your AI agent persistent, hierarchical memory that decays, consolidates, and evolves — like human memory. No LLM calls. No embedding API. No cloud. One `pip install`, 2.7 MB binary, works offline.
 
+```python
+from aura import Aura
+brain = Aura("./agent")
+brain.store("User prefers dark mode", tags=["preference"])
+context = brain.recall("user preferences", token_budget=2000)  # <1ms
+```
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/teolex2020/AuraSDK/blob/main/examples/colab_quickstart.ipynb)
 [![YouTube Channel](https://img.shields.io/badge/YouTube-TechVanguard-red?logo=youtube)](https://www.youtube.com/@TechVanguard435)
 
 ```python
@@ -44,20 +52,22 @@ report = brain.run_maintenance()
 
 ## Why Aura?
 
-| | Aura | Mem0 | Zep | Letta/MemGPT |
-|---|---|---|---|---|
-| LLM required | **No** | Yes | Yes | Yes |
-| Embedding model required | **No** | Yes | Yes | No |
-| Works fully offline | **Yes** | Partial | No | With local LLM |
-| Cost per operation | **$0** | API billing | Credit-based | LLM cost |
-| Recall latency (1K records) | **<1ms** | ~200ms+ | ~200ms | LLM-bound |
-| Binary size | **2.7 MB** | Python pkg | Cloud service | Python pkg |
-| Memory lifecycle (decay/promote) | **Built-in** | Via LLM | Via LLM | Via LLM |
-| Trust & provenance scoring | **Built-in** | No | No | No |
-| Background maintenance (8 phases) | **Built-in** | No | No | No |
-| Namespace isolation | **Built-in** | No | No | No |
-| Encryption at rest | **ChaCha20** | No | No | No |
-| Language | **Rust** | Python | Proprietary | Python |
+| | Aura | Cognee | Mem0 | Zep | Letta/MemGPT |
+|---|---|---|---|---|---|
+| LLM required | **No** | Yes (cognify) | Yes | Yes | Yes |
+| Embedding model required | **No** | Yes | Yes | Yes | No |
+| Works fully offline | **Yes** | No (needs API) | Partial | No | With local LLM |
+| Cost per operation | **$0** | LLM + DB cost | API billing | Credit-based | LLM cost |
+| Recall latency (1K records) | **<1ms** | LLM-bound | ~200ms+ | ~200ms | LLM-bound |
+| Binary size | **2.7 MB** | Heavy (Python + Neo4j + vector DB) | Python pkg | Cloud service | Python pkg |
+| Memory lifecycle (decay/promote) | **Built-in** | No | Via LLM | Via LLM | Via LLM |
+| Trust & provenance scoring | **Built-in** | No | No | No | No |
+| Background maintenance (8 phases) | **Built-in** | No | No | No | No |
+| Namespace isolation | **Built-in** | No | No | No | No |
+| Encryption at rest | **ChaCha20** | No | No | No | No |
+| Knowledge graph | Via connections | **Built-in (Neo4j)** | No | No | No |
+| Document ingestion (PDF, audio) | No (agent memory) | **38+ sources** | No | No | No |
+| Language | **Rust** | Python | Python | Proprietary | Python |
 
 ## Features
 
@@ -68,6 +78,7 @@ report = brain.run_maintenance()
 - **4-Level Hierarchical Decay** — Working (0.80), Decisions (0.90), Domain (0.95), Identity (0.99) retention rates
 - **Living Memory** — 8-phase background maintenance: decay, reflect, insights, consolidation, cross-connections, archival
 - **Trust & Provenance** — Source authority scoring, provenance stamping, credibility tracking for 60+ domains
+- **Source Type Tracking** — `source_type="recorded|retrieved|inferred|generated"` — user data ranks higher than agent-generated in recall
 - **Typed Connections** — Causal, reflective, associative, coactivation graph links between memories
 - **Auto-Protect Guards** — Regex detection of phone numbers, emails, wallets, API keys with automatic tagging
 - **Pluggable Embeddings** — Optional 4th RRF signal: bring your own embedding function for semantic boost
@@ -379,6 +390,8 @@ Add to your Claude Desktop config (Settings > Developer > Edit Config):
 Restart Claude Desktop. Aura provides 8 tools: `recall`, `recall_structured`, `store`, `store_code`, `store_decision`, `search`, `insights`, `consolidate`.
 
 ## Examples
+
+**Try it now:** [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/teolex2020/AuraSDK/blob/main/examples/colab_quickstart.ipynb) — zero install, runs in browser
 
 **Core:**
 - [`basic_usage.py`](examples/basic_usage.py) — Store, recall, search, update, delete

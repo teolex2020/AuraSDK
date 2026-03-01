@@ -259,7 +259,7 @@ pub fn merge_records(
     store: &CognitiveStore,
 ) {
     // Get data from the record being removed
-    let (remove_tags, remove_connections, remove_conn_types, remove_strength, remove_level, remove_activation) = {
+    let (remove_tags, remove_connections, remove_conn_types, remove_strength, remove_level, remove_activation, remove_source_type) = {
         if let Some(remove) = records.get(remove_id) {
             (
                 remove.tags.clone(),
@@ -268,6 +268,7 @@ pub fn merge_records(
                 remove.strength,
                 remove.level,
                 remove.activation_count,
+                remove.source_type.clone(),
             )
         } else {
             return;
@@ -303,6 +304,14 @@ pub fn merge_records(
         // Combine strength
         keep.strength = (keep.strength + 0.3 * remove_strength).min(1.0);
         keep.activation_count += remove_activation;
+
+        // Preserve higher-authority source_type (recorded > retrieved > inferred > generated)
+        let rank = |st: &str| -> u8 {
+            match st { "recorded" => 3, "retrieved" => 2, "inferred" => 1, _ => 0 }
+        };
+        if rank(&remove_source_type) > rank(&keep.source_type) {
+            keep.source_type = remove_source_type;
+        }
     }
 
     // Delete the removed record

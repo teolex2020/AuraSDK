@@ -30,7 +30,7 @@ from aura._core import (
     CircuitBreakerConfig,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __all__ = [
     "Aura",
     "Level",

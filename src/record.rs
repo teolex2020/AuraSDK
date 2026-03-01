@@ -51,13 +51,29 @@ pub struct Record {
     /// Default: "default". Empty string is NOT valid.
     #[serde(default = "default_namespace")]
     pub namespace: String,
+    /// How the data was obtained — epistemological provenance.
+    /// Values: "recorded" (user interaction), "retrieved" (external source),
+    /// "inferred" (LLM reasoning), "generated" (agent-created).
+    /// Default: "recorded".
+    #[serde(default = "default_source_type")]
+    pub source_type: String,
 }
 
 /// Default namespace for records.
 pub const DEFAULT_NAMESPACE: &str = "default";
 
+/// Default source type for records (user interaction).
+pub const DEFAULT_SOURCE_TYPE: &str = "recorded";
+
+/// Valid epistemological source types.
+pub const VALID_SOURCE_TYPES: &[&str] = &["recorded", "retrieved", "inferred", "generated"];
+
 fn default_namespace() -> String {
     DEFAULT_NAMESPACE.to_string()
+}
+
+fn default_source_type() -> String {
+    DEFAULT_SOURCE_TYPE.to_string()
 }
 
 impl Record {
@@ -86,6 +102,7 @@ impl Record {
             aura_id: None,
             caused_by_id: None,
             namespace: DEFAULT_NAMESPACE.to_string(),
+            source_type: DEFAULT_SOURCE_TYPE.to_string(),
         }
     }
 
@@ -195,6 +212,21 @@ impl Record {
         Ok(())
     }
 
+    /// Validate a source_type string.
+    ///
+    /// Must be one of: "recorded", "retrieved", "inferred", "generated".
+    pub fn validate_source_type(st: &str) -> Result<(), String> {
+        if VALID_SOURCE_TYPES.contains(&st) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Invalid source_type '{}'. Must be one of: {}",
+                st,
+                VALID_SOURCE_TYPES.join(", ")
+            ))
+        }
+    }
+
     /// Days since last activation.
     pub fn days_since_activation(&self) -> f64 {
         let now = SystemTime::now()
@@ -238,6 +270,8 @@ impl Record {
     fn get_caused_by_id(&self) -> Option<String> { self.caused_by_id.clone() }
     #[getter]
     fn get_namespace(&self) -> &str { &self.namespace }
+    #[getter]
+    fn get_source_type(&self) -> &str { &self.source_type }
     #[getter]
     fn get_importance(&self) -> f32 { self.importance() }
 
@@ -413,5 +447,49 @@ mod tests {
         assert!(Record::validate_namespace("ns/path").is_err());
         assert!(Record::validate_namespace(&"a".repeat(65)).is_err());
         assert!(Record::validate_namespace(&"a".repeat(64)).is_ok());
+    }
+
+    // ── Source type tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_default_source_type() {
+        let rec = Record::new("test".into(), Level::Working);
+        assert_eq!(rec.source_type, "recorded");
+    }
+
+    #[test]
+    fn test_custom_source_type() {
+        let mut rec = Record::new("test".into(), Level::Working);
+        rec.source_type = "retrieved".to_string();
+        assert_eq!(rec.source_type, "retrieved");
+    }
+
+    #[test]
+    fn test_backward_compat_no_source_type() {
+        let rec = Record::new("old record".into(), Level::Working);
+        let mut json_val: serde_json::Value = serde_json::to_value(&rec).unwrap();
+        json_val.as_object_mut().unwrap().remove("source_type");
+        let restored: Record = serde_json::from_value(json_val).unwrap();
+        assert_eq!(restored.source_type, "recorded");
+    }
+
+    #[test]
+    fn test_source_type_serialization_roundtrip() {
+        let mut rec = Record::new("test".into(), Level::Working);
+        rec.source_type = "inferred".to_string();
+        let json = serde_json::to_string(&rec).unwrap();
+        let restored: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.source_type, "inferred");
+    }
+
+    #[test]
+    fn test_validate_source_type() {
+        assert!(Record::validate_source_type("recorded").is_ok());
+        assert!(Record::validate_source_type("retrieved").is_ok());
+        assert!(Record::validate_source_type("inferred").is_ok());
+        assert!(Record::validate_source_type("generated").is_ok());
+        assert!(Record::validate_source_type("unknown").is_err());
+        assert!(Record::validate_source_type("").is_err());
+        assert!(Record::validate_source_type("banana").is_err());
     }
 }
