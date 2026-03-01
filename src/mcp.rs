@@ -58,6 +58,8 @@ pub struct StoreParams {
     tags: Option<Vec<String>>,
     /// Content type hint (text, code, decision).
     content_type: Option<String>,
+    /// How the data was obtained: "recorded", "retrieved", "inferred", "generated".
+    source_type: Option<String>,
     /// ID of the record that caused this one.
     caused_by_id: Option<String>,
     /// Namespace to store in (default: "default").
@@ -104,6 +106,8 @@ pub struct SearchParams {
     tags: Option<Vec<String>>,
     /// Filter by content type.
     content_type: Option<String>,
+    /// Filter by source type: "recorded", "retrieved", "inferred", "generated".
+    source_type: Option<String>,
     /// Namespace to search in (default: "default").
     namespace: Option<String>,
 }
@@ -179,6 +183,7 @@ impl AuraMcpServer {
                 "level": format!("{:?}", rec.level),
                 "tags": rec.tags,
                 "strength": rec.strength,
+                "source_type": rec.source_type,
             })
         }).collect();
         let json = serde_json::to_string(&items).map_err(|e| err(e.to_string()))?;
@@ -189,7 +194,7 @@ impl AuraMcpServer {
     async fn store(&self, Parameters(p): Parameters<StoreParams>) -> Result<CallToolResult, McpError> {
         let level = p.level.as_deref().and_then(parse_level);
         let rec = self.brain
-            .store(&p.content, level, p.tags, None, p.content_type.as_deref(), None, None, p.caused_by_id.as_deref(), p.namespace.as_deref())
+            .store(&p.content, level, p.tags, None, p.content_type.as_deref(), p.source_type.as_deref(), None, None, p.caused_by_id.as_deref(), p.namespace.as_deref())
             .map_err(|e| err(e.to_string()))?;
         let resp = serde_json::json!({"id": rec.id, "level": format!("{:?}", rec.level)});
         Ok(CallToolResult::success(vec![Content::text(resp.to_string())]))
@@ -205,7 +210,7 @@ impl AuraMcpServer {
         }
         let content = format!("```{}\n{}\n```", p.language, p.code);
         let rec = self.brain
-            .store(&content, Some(Level::Domain), Some(tags), None, Some("code"), None, None, None, p.namespace.as_deref())
+            .store(&content, Some(Level::Domain), Some(tags), None, Some("code"), None, None, None, None, p.namespace.as_deref())
             .map_err(|e| err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::json!({"id": rec.id, "level": "DOMAIN"}).to_string()
@@ -224,7 +229,7 @@ impl AuraMcpServer {
         let mut tags = p.tags.unwrap_or_default();
         tags.push("decision".into());
         let rec = self.brain
-            .store(&content, Some(Level::Decisions), Some(tags), None, Some("decision"), None, None, p.caused_by_id.as_deref(), p.namespace.as_deref())
+            .store(&content, Some(Level::Decisions), Some(tags), None, Some("decision"), None, None, None, p.caused_by_id.as_deref(), p.namespace.as_deref())
             .map_err(|e| err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::json!({"id": rec.id, "level": "DECISIONS"}).to_string()
@@ -236,7 +241,7 @@ impl AuraMcpServer {
         let level = p.level.as_deref().and_then(parse_level);
         let ns_vec: Option<Vec<&str>> = p.namespace.as_ref().map(|s| vec![s.as_str()]);
         let ns_slice: Option<&[&str]> = ns_vec.as_deref();
-        let results = self.brain.search(p.query.as_deref(), level, p.tags, None, p.content_type.as_deref(), ns_slice);
+        let results = self.brain.search(p.query.as_deref(), level, p.tags, None, p.content_type.as_deref(), p.source_type.as_deref(), ns_slice);
         let items: Vec<serde_json::Value> = results.iter().map(|r| {
             serde_json::json!({
                 "id": r.id, "content": r.content,

@@ -326,6 +326,7 @@ pub fn causal_walk(
 /// - Source authority (user > agent > autonomous)
 /// - Recency boost (fresh records get +boost, decays over half_life)
 /// - Base trust score from provenance
+/// - Source type factor (recorded > retrieved > inferred > generated)
 ///
 /// Final score = rrf_score × strength × effective_trust
 pub fn apply_recency_scoring(
@@ -343,7 +344,7 @@ pub fn apply_recency_scoring(
 
     for (score, rec) in matched.iter_mut() {
         let effective_trust = trust::compute_effective_trust(
-            &rec.metadata, now_unix, config,
+            &rec.metadata, now_unix, config, &rec.source_type,
         );
         *score = *score * rec.strength * effective_trust;
     }
@@ -468,16 +469,24 @@ fn format_record(rec: &Record, records: &HashMap<String, Record>) -> String {
         format!(" [{}]", rec.tags.join(", "))
     };
 
+    // Source type label for non-recorded data (epistemological provenance)
+    let source_label = match rec.source_type.as_str() {
+        "retrieved" => " [retrieved]",
+        "inferred" => " [inferred]",
+        "generated" => " [generated]",
+        _ => "", // "recorded" is the default — no label needed
+    };
+
     let mut base = match rec.content_type.as_str() {
         "code" => {
             let lang = rec.metadata.get("language").map(|s| s.as_str()).unwrap_or("");
-            format!("  - [CODE]{}\n```{}\n{}\n```", tags_str, lang, rec.content)
+            format!("  - [CODE]{}{}\n```{}\n{}\n```", source_label, tags_str, lang, rec.content)
         }
         "json" => {
-            format!("  - [JSON]{}\n```json\n{}\n```", tags_str, rec.content)
+            format!("  - [JSON]{}{}\n```json\n{}\n```", source_label, tags_str, rec.content)
         }
         _ => {
-            format!("  - {}{}", rec.content, tags_str)
+            format!("  - {}{}{}", rec.content, source_label, tags_str)
         }
     };
 

@@ -205,11 +205,15 @@ pub fn stamp_provenance(
 
 /// Compute effective trust score at recall time.
 ///
-/// `effective_trust = (base_trust + recency_boost) × authority_multiplier`
+/// `effective_trust = (base_trust + recency_boost) × authority_multiplier × source_type_factor`
+///
+/// `source_type_factor` encodes epistemological reliability:
+/// recorded (direct user input) > retrieved (external source) > inferred (LLM reasoning) > generated (agent-created).
 pub fn compute_effective_trust(
     metadata: &HashMap<String, String>,
     now_unix: f64,
     trust_config: &TrustConfig,
+    source_type: &str,
 ) -> f32 {
     let trust = metadata
         .get("trust_score")
@@ -238,7 +242,16 @@ pub fn compute_effective_trust(
         * (1.0 - age_days as f32 / trust_config.recency_half_life_days))
         .max(0.0);
 
-    let effective = (trust + recency_boost) * authority;
+    // Source type factor — epistemological reliability
+    let source_type_factor = match source_type {
+        "recorded" => 1.0_f32,
+        "retrieved" => 0.9,
+        "inferred" => 0.85,
+        "generated" => 0.8,
+        _ => 0.9, // unknown defaults to retrieved-level
+    };
+
+    let effective = (trust + recency_boost) * authority * source_type_factor;
     effective.clamp(0.05, 1.0)
 }
 
@@ -276,10 +289,31 @@ mod tests {
         meta.insert("timestamp".into(), chrono::Utc::now().to_rfc3339());
 
         let now = chrono::Utc::now().timestamp() as f64;
-        let score = compute_effective_trust(&meta, now, &config);
-        // user-telegram authority = 1.2, trust = 0.8, recency = ~0.2
-        // effective = (0.8 + 0.2) * 1.2 = 1.2, clamped to 1.0
+        let score = compute_effective_trust(&meta, now, &config, "recorded");
+        // user-telegram authority = 1.2, trust = 0.8, recency = ~0.2, source_type = 1.0
+        // effective = (0.8 + 0.2) * 1.2 * 1.0 = 1.2, clamped to 1.0
         assert!(score >= 0.9);
+    }
+
+    #[test]
+    fn test_source_type_factor() {
+        let config = TrustConfig::default();
+        let mut meta = HashMap::new();
+        meta.insert("trust_score".into(), "0.7".into());
+        meta.insert("source".into(), "agent-interactive".into());
+        // Use a timestamp in the past so recency_boost ≈ 0
+        let old = chrono::Utc::now() - chrono::Duration::days(30);
+        meta.insert("timestamp".into(), old.to_rfc3339());
+        let now = chrono::Utc::now().timestamp() as f64;
+
+        let recorded = compute_effective_trust(&meta, now, &config, "recorded");
+        let retrieved = compute_effective_trust(&meta, now, &config, "retrieved");
+        let inferred = compute_effective_trust(&meta, now, &config, "inferred");
+        let generated = compute_effective_trust(&meta, now, &config, "generated");
+
+        assert!(recorded > retrieved, "recorded should rank higher than retrieved");
+        assert!(retrieved > inferred, "retrieved should rank higher than inferred");
+        assert!(inferred > generated, "inferred should rank higher than generated");
     }
 
     #[test]
