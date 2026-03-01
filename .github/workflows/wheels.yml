@@ -17,12 +17,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            interpreters: "3.9 3.10 3.11 3.12 3.13"
           - os: macos-14
             target: x86_64-apple-darwin
+            interpreters: "3.9 3.10 3.11 3.12 3.13"
           - os: macos-latest
             target: aarch64-apple-darwin
+            interpreters: "3.9 3.10 3.11 3.12 3.13"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            interpreters: "3.10 3.11 3.12 3.13"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,7 +36,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --features "pyo3/extension-module,encryption" --interpreter 3.9 3.10 3.11 3.12 3.13
+          args: --release --out dist --features "pyo3/extension-module,encryption" --interpreter ${{ matrix.interpreters }}
           manylinux: auto
       - uses: actions/upload-artifact@v4
         with:
