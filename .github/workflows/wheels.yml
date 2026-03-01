@@ -32,7 +32,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --features "pyo3/extension-module,encryption"
+          args: --release --out dist --features "pyo3/extension-module,encryption" --interpreter 3.9 3.10 3.11 3.12 3.13
           manylinux: auto
       - uses: actions/upload-artifact@v4
         with:
