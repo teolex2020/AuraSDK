@@ -1,7 +1,7 @@
 """Edge device memory — IoT, embedded, air-gapped environments.
 
 Demonstrates what makes Aura unique:
-- 2.7 MB binary, no external dependencies
+- ~3 MB binary, no external dependencies
 - Works completely offline (no LLM, no embeddings API, no cloud)
 - Encrypted at rest (ChaCha20-Poly1305 + Argon2id)
 - Auto-protect sensitive data (PII detection)
@@ -25,7 +25,7 @@ from aura import Aura, Level, MaintenanceConfig, TagTaxonomy
 # All data encrypted at rest. No data leaves the device.
 brain = Aura("./edge_data", password="demo-device-key")
 print(f"Encrypted brain: {brain.is_encrypted()}")
-print(f"Binary size: ~2.7 MB (pure Rust, no Python deps)")
+print(f"Binary size: ~~3 MB (pure Rust, no Python deps)")
 
 # ── Configure for edge constraints ──
 # Protect sensitive data automatically (regex-based PII detection)
