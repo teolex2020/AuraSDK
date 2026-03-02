@@ -11,7 +11,7 @@
 
 > **:star: Like what you see?** A GitHub star helps others discover Aura and keeps the project going. [Star this repo](https://github.com/teolex2020/AuraSDK) — it takes 1 second!
 
-Aura gives your AI agent persistent, hierarchical memory that decays, consolidates, and evolves — like human memory. No LLM calls. No embedding API. No cloud. One `pip install`, 2.7 MB binary, works offline.
+Aura gives your AI agent persistent, hierarchical memory that decays, consolidates, and evolves — like human memory. No LLM calls. No embedding API. No cloud. One `pip install`, ~3 MB binary, works offline.
 
 ```python
 from aura import Aura
@@ -21,7 +21,7 @@ context = brain.recall("user preferences", token_budget=2000)  # <1ms
 ```
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/teolex2020/AuraSDK/blob/main/examples/colab_quickstart.ipynb)
-[![YouTube Channel](https://img.shields.io/badge/YouTube-TechVanguard-red?logo=youtube)](https://www.youtube.com/@TechVanguard435)
+[![Demo Video](https://img.shields.io/badge/YouTube-Demo_30s-red?logo=youtube)](https://www.youtube.com/watch?v=ZyE9P2_uKxg)
 
 ```python
 from aura import Aura, Level
@@ -59,7 +59,7 @@ report = brain.run_maintenance()
 | Works fully offline | **Yes** | No (needs API) | Partial | No | With local LLM |
 | Cost per operation | **$0** | LLM + DB cost | API billing | Credit-based | LLM cost |
 | Recall latency (1K records) | **<1ms** | LLM-bound | ~200ms+ | ~200ms | LLM-bound |
-| Binary size | **2.7 MB** | Heavy (Python + Neo4j + vector DB) | Python pkg | Cloud service | Python pkg |
+| Binary size | **~3 MB** | Heavy (Python + Neo4j + vector DB) | Python pkg | Cloud service | Python pkg |
 | Memory lifecycle (decay/promote) | **Built-in** | No | Via LLM | Via LLM | Via LLM |
 | Trust & provenance scoring | **Built-in** | No | No | No | No |
 | Background maintenance (8 phases) | **Built-in** | No | No | No | No |
@@ -295,7 +295,7 @@ context = brain.recall(user_message, token_budget=2000)
 ### Edge / IoT / Air-gapped
 
 ```python
-# 2.7 MB binary, encrypted, zero network dependencies
+# ~3 MB binary, encrypted, zero network dependencies
 brain = Aura("./edge_data", password="device-key")
 brain.store("Sensor reading: 22.5C", tags=["sensor"])
 # Auto-protect detects PII: phone, email, wallet, API key
@@ -314,7 +314,7 @@ Benchmarked on Windows 10 / Ryzen 7 / 1000 records:
 | Recall (cached) | 0.48 us/op | **~400,000x faster** |
 | Search by tag | 0.01 ms/op | N/A |
 | Maintenance cycle | 1.1 ms | No equivalent |
-| Binary size | 2.7 MB | ~50 MB+ (Python + deps) |
+| Binary size | ~3 MB | ~50 MB+ (Python + deps) |
 
 *Mem0 recall requires embedding API call (~200ms+) + vector search. Aura recall is pure local computation.
 
@@ -414,7 +414,7 @@ See [docs/API.md](docs/API.md) for the complete API reference (40+ methods).
 
 ## Community & Resources
 
-- [YouTube — TechVanguard](https://www.youtube.com/@TechVanguard435) — Video tutorials and demos (Ukrainian)
+- [Demo Video (30s)](https://www.youtube.com/watch?v=ZyE9P2_uKxg) — Quick overview of Aura in action
 - [API Reference](docs/API.md) — Complete API docs (40+ methods)
 - [Examples](examples/) — Ready-to-run scripts
 - [Landing Page](https://aurasdk.dev) — Project overview
