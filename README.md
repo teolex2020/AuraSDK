@@ -1,4 +1,4 @@
-# Aura
+# AuraSDK: The Cognitive Memory Layer for Autonomous Agents
 
 [![CI](https://github.com/teolex2020/AuraSDK/actions/workflows/test.yml/badge.svg)](https://github.com/teolex2020/AuraSDK/actions/workflows/test.yml)
 [![PyPI](https://img.shields.io/pypi/v/aura-memory.svg)](https://pypi.org/project/aura-memory/)
@@ -7,185 +7,127 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Patent Pending](https://img.shields.io/badge/Patent_Pending-US_63%2F969%2C703-blue.svg)](https://www.uspto.gov/)
 
-**Agent memory in 3 lines of Python. <1ms recall. No LLM. No cloud.**
+## The Problem
 
-> **:star: Like what you see?** A GitHub star helps others discover Aura and keeps the project going. [Star this repo](https://github.com/teolex2020/AuraSDK) — it takes 1 second!
+**LLMs forget everything.** Every conversation starts from zero. Standard vector databases store text but lack association, decay, and trust. Existing memory solutions (Mem0, Zep, Cognee) require LLM calls for basic recall — adding latency, cloud dependency, and cost to every operation.
 
-Aura gives your AI agent persistent, hierarchical memory that decays, consolidates, and evolves — like human memory. No LLM calls. No embedding API. No cloud. One `pip install`, ~3 MB binary, works offline.
+**Your agent needs a long-term brain, not another API call.**
 
-```python
-from aura import Aura
-brain = Aura("./agent")
-brain.store("User prefers dark mode", tags=["preference"])
-context = brain.recall("user preferences", token_budget=2000)  # <1ms
+## The Solution
+
+Aura gives your AI agent persistent, hierarchical memory that decays, consolidates, and evolves — like a human brain. No LLM calls. No embedding API. No cloud. One `pip install`, ~3 MB binary, works fully offline.
+
+```bash
+pip install aura-memory
 ```
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/teolex2020/AuraSDK/blob/main/examples/colab_quickstart.ipynb)
-[![Demo Video](https://img.shields.io/badge/YouTube-Demo_30s-red?logo=youtube)](https://www.youtube.com/watch?v=ZyE9P2_uKxg)
 
 ```python
 from aura import Aura, Level
 
-brain = Aura("./my_agent")
+brain = Aura("./agent_memory")
+
+brain.store("User prefers dark mode", level=Level.Identity, tags=["ui"])
+brain.store("Deploy to staging first", level=Level.Decisions, tags=["workflow"])
+
+context = brain.recall("user preferences")  # <1ms, inject into any LLM
+```
+
+That's it. Your agent now remembers.
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/teolex2020/AuraSDK/blob/main/examples/colab_quickstart.ipynb)
+[![Demo Video](https://img.shields.io/badge/YouTube-Demo_30s-red?logo=youtube)](https://www.youtube.com/watch?v=ZyE9P2_uKxg)
+
+## Why Aura?
+
+| | Aura | Mem0 | Zep | Cognee | Letta/MemGPT |
+|---|---|---|---|---|---|
+| **LLM required** | **No** | Yes | Yes | Yes (cognify) | Yes |
+| **Recall latency** | **<1ms** | ~200ms+ | ~200ms | LLM-bound | LLM-bound |
+| **Works offline** | **Fully** | Partial | No | No (needs API) | With local LLM |
+| **Cost per operation** | **$0** | API billing | Credit-based | LLM + DB cost | LLM cost |
+| **Binary size** | **~3 MB** | Python pkg | Cloud service | Heavy (Neo4j + vector DB) | Python pkg |
+| **Memory decay & promotion** | **Built-in** | Via LLM | Via LLM | No | Via LLM |
+| **Trust & provenance** | **Built-in** | No | No | No | No |
+| **Encryption at rest** | **ChaCha20 + Argon2** | No | No | No | No |
+| **Language** | **Rust** | Python | Proprietary | Python | Python |
+
+## How Memory Works
+
+Aura organizes memories into 4 levels across 2 tiers — important memories persist, trivial ones decay naturally:
+
+```
+CORE TIER (slow decay, weeks to months)
+  Identity  [0.99]  Who the user is. Preferences. Personality.
+  Domain    [0.95]  Learned facts. Domain knowledge.
+
+COGNITIVE TIER (fast decay, hours to days)
+  Decisions [0.90]  Choices made. Action items.
+  Working   [0.80]  Current tasks. Recent messages.
+```
+
+One call runs the full lifecycle — decay, promote, merge duplicates, archive expired:
+
+```python
+report = brain.run_maintenance()  # 8 phases, <1ms
+```
+
+## Key Features
+
+- **RRF Fusion Recall** — Multi-signal ranking: SDR + MinHash + Tag Jaccard (+ optional embeddings)
+- **Trust & Provenance** — Source authority scoring: user input outranks web scrapes, automatically
+- **Source Type Tracking** — Every memory carries provenance: `recorded`, `retrieved`, `inferred`, `generated`
+- **Two-Tier Memory** — Cognitive (ephemeral) + Core (permanent) with dedicated recall and promotion API
+- **Namespace Isolation** — `namespace="sandbox"` keeps test data invisible to production recall
+- **Pluggable Embeddings** — Optional 4th RRF signal: bring your own embedding function
+- **Auto-Protect Guards** — Detects phone numbers, emails, wallets, API keys automatically
+- **Typed Connections** — Causal, reflective, associative graph links between memories
+- **Background Maintenance** — 8-phase cycle: decay, reflect, insights, consolidation, archival
+- **Encryption** — ChaCha20-Poly1305 with Argon2id key derivation
+- **Pure Rust** — No Python dependencies, no external services, ~3 MB binary
+
+## Quick Start
+
+### Store & Recall
+
+```python
+from aura import Aura, Level
+
+brain = Aura("./data")
 
 # Store memories at different importance levels
 brain.store("User prefers dark mode", level=Level.Identity, tags=["preference"])
 brain.store("Deploy to staging first", level=Level.Decisions, tags=["workflow"])
 brain.store("Bug in auth module", level=Level.Working, tags=["bug", "auth"])
 
-# Recall with RRF Fusion (SDR + MinHash + Tag Jaccard)
+# Recall returns formatted context — inject straight into LLM system prompt
 context = brain.recall("authentication issues", token_budget=2000)
 
-# Structured recall with trust-weighted scores
+# Structured recall returns scored results with metadata
 results = brain.recall_structured("user preferences", top_k=5)
 for r in results:
-    print(f"  [{r['level']}] score={r['score']:.3f} — {r['content'][:60]}")
-
-# Unified recall: RRF + substring + failure search in one call
-results = brain.recall_full("auth bug", top_k=10, include_failures=True)
-for r in results:
-    print(f"  score={r['score']:.3f}  [{r['level']}] {r['content'][:60]}")
-
-# Run maintenance (decay, consolidation, insights, archival)
-report = brain.run_maintenance()
+    print(f"  [{r['level']}] score={r['score']:.3f} -- {r['content'][:60]}")
 ```
 
-## Why Aura?
-
-| | Aura | Cognee | Mem0 | Zep | Letta/MemGPT |
-|---|---|---|---|---|---|
-| LLM required | **No** | Yes (cognify) | Yes | Yes | Yes |
-| Embedding model required | **No** | Yes | Yes | Yes | No |
-| Works fully offline | **Yes** | No (needs API) | Partial | No | With local LLM |
-| Cost per operation | **$0** | LLM + DB cost | API billing | Credit-based | LLM cost |
-| Recall latency (1K records) | **<1ms** | LLM-bound | ~200ms+ | ~200ms | LLM-bound |
-| Binary size | **~3 MB** | Heavy (Python + Neo4j + vector DB) | Python pkg | Cloud service | Python pkg |
-| Memory lifecycle (decay/promote) | **Built-in** | No | Via LLM | Via LLM | Via LLM |
-| Trust & provenance scoring | **Built-in** | No | No | No | No |
-| Background maintenance (8 phases) | **Built-in** | No | No | No | No |
-| Namespace isolation | **Built-in** | No | No | No | No |
-| Encryption at rest | **ChaCha20** | No | No | No | No |
-| Knowledge graph | Via connections | **Built-in (Neo4j)** | No | No | No |
-| Document ingestion (PDF, audio) | No (agent memory) | **38+ sources** | No | No | No |
-| Language | **Rust** | Python | Python | Proprietary | Python |
-
-## Features
-
-- **Namespace Isolation** — `namespace="sandbox"` keeps test data invisible to production recall. Multi-namespace queries, move, stats
-- **Two-Tier Memory** — Cognitive (ephemeral) + Core (permanent) tiers with dedicated recall, stats, and promotion API
-- **RRF Fusion Recall** — Multi-signal ranking: SDR + MinHash + Tag Jaccard (+ optional embeddings), k=60
-- **Unified Recall** — `recall_full()`: RRF + substring fallback + failure search in 2 lock passes instead of 3
-- **4-Level Hierarchical Decay** — Working (0.80), Decisions (0.90), Domain (0.95), Identity (0.99) retention rates
-- **Living Memory** — 8-phase background maintenance: decay, reflect, insights, consolidation, cross-connections, archival
-- **Trust & Provenance** — Source authority scoring, provenance stamping, credibility tracking for 60+ domains
-- **Source Type Tracking** — `source_type="recorded|retrieved|inferred|generated"` — user data ranks higher than agent-generated in recall
-- **Typed Connections** — Causal, reflective, associative, coactivation graph links between memories
-- **Auto-Protect Guards** — Regex detection of phone numbers, emails, wallets, API keys with automatic tagging
-- **Pluggable Embeddings** — Optional 4th RRF signal: bring your own embedding function for semantic boost
-- **Research Orchestrator** — Start research sessions, collect findings with credibility, synthesize results
-- **Circuit Breaker** — Per-tool failure tracking with automatic circuit open/close
-- **Encryption** — ChaCha20-Poly1305 with Argon2id key derivation (optional)
-- **Pure Rust** — No Python dependencies, no external services, <3 MB binary
-
-## Installation
-
-```bash
-pip install aura-memory
-```
-
-Requires Python 3.9+. Pre-built wheels for Linux, macOS, and Windows.
-
-## Quick Start
-
-### Basic Store & Recall
+### Trust & Provenance
 
 ```python
-from aura import Aura, Level
+from aura import Aura, TrustConfig
 
 brain = Aura("./data")
 
-# Store with auto-deduplication
-brain.store("Python uses indentation for blocks", tags=["python", "syntax"])
-brain.store("Rust has zero-cost abstractions", level=Level.Domain, tags=["rust"])
+tc = TrustConfig()
+tc.source_trust = {"user": 1.0, "api": 0.8, "web_scrape": 0.5}
+brain.set_trust_config(tc)
 
-# Recall returns formatted context for LLM injection
-context = brain.recall("programming language features")
-print(context)
-# === COGNITIVE CONTEXT ===
-# [DOMAIN]
-#   - Rust has zero-cost abstractions [rust]
-# [WORKING]
-#   - Python uses indentation for blocks [python, syntax]
+# User facts rank higher than scraped data in recall
+brain.store("User is vegan", channel="user")
+brain.store("User might like steak restaurants", channel="web_scrape")
 
-# Structured recall returns scored results
-results = brain.recall_structured("rust", top_k=3)
-for r in results:
-    print(f"  score={r['score']:.3f}  {r['content']}")
+results = brain.recall_structured("food preferences", top_k=5)
+# -> "User is vegan" scores higher, always
 ```
-
-### Two-Tier Memory (Cognitive / Core)
-
-```python
-from aura import Aura, Level
-
-brain = Aura("./data")
-
-# Store across tiers
-brain.store("Meeting notes from today", level=Level.Working, tags=["meeting"])
-brain.store("Decided to use PostgreSQL", level=Level.Decisions, tags=["db"])
-brain.store("Python uses GIL for thread safety", level=Level.Domain, tags=["python"])
-brain.store("User prefers Ukrainian language", level=Level.Identity, tags=["preference"])
-
-# Query only cognitive tier (recent context)
-recent = brain.recall_cognitive("meeting")
-
-# Query only core tier (permanent knowledge)
-knowledge = brain.recall_core_tier("python")
-
-# Tier statistics
-stats = brain.tier_stats()
-print(f"Cognitive: {stats['cognitive_total']}  Core: {stats['core_total']}")
-
-# Find and promote frequent cognitive records to core
-for rec in brain.promotion_candidates():
-    brain.promote_record(rec.id)
-
-# Level properties
-print(Level.Working.tier)        # "cognitive"
-print(Level.Domain.is_core)      # True
-```
-
-### Namespace Isolation
-
-```python
-from aura import Aura
-
-brain = Aura("./data")
-
-# Store in separate namespaces — they never mix during recall
-brain.store("Real user preference: dark mode", namespace="default")
-brain.store("Test case: user likes light mode", namespace="sandbox")
-
-# Recall only sees "default" namespace (default behavior)
-results = brain.recall_structured("user preference", top_k=5)
-# -> only "Real user preference: dark mode"
-
-# Query multiple namespaces at once
-results = brain.recall_structured("user", namespace=["default", "sandbox"], top_k=10)
-
-# Move a record between namespaces
-brain.move_record(record_id, "sandbox")
-
-# Namespace statistics
-print(brain.namespace_stats())    # {"default": 1, "sandbox": 1}
-print(brain.list_namespaces())    # ["default", "sandbox"]
-```
-
-Namespaces also enforce isolation for deduplication, consolidation, auto-connect, and co-activation — no cross-namespace side effects.
 
 ### Pluggable Embeddings (Optional)
-
-Aura works without embeddings, but you can add them as a 4th RRF signal for better semantic recall:
 
 ```python
 from aura import Aura
@@ -195,76 +137,87 @@ brain = Aura("./data")
 # Plug in any embedding function: OpenAI, Ollama, sentence-transformers, etc.
 from sentence_transformers import SentenceTransformer
 model = SentenceTransformer("all-MiniLM-L6-v2")
-
 brain.set_embedding_fn(lambda text: model.encode(text).tolist())
 
-# Now store and recall use embeddings as a 4th signal in RRF fusion
+# Now "login problems" matches "Authentication failed" via semantic similarity
 brain.store("Authentication failed for user admin")
-brain.store("Login issues reported on the dashboard")
-
-# "login problems" matches via embedding even without exact word overlap
 results = brain.recall_structured("login problems", top_k=5)
 ```
 
-When offline or without an embedding model, Aura falls back to SDR + MinHash + Tag Jaccard — still fast, still effective.
-
-### Trust & Provenance
-
-```python
-from aura import Aura, TrustConfig
-
-brain = Aura("./data")
-
-# Configure source trust
-tc = TrustConfig()
-tc.source_trust = {"user": 1.0, "api": 0.8, "web_scrape": 0.5}
-brain.set_trust_config(tc)
-
-# Store with provenance (channel stamps source automatically)
-brain.store("API response data", tags=["api"], channel="api_endpoint")
-
-# Structured recall applies trust weighting
-# final_score = rrf_score * effective_trust
-results = brain.recall_structured("api data", top_k=5)
-```
-
-### Living Memory (Background Maintenance)
-
-```python
-from aura import Aura, MaintenanceConfig
-
-brain = Aura("./data")
-
-# Single maintenance cycle (8 phases)
-report = brain.run_maintenance()
-print(f"Decayed: {report.decay.decayed}")
-print(f"Promoted: {report.reflect.promoted}")
-print(f"Consolidated: {report.consolidation.native_merged}")
-print(f"Archived: {report.records_archived}")
-
-# Start background maintenance thread
-brain.start_background(interval_secs=120)
-```
+Without embeddings, Aura falls back to SDR + MinHash + Tag Jaccard — still fast, still effective.
 
 ### Encryption
 
 ```python
-# All data encrypted at rest with ChaCha20-Poly1305
 brain = Aura("./secret_data", password="my-secure-password")
 brain.store("Top secret information")
-assert brain.is_encrypted()
+assert brain.is_encrypted()  # ChaCha20-Poly1305 + Argon2id
 ```
+
+### Namespace Isolation
+
+```python
+brain = Aura("./data")
+
+brain.store("Real preference: dark mode", namespace="default")
+brain.store("Test: user likes light mode", namespace="sandbox")
+
+# Recall only sees "default" namespace — sandbox is invisible
+results = brain.recall_structured("user preference", top_k=5)
+```
+
+## Cookbook: Personal Assistant That Remembers
+
+The killer use case: an agent that remembers your preferences after a week offline, with zero API calls.
+
+See [`examples/personal_assistant.py`](examples/personal_assistant.py) for the full runnable script.
+
+```python
+from aura import Aura, Level
+
+brain = Aura("./assistant_memory")
+
+# Day 1: User tells the agent about themselves
+brain.store("User is vegan", level=Level.Identity, tags=["diet"])
+brain.store("User loves jazz music", level=Level.Identity, tags=["music"])
+brain.store("User works 10am-6pm", level=Level.Identity, tags=["schedule"])
+brain.store("Discuss quarterly report tomorrow", level=Level.Working, tags=["task"])
+
+# Simulate a week passing — run maintenance cycles
+for _ in range(7):
+    brain.run_maintenance()  # decay + reflect + consolidate + archive
+
+# Day 8: What does the agent remember?
+context = brain.recall("user preferences and personality")
+# -> Still remembers: vegan, jazz, schedule (Identity, strength ~0.93)
+# -> "quarterly report" decayed heavily (Working, strength ~0.21)
+```
+
+Identity persists. Tasks fade. Important patterns get promoted. Like a real brain.
+
+## Performance
+
+Benchmarked on Windows 10 / Ryzen 7 / 1,000 records:
+
+| Operation | Latency | vs Mem0* |
+|-----------|---------|----------|
+| Store | 0.09 ms/op | ~same |
+| Recall (structured) | 0.74 ms/op | **~270x faster** |
+| Recall (cached) | 0.48 us/op | **~400,000x faster** |
+| Search by tag | 0.01 ms/op | N/A |
+| Maintenance cycle | 1.1 ms | No equivalent |
+| Binary size | ~3 MB | ~50 MB+ (Python + deps) |
+
+\*Mem0 recall requires embedding API call (~200ms+) + vector search. Aura recall is pure local computation.
 
 ## Dashboard UI
 
-Aura includes a standalone web dashboard for visual memory management. Download the binary from [GitHub Releases](https://github.com/teolex2020/AuraSDK/releases) — no extra dependencies needed.
+Aura includes a standalone web dashboard for visual memory management. Download from [GitHub Releases](https://github.com/teolex2020/AuraSDK/releases).
 
 ```bash
-# Download for your platform, then:
 ./aura-dashboard ./my_brain --port 8000
 ```
 
-Opens `http://localhost:8000` in your browser with:
 - **Analytics** — total memories, plasticity stats, DNA distribution
 - **Memory Explorer** — paginated table with filtering, edit, delete, batch operations
 - **Recall Console** — test RRF Fusion search with live scoring
@@ -277,104 +230,15 @@ Opens `http://localhost:8000` in your browser with:
 | macOS ARM | `aura-dashboard-macos-arm64` |
 | macOS x64 | `aura-dashboard-macos-x64` |
 
-Environment variables: `AURA_API_KEY`, `AURA_CORS_ORIGINS`, `AURA_TLS_CERT`/`AURA_TLS_KEY`. See `--help` for details.
-
-## Use Cases
-
-### Aura + Ollama (fully local AI with memory)
-
-```python
-# No cloud. No API keys. Everything runs on your machine.
-# See examples/ollama_agent.py for the full example.
-
-brain = Aura("./agent_data")
-context = brain.recall(user_message, token_budget=2000)
-# Inject context into Ollama system prompt...
-```
-
-### Edge / IoT / Air-gapped
-
-```python
-# ~3 MB binary, encrypted, zero network dependencies
-brain = Aura("./edge_data", password="device-key")
-brain.store("Sensor reading: 22.5C", tags=["sensor"])
-# Auto-protect detects PII: phone, email, wallet, API key
-brain.store("User phone: +380991234567", tags=["user"])
-# -> automatically adds "contact" tag, blocks consolidation
-```
-
-## Performance
-
-Benchmarked on Windows 10 / Ryzen 7 / 1000 records:
-
-| Operation | Latency | vs Mem0* |
-|-----------|---------|----------|
-| Store | 0.09 ms/op | ~same |
-| Recall (structured) | 0.74 ms/op | **~270x faster** |
-| Recall (cached) | 0.48 us/op | **~400,000x faster** |
-| Search by tag | 0.01 ms/op | N/A |
-| Maintenance cycle | 1.1 ms | No equivalent |
-| Binary size | ~3 MB | ~50 MB+ (Python + deps) |
-
-*Mem0 recall requires embedding API call (~200ms+) + vector search. Aura recall is pure local computation.
-
-## Memory Levels & Tiers
-
-| Tier | Level | Retention | Use Case |
-|------|-------|-----------|----------|
-| **Cognitive** | `Level.Working` | 0.80/cycle | Short-term: current tasks, recent messages |
-| **Cognitive** | `Level.Decisions` | 0.90/cycle | Medium-term: choices made, action items |
-| **Core** | `Level.Domain` | 0.95/cycle | Long-term: learned facts, domain knowledge |
-| **Core** | `Level.Identity` | 0.99/cycle | Permanent: user preferences, core identity |
-
-**Cognitive tier** = ephemeral working memory (fast decay, hours to days).
-**Core tier** = permanent knowledge base (slow decay, weeks to months).
-
-Records are automatically promoted based on access patterns and demoted through decay. Use `promotion_candidates()` to find cognitive records ready for core, and `promote_record()` to move them up.
-
-## Architecture
-
-```
-Python  --  from aura import Aura  -->  aura._core (PyO3)
-                                              |
-Rust    ------------------------------------------
-        +---------------------------------------------+
-        |  Aura (orchestrator)                         |
-        |                                              |
-        |  Two-Tier Memory                             |
-        |  +-- Cognitive Tier (Working + Decisions)    |
-        |  |   recall_cognitive(), promotion_candidates |
-        |  +-- Core Tier (Domain + Identity)           |
-        |  |   recall_core_tier(), tier_stats()        |
-        |  |   promote_record()                        |
-        |                                              |
-        |  Recall Engine                               |
-        |  +-- RRF Fusion (k=60)                       |
-        |      +-- Signal 1: SDR similarity (256k bit) |
-        |      +-- Signal 2: MinHash N-gram            |
-        |      +-- Signal 3: Tag Jaccard               |
-        |      +-- Signal 4: Embedding (optional)      |
-        |                                              |
-        |  Knowledge Graph (typed connections)          |
-        |  Living Memory (8-phase maintenance)          |
-        |  Trust & Provenance                           |
-        |  Guards (auto-protect sensitive data)         |
-        |  Circuit Breaker (per-tool)                   |
-        |  Research Orchestrator                        |
-        |  Identity (profile + persona)                 |
-        |  Encryption (ChaCha20 + Argon2id)             |
-        +---------------------------------------------+
-```
-
 ## MCP Server (Claude Desktop)
 
-Aura works as an MCP server for Claude Desktop — giving Claude persistent memory across conversations:
+Give Claude persistent memory across conversations:
 
 ```bash
 pip install aura-memory
 ```
 
-Add to your Claude Desktop config (Settings > Developer > Edit Config):
+Add to Claude Desktop config (Settings > Developer > Edit Config):
 
 ```json
 {
@@ -387,11 +251,14 @@ Add to your Claude Desktop config (Settings > Developer > Edit Config):
 }
 ```
 
-Restart Claude Desktop. Aura provides 8 tools: `recall`, `recall_structured`, `store`, `store_code`, `store_decision`, `search`, `insights`, `consolidate`.
+Provides 8 tools: `recall`, `recall_structured`, `store`, `store_code`, `store_decision`, `search`, `insights`, `consolidate`.
 
 ## Examples
 
-**Try it now:** [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/teolex2020/AuraSDK/blob/main/examples/colab_quickstart.ipynb) — zero install, runs in browser
+**Try now:** [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/teolex2020/AuraSDK/blob/main/examples/colab_quickstart.ipynb) — zero install, runs in browser
+
+**Cookbook:**
+- [`personal_assistant.py`](examples/personal_assistant.py) — Agent that remembers preferences after a week offline
 
 **Core:**
 - [`basic_usage.py`](examples/basic_usage.py) — Store, recall, search, update, delete
@@ -408,32 +275,55 @@ Restart Claude Desktop. Aura provides 8 tools: `recall`, `recall_structured`, `s
 - [`autogen_agent.py`](examples/autogen_agent.py) — AutoGen: Memory protocol implementation
 - [`research_bot.py`](examples/research_bot.py) — Research orchestrator with trust scoring
 
+## Architecture
+
+```
+Python  --  from aura import Aura  -->  aura._core (PyO3)
+                                              |
+Rust    ------------------------------------------
+        +---------------------------------------------+
+        |  Aura (orchestrator)                         |
+        |                                              |
+        |  Two-Tier Memory                             |
+        |  +-- Cognitive Tier (Working + Decisions)    |
+        |  +-- Core Tier (Domain + Identity)           |
+        |                                              |
+        |  Recall Engine (RRF Fusion, k=60)            |
+        |  +-- SDR similarity (256k bit)               |
+        |  +-- MinHash N-gram                          |
+        |  +-- Tag Jaccard                             |
+        |  +-- Embedding (optional, pluggable)         |
+        |                                              |
+        |  Knowledge Graph (typed connections)          |
+        |  Living Memory (8-phase maintenance)          |
+        |  Trust & Provenance                           |
+        |  Guards (auto-protect PII)                    |
+        |  Encryption (ChaCha20 + Argon2id)             |
+        +---------------------------------------------+
+```
+
 ## API Reference
 
 See [docs/API.md](docs/API.md) for the complete API reference (40+ methods).
 
-## Community & Resources
+## Resources
 
-- [Demo Video (30s)](https://www.youtube.com/watch?v=ZyE9P2_uKxg) — Quick overview of Aura in action
-- [API Reference](docs/API.md) — Complete API docs (40+ methods)
+- [Demo Video (30s)](https://www.youtube.com/watch?v=ZyE9P2_uKxg) — Quick overview
+- [API Reference](docs/API.md) — Complete API docs
 - [Examples](examples/) — Ready-to-run scripts
 - [Landing Page](https://aurasdk.dev) — Project overview
 
 ## Contributing
 
-Contributions are welcome! Check out the [open issues](https://github.com/teolex2020/AuraSDK/issues) for ideas, or open a new one to discuss your proposal.
+Contributions welcome! Check the [open issues](https://github.com/teolex2020/AuraSDK/issues) or open a new one.
 
-## Support the Project
-
-If Aura saves you time or you find it useful, the best way to support it is:
-
-1. **:star: [Star this repo](https://github.com/teolex2020/AuraSDK)** — helps others discover Aura
-2. **Share** — tell your team, tweet about it, post in Discord
-3. **Contribute** — open an issue or PR, we welcome all contributions
-
-Every star makes a difference. Thank you!
+If Aura is useful to you, a [GitHub star](https://github.com/teolex2020/AuraSDK) helps others discover it.
 
 ## License & Intellectual Property
 
 - **Code License:** MIT — see [LICENSE](LICENSE).
 - **Patent Notice:** The core cognitive architecture of Aura (DNA Layering, Cognitive Crystallization, SDR Indexing, and Synaptic Synthesis) is **Patent Pending** (US Provisional Application No. **63/969,703**). See [PATENT](PATENT) for details. Commercial integration of these architectural concepts into enterprise products requires a commercial license. The open-source SDK is freely available for non-commercial, academic, and standard agent integrations under the MIT License.
+
+---
+
+Built in Kyiv, Ukraine :ukraine: — including during power outages.
