@@ -12,6 +12,7 @@
   <a href="https://pypi.org/project/aura-memory/"><img src="https://img.shields.io/pypi/dm/aura-memory.svg" alt="Downloads"></a>
   <a href="https://github.com/teolex2020/AuraSDK/stargazers"><img src="https://img.shields.io/github/stars/teolex2020/AuraSDK?style=social" alt="GitHub stars"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://github.com/teolex2020/AuraSDK/actions/workflows/test.yml"><img src="https://img.shields.io/badge/tests-503_passed-brightgreen" alt="Tests"></a>
   <a href="https://www.uspto.gov/"><img src="https://img.shields.io/badge/Patent_Pending-US_63%2F969%2C703-blue.svg" alt="Patent Pending"></a>
 </p>
 
@@ -270,6 +271,8 @@ Aura includes a standalone web dashboard for visual memory management. Download 
 ---
 
 ## Architecture
+
+50 Rust modules · ~22,800 lines · **265 Rust + 238 Python = 503 tests**
 
 ```
 Python  ──  from aura import Aura  ──▶  aura._core (PyO3)
