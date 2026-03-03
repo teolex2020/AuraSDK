@@ -571,6 +571,11 @@ impl AuraStorage {
         *self.dirty_header.lock() = true;
         *self.needs_flush.lock() = true;
 
+        // Flush after batch to ensure data reaches disk
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        *self.needs_flush.lock() = false;
+
         tracing::debug!("Appended {} records in batch (encrypted: {})", written, self.is_encrypted());
 
         Ok(written)
@@ -587,12 +592,16 @@ impl AuraStorage {
             writer.seek(SeekFrom::Start(8))?;
             writer.write_u64::<LittleEndian>(count)?;
             writer.flush()?;
-            
+
             // Seeking back to end ensures next append is safe
             writer.seek(SeekFrom::End(0))?;
             *dirty = false;
         }
-        
+
+        // fsync: force OS to write buffers to physical disk.
+        // Without this, data can be lost on crash/power failure.
+        writer.get_ref().sync_all()?;
+
         // Also persist temporal graph (propagate error)
         self.save_temporal_chain()?;
 
@@ -804,6 +813,20 @@ impl AuraStorage {
         
         tracing::info!("Loaded {} temporal links from {:?}", applied, self.temporal_path);
         Ok(())
+    }
+}
+
+impl Drop for AuraStorage {
+    fn drop(&mut self) {
+        // Ensure all pending writes are flushed to disk on drop.
+        // This prevents data loss when the process exits or panics.
+        if let Some(needs) = self.needs_flush.try_lock() {
+            if *needs {
+                if let Err(e) = self.flush() {
+                    eprintln!("AuraStorage: failed to flush on drop: {}", e);
+                }
+            }
+        }
     }
 }
 
