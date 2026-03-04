@@ -154,14 +154,24 @@ class TestConsolidationWithLevels:
 
     def test_consolidation_preserves_count_floor(self, brain):
         """After consolidation, count should never be zero if records existed."""
-        for i in range(10):
-            brain.store(f"Unique fact number {i} about different topic {i}",
-                         level=Level.Domain, tags=[f"topic{i}"],
+        distinct_facts = [
+            "The speed of light is 299792 km per second",
+            "Tokyo is the capital city of Japan",
+            "Water molecule consists of two hydrogen and one oxygen atom",
+            "Python was created by Guido van Rossum in 1991",
+            "The Great Wall of China is over 21000 km long",
+            "Bitcoin was invented by Satoshi Nakamoto in 2008",
+            "Mount Everest is 8849 meters above sea level",
+            "The human heart beats about 100000 times per day",
+            "Rust programming language guarantees memory safety",
+            "PostgreSQL is an open source relational database",
+        ]
+        for i, fact in enumerate(distinct_facts):
+            brain.store(fact, level=Level.Domain, tags=[f"topic{i}"],
                          deduplicate=False)
 
         brain.consolidate()
 
-        # Unique records should mostly survive
         assert brain.count() >= 5, \
             f"Too many unique records were consolidated: {brain.count()}/10"
 
