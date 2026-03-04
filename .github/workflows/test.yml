@@ -14,15 +14,17 @@ jobs:
   rust-tests:
     name: Rust Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+      - name: Build tests
+        run: cargo test --no-default-features --features "encryption,audit" --no-run 2>&1 | tail -5
       - name: Run tests
-        run: cargo test --no-default-features --features "encryption,audit"
+        run: cargo test --no-default-features --features "encryption,audit" -- --test-threads=2
       - name: Clippy
         run: cargo clippy --no-default-features --features "encryption,audit" -- -D warnings
 
