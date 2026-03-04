@@ -8,11 +8,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-C debuginfo=0"
 
 jobs:
   rust-tests:
     name: Rust Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -22,7 +25,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --no-default-features --features "encryption,audit"
+        run: cargo test --no-default-features --features "encryption,audit" --release
       - name: Clippy
         run: cargo clippy --no-default-features --features "encryption,audit" -- -D warnings
         if: matrix.os == 'ubuntu-latest'
@@ -30,6 +33,7 @@ jobs:
   python-tests:
     name: Python Tests (${{ matrix.os }}, ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -45,22 +49,22 @@ jobs:
       - name: Create venv and install deps
         run: |
           python -m venv .venv
-          .venv/bin/pip install maturin pytest
+          .venv/bin/pip install maturin pytest pytest-timeout
         if: runner.os != 'Windows'
       - name: Create venv and install deps (Windows)
         run: |
           python -m venv .venv
-          .venv\Scripts\pip install maturin pytest
+          .venv\Scripts\pip install maturin pytest pytest-timeout
         if: runner.os == 'Windows'
       - name: Build and install
-        run: .venv/bin/maturin develop --features "pyo3/extension-module,encryption"
+        run: .venv/bin/maturin develop --release --features "pyo3/extension-module,encryption"
         if: runner.os != 'Windows'
       - name: Build and install (Windows)
-        run: .venv\Scripts\maturin develop --features "pyo3/extension-module,encryption"
+        run: .venv\Scripts\maturin develop --release --features "pyo3/extension-module,encryption"
         if: runner.os == 'Windows'
       - name: Run Python tests
-        run: .venv/bin/pytest tests/ -v
+        run: .venv/bin/pytest tests/ -v --timeout=60
         if: runner.os != 'Windows'
       - name: Run Python tests (Windows)
-        run: .venv\Scripts\pytest tests/ -v
+        run: .venv\Scripts\pytest tests/ -v --timeout=60
         if: runner.os == 'Windows'
