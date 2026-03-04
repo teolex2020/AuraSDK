@@ -82,7 +82,6 @@ pub fn consolidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::levels::Level;
 
     #[test]
     fn test_consolidation_threshold() {

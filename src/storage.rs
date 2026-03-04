@@ -6,6 +6,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use parking_lot::{RwLock, Mutex};
 use std::collections::HashMap;
 use anyhow::{Result, anyhow};
+use tracing::instrument;
 // use serde::{Serialize, Deserialize}; // Not needed if only using bincode functions
 
 use crate::types::{AuraSynapse, Pulse, Flux};
@@ -496,6 +497,7 @@ impl AuraStorage {
         Ok(())
     }
 
+    #[instrument(skip(self, record))]
     pub fn append(&self, record: &StoredRecord) -> Result<u64> {
         let mut writer = self.writer.lock();
 
@@ -530,6 +532,7 @@ impl AuraStorage {
     /// Append multiple records in a single lock acquisition.
     /// Returns the number of records written successfully.
     /// This is 100x faster than calling append() for each record.
+    #[instrument(skip(self, records), fields(batch_size = records.len()))]
     pub fn append_batch(&self, records: &[StoredRecord]) -> Result<usize> {
         if records.is_empty() {
             return Ok(0);
@@ -581,6 +584,7 @@ impl AuraStorage {
         Ok(written)
     }
 
+    #[instrument(skip(self))]
     pub fn flush(&self) -> Result<()> {
         let mut writer = self.writer.lock();
         writer.flush()?;

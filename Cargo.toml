@@ -35,6 +35,8 @@ sync = ["crdts"]
 mcp = ["rmcp", "schemars"]
 embedded = ["encryption"]
 lite = []
+ffi = []
+telemetry = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 
 [dependencies]
 # ============= CORE (Always included) =============
@@ -118,6 +120,12 @@ zeroize = { version = "1.7", features = ["derive"], optional = true }
 
 # P2P Sync
 crdts = { version = "7.3", optional = true }
+
+# Telemetry (OpenTelemetry)
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", features = ["tonic"], optional = true }
+tracing-opentelemetry = { version = "0.28", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
