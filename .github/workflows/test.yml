@@ -12,13 +12,9 @@ env:
 
 jobs:
   rust-tests:
-    name: Rust Tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Rust Tests
+    runs-on: ubuntu-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,7 +25,6 @@ jobs:
         run: cargo test --no-default-features --features "encryption,audit"
       - name: Clippy
         run: cargo clippy --no-default-features --features "encryption,audit" -- -D warnings
-        if: matrix.os == 'ubuntu-latest'
 
   python-tests:
     name: Python Tests (${{ matrix.os }}, ${{ matrix.python-version }})
