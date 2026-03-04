@@ -2670,6 +2670,15 @@ fn extract_namespaces(ns: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>) -> PyRes
     }
 }
 
+impl Drop for Aura {
+    fn drop(&mut self) {
+        self.stop_background();
+        let _ = self.flush();
+        let _ = self.storage.flush();
+        let _ = self.index.save();
+    }
+}
+
 #[cfg(feature = "python")]
 #[pymethods]
 impl Aura {
