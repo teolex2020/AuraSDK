@@ -2157,7 +2157,7 @@ impl Aura {
                 if let Some(ref parent) = rec.caused_by_id {
                     // Only follow if parent has superseded_by pointing forward in chain
                     if let Some(parent_rec) = records.get(parent.as_str()) {
-                        if parent_rec.metadata.get("superseded_by").is_some()
+                        if parent_rec.metadata.contains_key("superseded_by")
                             && !visited.contains(parent)
                         {
                             visited.insert(parent.clone());
