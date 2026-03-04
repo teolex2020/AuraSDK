@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use anyhow::Result;
+use tracing::instrument;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -207,6 +208,7 @@ impl Aura {
 
     /// Store with explicit channel for provenance stamping.
     /// `auto_promote`: if Some(false), disables surprise-based level promotion.
+    #[instrument(skip(self, content, metadata), fields(level, namespace, tag_count))]
     pub fn store_with_channel(
         &self,
         content: &str,
@@ -481,6 +483,7 @@ impl Aura {
     }
 
     /// Recall structured (raw results with trust scoring).
+    #[instrument(skip(self), fields(top_k, min_strength))]
     pub fn recall_structured(
         &self,
         query: &str,
@@ -503,6 +506,104 @@ impl Aura {
         Ok(scored)
     }
 
+    /// Temporal recall: recall only from records created at or before a given timestamp.
+    ///
+    /// Answers the question: "What did the agent know at time X?"
+    /// The pipeline is identical to `recall_structured`, but the record set is
+    /// pre-filtered by `created_at <= timestamp` before scoring.
+    pub fn recall_at(
+        &self,
+        query: &str,
+        timestamp: f64,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+        namespaces: Option<&[&str]>,
+    ) -> Result<Vec<(f32, Record)>> {
+        let records = self.records.read();
+        let ns_records = Self::records_for_namespace(&records, namespaces);
+        let time_records = Self::records_before_timestamp(&ns_records, timestamp);
+
+        let ngram = self.ngram_index.read();
+        let tag_idx = self.tag_index.read();
+        let aura_idx = self.aura_index.read();
+
+        let top = top_k.unwrap_or(20);
+        let embedding_ranked = self.collect_embedding_signal(query, top);
+        let trust_config = self.trust_config.read();
+
+        let scored = recall::recall_pipeline(
+            query,
+            top,
+            min_strength.unwrap_or(0.1),
+            expand_connections.unwrap_or(true),
+            &self.sdr,
+            &self.index,
+            &self.storage,
+            &ngram,
+            &tag_idx,
+            &aura_idx,
+            &time_records,
+            embedding_ranked,
+            Some(&trust_config),
+        );
+
+        drop(records);
+        drop(ngram);
+        drop(tag_idx);
+        drop(aura_idx);
+        drop(trust_config);
+
+        // Activate recalled records
+        {
+            let mut records = self.records.write();
+            let mut tracker = self.session_tracker.write();
+            recall::activate_and_strengthen(&scored, &mut records, &mut tracker, session_id);
+        }
+
+        if let Some(ref log) = self.audit_log {
+            let _ = log.log_retrieve(query, scored.len());
+        }
+
+        Ok(scored)
+    }
+
+    /// Return the access/strength timeline for a single record.
+    ///
+    /// Returns a snapshot with: creation time, last activation, current strength,
+    /// activation count, age in days, and days since last activation.
+    pub fn history(&self, record_id: &str) -> Result<HashMap<String, String>> {
+        let records = self.records.read();
+        let rec = records
+            .get(record_id)
+            .ok_or_else(|| anyhow::anyhow!("Record not found: {}", record_id))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        let mut info = HashMap::new();
+        info.insert("id".into(), rec.id.clone());
+        info.insert("content".into(), rec.content.clone());
+        info.insert("level".into(), rec.level.name().to_string());
+        info.insert("strength".into(), format!("{:.4}", rec.strength));
+        info.insert("activation_count".into(), rec.activation_count.to_string());
+        info.insert("created_at".into(), format!("{:.3}", rec.created_at));
+        info.insert("last_activated".into(), format!("{:.3}", rec.last_activated));
+        info.insert("age_days".into(), format!("{:.2}", (now - rec.created_at) / 86400.0));
+        info.insert("days_since_activation".into(), format!("{:.2}", (now - rec.last_activated) / 86400.0));
+        info.insert("namespace".into(), rec.namespace.clone());
+        info.insert("source_type".into(), rec.source_type.clone());
+        info.insert("tags".into(), rec.tags.join(", "));
+
+        // Include connection count
+        info.insert("connections".into(), rec.connections.len().to_string());
+
+        Ok(info)
+    }
+
     /// Unified recall: recall_core (RRF) + substring fallback + failure records in fewer lock passes.
     ///
     /// Combines what Python previously did in 3 separate calls:
@@ -512,6 +613,7 @@ impl Aura {
     ///
     /// Stage 1 runs recall_core as-is (it needs write lock for activation).
     /// Stages 2+3 are merged into a single read lock pass.
+    #[instrument(skip(self), fields(top_k, include_failures))]
     pub fn recall_full(
         &self,
         query: &str,
@@ -611,7 +713,20 @@ impl Aura {
             .collect()
     }
 
+    /// Filter records to those created at or before a given timestamp.
+    fn records_before_timestamp(
+        records: &HashMap<String, Record>,
+        timestamp: f64,
+    ) -> HashMap<String, Record> {
+        records
+            .iter()
+            .filter(|(_, r)| r.created_at <= timestamp)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// Core recall pipeline.
+    #[instrument(skip(self), fields(top_k, min_strength))]
     fn recall_core(
         &self,
         query: &str,
@@ -867,6 +982,7 @@ impl Aura {
     // ── Maintenance Operations ──
 
     /// Apply decay to all records.
+    #[instrument(skip(self))]
     pub fn decay(&self) -> Result<(usize, usize)> {
         let mut records = self.records.write();
         let mut decayed = 0;
@@ -916,6 +1032,7 @@ impl Aura {
     }
 
     /// Consolidate duplicates.
+    #[instrument(skip(self))]
     pub fn consolidate(&self) -> Result<HashMap<String, usize>> {
         let mut records = self.records.write();
         let mut ngram = self.ngram_index.write();
@@ -937,6 +1054,7 @@ impl Aura {
     }
 
     /// Reflect — promote, archive, detect conflicts.
+    #[instrument(skip(self))]
     pub fn reflect(&self) -> Result<HashMap<String, usize>> {
         let mut records = self.records.write();
         let mut promoted = 0;
@@ -1384,6 +1502,7 @@ impl Aura {
     }
 
     /// Run a single maintenance cycle (all 8 phases).
+    #[instrument(skip(self))]
     pub fn run_maintenance(&self) -> MaintenanceReport {
         let config = self.maintenance_config.read().clone();
         let taxonomy = self.taxonomy.read().clone();
@@ -1749,6 +1868,86 @@ impl Aura {
         })
     }
 
+    // ── Multimodal Memory Stubs ──
+
+    /// Store an image reference with its description.
+    ///
+    /// This stores the textual description as a standard memory record with
+    /// `content_type=image` and the source path in metadata. When an embedding
+    /// function is set, the description is embedded for semantic search.
+    ///
+    /// Actual image processing (CLIP, OCR, etc.) is left to the caller —
+    /// pass the results as `description`.
+    pub fn store_image(
+        &self,
+        path: &str,
+        description: &str,
+        level: Option<Level>,
+        tags: Option<Vec<String>>,
+        namespace: Option<&str>,
+    ) -> Result<Record> {
+        let mut metadata = HashMap::new();
+        metadata.insert("source_path".into(), path.to_string());
+        metadata.insert("media_type".into(), "image".into());
+
+        let mut all_tags = tags.unwrap_or_default();
+        if !all_tags.iter().any(|t| t == "image") {
+            all_tags.push("image".into());
+        }
+
+        self.store_with_channel(
+            description,
+            level,
+            Some(all_tags),
+            None,
+            Some("image"),
+            Some("recorded"),
+            Some(metadata),
+            None,
+            None,
+            None,
+            None,
+            namespace,
+        )
+    }
+
+    /// Store an audio transcript with provenance metadata.
+    ///
+    /// The transcript text is stored as a standard memory record with
+    /// `content_type=audio_transcript` and the source path in metadata.
+    pub fn store_audio_transcript(
+        &self,
+        transcript: &str,
+        source_path: &str,
+        level: Option<Level>,
+        tags: Option<Vec<String>>,
+        namespace: Option<&str>,
+    ) -> Result<Record> {
+        let mut metadata = HashMap::new();
+        metadata.insert("source_path".into(), source_path.to_string());
+        metadata.insert("media_type".into(), "audio".into());
+
+        let mut all_tags = tags.unwrap_or_default();
+        if !all_tags.iter().any(|t| t == "audio") {
+            all_tags.push("audio".into());
+        }
+
+        self.store_with_channel(
+            transcript,
+            level,
+            Some(all_tags),
+            None,
+            Some("audio_transcript"),
+            Some("recorded"),
+            Some(metadata),
+            None,
+            None,
+            None,
+            None,
+            namespace,
+        )
+    }
+
     // ── SDK Wrapper: Circuit Breaker ──
 
     /// Record a tool failure.
@@ -1797,6 +1996,486 @@ impl Aura {
         self.cognitive_store.flush()?;
         self.storage.flush()?;
         Ok(())
+    }
+
+    // ── Phase 6: Adaptive Recall (Feedback) ──
+
+    /// Provide feedback on a recalled record.
+    ///
+    /// Positive feedback boosts the record's strength and lowers its decay rate
+    /// (via activation). Negative feedback weakens the record.
+    /// The feedback is tracked in metadata for analytics.
+    #[instrument(skip(self))]
+    pub fn feedback(&self, record_id: &str, useful: bool) -> Result<bool> {
+        let mut records = self.records.write();
+        let rec = match records.get_mut(record_id) {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+
+        // Track feedback counts in metadata
+        let pos_key = "feedback_positive";
+        let neg_key = "feedback_negative";
+        let last_key = "feedback_last";
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        rec.metadata.insert(last_key.into(), format!("{:.3}", now));
+
+        if useful {
+            let prev: u32 = rec.metadata.get(pos_key)
+                .and_then(|v| v.parse().ok()).unwrap_or(0);
+            rec.metadata.insert(pos_key.into(), (prev + 1).to_string());
+            // Positive: boost strength (like an activation, but weaker)
+            rec.strength = (rec.strength + 0.1).min(1.0);
+        } else {
+            let prev: u32 = rec.metadata.get(neg_key)
+                .and_then(|v| v.parse().ok()).unwrap_or(0);
+            rec.metadata.insert(neg_key.into(), (prev + 1).to_string());
+            // Negative: weaken strength
+            rec.strength = (rec.strength - 0.15).max(0.0);
+        }
+
+        // Persist change
+        self.cognitive_store.append_update(rec)?;
+        self.recall_cache.clear();
+
+        Ok(true)
+    }
+
+    /// Get feedback stats for a record.
+    ///
+    /// Returns (positive_count, negative_count, net_score).
+    pub fn feedback_stats(&self, record_id: &str) -> Option<(u32, u32, i32)> {
+        let records = self.records.read();
+        let rec = records.get(record_id)?;
+
+        let pos: u32 = rec.metadata.get("feedback_positive")
+            .and_then(|v| v.parse().ok()).unwrap_or(0);
+        let neg: u32 = rec.metadata.get("feedback_negative")
+            .and_then(|v| v.parse().ok()).unwrap_or(0);
+
+        Some((pos, neg, pos as i32 - neg as i32))
+    }
+
+    // ── Phase 6: Semantic Versioning (Supersede) ──
+
+    /// Supersede an old record with new content.
+    ///
+    /// The old record is marked with `superseded_by` in metadata and its
+    /// strength is halved. A new record is created with a causal link to
+    /// the old one. Recall prefers the new version automatically because
+    /// the old record's weakened strength pushes it down in rankings.
+    #[instrument(skip(self, new_content))]
+    pub fn supersede(
+        &self,
+        old_id: &str,
+        new_content: &str,
+        level: Option<Level>,
+        tags: Option<Vec<String>>,
+        namespace: Option<&str>,
+    ) -> Result<Record> {
+        // Validate old record exists
+        {
+            let mut records = self.records.write();
+            let old_rec = records.get_mut(old_id)
+                .ok_or_else(|| anyhow::anyhow!("Record '{}' not found", old_id))?;
+
+            // Mark as superseded
+            old_rec.metadata.insert("superseded_by".into(), "pending".into());
+            old_rec.strength *= 0.5; // Halve strength — still findable but de-ranked
+            self.cognitive_store.append_update(old_rec)?;
+        }
+
+        // Determine level and tags from old record if not provided
+        let (effective_level, effective_tags, effective_ns) = {
+            let records = self.records.read();
+            let old_rec = records.get(old_id).unwrap();
+            let l = level.unwrap_or(old_rec.level);
+            let t = tags.unwrap_or_else(|| old_rec.tags.clone());
+            let n = namespace.unwrap_or(&old_rec.namespace).to_string();
+            (l, t, n)
+        };
+
+        // Store new record with causal link to old
+        let new_rec = self.store_with_channel(
+            new_content,
+            Some(effective_level),
+            Some(effective_tags),
+            None,
+            None,
+            None,
+            None,
+            Some(false), // Don't deduplicate against old version
+            Some(old_id),
+            None,
+            None,
+            Some(&effective_ns),
+        )?;
+
+        // Update old record's superseded_by with actual new ID
+        {
+            let mut records = self.records.write();
+            if let Some(old_rec) = records.get_mut(old_id) {
+                old_rec.metadata.insert("superseded_by".into(), new_rec.id.clone());
+                let _ = self.cognitive_store.append_update(old_rec);
+            }
+        }
+
+        self.recall_cache.clear();
+        Ok(new_rec)
+    }
+
+    /// Check if a record has been superseded.
+    ///
+    /// Returns `Some(new_record_id)` if superseded, `None` otherwise.
+    pub fn superseded_by(&self, record_id: &str) -> Option<String> {
+        let records = self.records.read();
+        records.get(record_id)
+            .and_then(|r| r.metadata.get("superseded_by"))
+            .filter(|v| !v.is_empty() && *v != "pending")
+            .cloned()
+    }
+
+    /// Get the full version chain for a record.
+    ///
+    /// Follows `superseded_by` links forward and `caused_by_id` links backward,
+    /// returning all versions from oldest to newest.
+    pub fn version_chain(&self, record_id: &str) -> Vec<Record> {
+        let records = self.records.read();
+
+        // Walk backward to find the oldest version
+        let mut oldest_id = record_id.to_string();
+        let mut visited = HashSet::new();
+        visited.insert(oldest_id.clone());
+
+        loop {
+            if let Some(rec) = records.get(&oldest_id) {
+                if let Some(ref parent) = rec.caused_by_id {
+                    // Only follow if parent has superseded_by pointing forward in chain
+                    if let Some(parent_rec) = records.get(parent.as_str()) {
+                        if parent_rec.metadata.get("superseded_by").is_some()
+                            && !visited.contains(parent)
+                        {
+                            visited.insert(parent.clone());
+                            oldest_id = parent.clone();
+                            continue;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+
+        // Walk forward collecting all versions
+        let mut chain = Vec::new();
+        let mut current_id = oldest_id;
+        let mut visited_fwd = HashSet::new();
+
+        loop {
+            if visited_fwd.contains(&current_id) {
+                break;
+            }
+            visited_fwd.insert(current_id.clone());
+
+            if let Some(rec) = records.get(&current_id) {
+                chain.push(rec.clone());
+                if let Some(next_id) = rec.metadata.get("superseded_by") {
+                    if !next_id.is_empty() && next_id != "pending" {
+                        current_id = next_id.clone();
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+
+        chain
+    }
+
+    // ── Phase 6: Memory Snapshots & Rollback ──
+
+    /// Create a named snapshot of the current memory state.
+    ///
+    /// The snapshot is a JSON export stored in the brain directory as
+    /// `<brain_path>_snapshot_<label>.json`.
+    #[instrument(skip(self))]
+    pub fn snapshot(&self, label: &str) -> Result<String> {
+        if label.is_empty() || label.len() > 64 {
+            return Err(anyhow::anyhow!("Label must be 1-64 characters"));
+        }
+        // Only allow safe chars in label (alphanumeric, dash, underscore)
+        if !label.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            return Err(anyhow::anyhow!("Label must contain only alphanumeric, dash, or underscore characters"));
+        }
+
+        // Flush pending writes
+        self.flush()?;
+
+        let records = self.records.read();
+        let recs: Vec<&Record> = records.values().collect();
+        let json = serde_json::to_string(&recs)?;
+
+        let snap_path = self.snapshot_path(label);
+        std::fs::write(&snap_path, json)?;
+
+        Ok(snap_path.to_string_lossy().to_string())
+    }
+
+    /// Rollback memory to a previously saved snapshot.
+    ///
+    /// This replaces all current records with those from the snapshot.
+    /// The current state is NOT saved before rollback — call `snapshot()`
+    /// first if you want to preserve it.
+    #[instrument(skip(self))]
+    pub fn rollback(&self, label: &str) -> Result<usize> {
+        let snap_path = self.snapshot_path(label);
+        if !snap_path.exists() {
+            return Err(anyhow::anyhow!("Snapshot '{}' not found", label));
+        }
+
+        let json = std::fs::read_to_string(&snap_path)?;
+        let imported: Vec<Record> = serde_json::from_str(&json)?;
+        let count = imported.len();
+
+        // Replace all records
+        let mut records = self.records.write();
+        let mut ngram = self.ngram_index.write();
+        let mut tag_idx = self.tag_index.write();
+        let mut aura_idx = self.aura_index.write();
+
+        // Clear existing indices
+        records.clear();
+        *ngram = NGramIndex::new(None, None);
+        tag_idx.clear();
+        aura_idx.clear();
+
+        // Re-import
+        for rec in imported {
+            ngram.add(&rec.id, &rec.content);
+            for tag in &rec.tags {
+                tag_idx.entry(tag.clone()).or_default().insert(rec.id.clone());
+            }
+            if let Some(ref aid) = rec.aura_id {
+                aura_idx.insert(aid.clone(), rec.id.clone());
+            }
+            records.insert(rec.id.clone(), rec);
+        }
+
+        self.recall_cache.clear();
+        Ok(count)
+    }
+
+    /// Compare two snapshots, returning added, removed, and modified record IDs.
+    pub fn diff(&self, label_a: &str, label_b: &str) -> Result<HashMap<String, Vec<String>>> {
+        let load_snap = |label: &str| -> Result<HashMap<String, Record>> {
+            let path = self.snapshot_path(label);
+            if !path.exists() {
+                return Err(anyhow::anyhow!("Snapshot '{}' not found", label));
+            }
+            let json = std::fs::read_to_string(&path)?;
+            let recs: Vec<Record> = serde_json::from_str(&json)?;
+            Ok(recs.into_iter().map(|r| (r.id.clone(), r)).collect())
+        };
+
+        let snap_a = load_snap(label_a)?;
+        let snap_b = load_snap(label_b)?;
+
+        let keys_a: HashSet<&String> = snap_a.keys().collect();
+        let keys_b: HashSet<&String> = snap_b.keys().collect();
+
+        let added: Vec<String> = keys_b.difference(&keys_a).map(|s| (*s).clone()).collect();
+        let removed: Vec<String> = keys_a.difference(&keys_b).map(|s| (*s).clone()).collect();
+        let modified: Vec<String> = keys_a.intersection(&keys_b)
+            .filter(|id| {
+                let a = &snap_a[**id];
+                let b = &snap_b[**id];
+                a.content != b.content || a.strength != b.strength || a.level != b.level
+            })
+            .map(|s| (*s).clone())
+            .collect();
+
+        let mut result = HashMap::new();
+        result.insert("added".into(), added);
+        result.insert("removed".into(), removed);
+        result.insert("modified".into(), modified);
+        Ok(result)
+    }
+
+    /// List available snapshot labels.
+    pub fn list_snapshots(&self) -> Vec<String> {
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        let prefix = format!("{}_snapshot_",
+            self.path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy());
+
+        let mut labels = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(&prefix) && name.ends_with(".json") {
+                    let label = name
+                        .strip_prefix(&prefix)
+                        .and_then(|s| s.strip_suffix(".json"))
+                        .map(|s| s.to_string());
+                    if let Some(l) = label {
+                        labels.push(l);
+                    }
+                }
+            }
+        }
+        labels.sort();
+        labels
+    }
+
+    /// Helper: build snapshot file path.
+    fn snapshot_path(&self, label: &str) -> PathBuf {
+        let stem = self.path.file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        dir.join(format!("{}_snapshot_{}.json", stem, label))
+    }
+
+    // ── Phase 6: Agent-to-Agent Memory Sharing Protocol ──
+
+    /// Export a portable memory fragment based on a query.
+    ///
+    /// Returns a JSON string containing matching records with provenance
+    /// metadata stamped for sharing. The recipient can import this via
+    /// `import_context()`.
+    #[instrument(skip(self))]
+    pub fn export_context(
+        &self,
+        query: &str,
+        top_k: Option<usize>,
+        namespaces: Option<&[&str]>,
+    ) -> Result<String> {
+        let results = self.recall_structured(
+            query,
+            top_k,
+            None,
+            None,
+            None,
+            namespaces,
+        )?;
+
+        // Build portable fragment with provenance
+        let fragment: Vec<serde_json::Value> = results.iter().map(|(score, rec)| {
+            let mut meta = rec.metadata.clone();
+            meta.insert("shared_score".into(), format!("{:.4}", score));
+            meta.insert("shared_from".into(),
+                self.path.to_string_lossy().to_string());
+
+            serde_json::json!({
+                "id": rec.id,
+                "content": rec.content,
+                "level": rec.level.name(),
+                "strength": rec.strength,
+                "tags": rec.tags,
+                "created_at": rec.created_at,
+                "source_type": rec.source_type,
+                "content_type": rec.content_type,
+                "metadata": meta,
+                "namespace": rec.namespace,
+            })
+        }).collect();
+
+        let envelope = serde_json::json!({
+            "version": "1.0",
+            "format": "aura_context",
+            "query": query,
+            "record_count": fragment.len(),
+            "records": fragment,
+        });
+
+        Ok(serde_json::to_string_pretty(&envelope)?)
+    }
+
+    /// Import a portable memory fragment from another agent.
+    ///
+    /// Records are imported with `source_type=retrieved` and tagged with
+    /// `shared` to distinguish them from locally created memories.
+    #[instrument(skip(self, fragment_json))]
+    /// Strength is reduced to 0.5x to require local validation.
+    pub fn import_context(&self, fragment_json: &str) -> Result<usize> {
+        let envelope: serde_json::Value = serde_json::from_str(fragment_json)?;
+
+        let format = envelope.get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if format != "aura_context" {
+            return Err(anyhow::anyhow!("Unknown format: '{}'. Expected 'aura_context'", format));
+        }
+
+        let records_val = envelope.get("records")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'records' field"))?;
+        let records_arr = records_val.as_array()
+            .ok_or_else(|| anyhow::anyhow!("'records' must be an array"))?;
+
+        let mut imported = 0;
+        for item in records_arr {
+            let content = item.get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Record missing 'content'"))?;
+
+            let level_str = item.get("level")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Working");
+            let level = match level_str.to_uppercase().as_str() {
+                "WORKING" => Level::Working,
+                "DECISIONS" => Level::Decisions,
+                "DOMAIN" => Level::Domain,
+                "IDENTITY" => Level::Identity,
+                _ => Level::Working,
+            };
+
+            let mut tags: Vec<String> = item.get("tags")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            if !tags.contains(&"shared".to_string()) {
+                tags.push("shared".into());
+            }
+
+            let mut metadata: HashMap<String, String> = item.get("metadata")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            metadata.insert("trust_external".into(), "true".into());
+
+            // Store with reduced strength (source_type=retrieved for external data)
+            let rec = self.store_with_channel(
+                content,
+                Some(level),
+                Some(tags),
+                None,
+                None,
+                Some("retrieved"),
+                Some(metadata),
+                Some(true), // Deduplicate against existing memories
+                None,
+                None,
+                Some(false), // Don't auto-promote external memories
+                None,
+            )?;
+
+            // Reduce strength for imported memories (needs local validation)
+            {
+                let mut records = self.records.write();
+                if let Some(r) = records.get_mut(&rec.id) {
+                    r.strength *= 0.5;
+                    let _ = self.cognitive_store.append_update(r);
+                }
+            }
+
+            imported += 1;
+        }
+
+        self.recall_cache.clear();
+        Ok(imported)
     }
 
     /// Export all records as JSON.
@@ -2083,6 +2762,59 @@ impl Aura {
         Ok(py_results)
     }
 
+    /// Temporal recall: only consider records created at or before `timestamp` (Unix seconds).
+    #[pyo3(name = "recall_at", signature = (query, timestamp, top_k=None, min_strength=None, expand_connections=None, session_id=None, namespace=None))]
+    fn py_recall_at(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        timestamp: f64,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+        namespace: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>,
+    ) -> PyResult<Vec<PyObject>> {
+        let ns_vec = extract_namespaces(namespace)?;
+        let ns_refs: Option<Vec<&str>> = ns_vec.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+        let ns_slice: Option<&[&str]> = ns_refs.as_deref();
+        let results = py.allow_threads(|| {
+            self.recall_at(query, timestamp, top_k, min_strength, expand_connections, session_id, ns_slice)
+        }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let mut py_results = Vec::new();
+        for (score, rec) in results {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("id", &rec.id)?;
+            dict.set_item("content", &rec.content)?;
+            dict.set_item("score", score)?;
+            dict.set_item("level", rec.level.name())?;
+            dict.set_item("strength", rec.strength)?;
+            dict.set_item("tags", &rec.tags)?;
+            dict.set_item("created_at", rec.created_at)?;
+            dict.set_item("source_type", &rec.source_type)?;
+            if let Some(trust) = rec.metadata.get("trust_score") {
+                dict.set_item("trust", trust)?;
+            }
+            py_results.push(dict.unbind().into_any());
+        }
+        Ok(py_results)
+    }
+
+    /// Return access/strength timeline snapshot for a single record.
+    #[pyo3(name = "history")]
+    fn py_history(&self, py: Python<'_>, record_id: &str) -> PyResult<PyObject> {
+        let info = py.allow_threads(|| {
+            self.history(record_id)
+        }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let dict = pyo3::types::PyDict::new_bound(py);
+        for (k, v) in &info {
+            dict.set_item(k, v)?;
+        }
+        Ok(dict.unbind().into_any())
+    }
+
     #[pyo3(name = "recall_full", signature = (query, top_k=None, include_failures=None, min_strength=None, expand_connections=None, session_id=None, namespace=None))]
     fn py_recall_full(
         &self,
@@ -2308,6 +3040,126 @@ impl Aura {
     #[pyo3(name = "get_persona")]
     fn py_get_persona(&self) -> Option<AgentPersona> {
         self.get_persona()
+    }
+
+    #[pyo3(name = "store_image")]
+    #[pyo3(signature = (path, description, level=None, tags=None, namespace=None))]
+    fn py_store_image(
+        &self,
+        path: &str,
+        description: &str,
+        level: Option<Level>,
+        tags: Option<Vec<String>>,
+        namespace: Option<&str>,
+    ) -> PyResult<String> {
+        self.store_image(path, description, level, tags, namespace)
+            .map(|r| r.id)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    #[pyo3(name = "store_audio_transcript")]
+    #[pyo3(signature = (transcript, source_path, level=None, tags=None, namespace=None))]
+    fn py_store_audio_transcript(
+        &self,
+        transcript: &str,
+        source_path: &str,
+        level: Option<Level>,
+        tags: Option<Vec<String>>,
+        namespace: Option<&str>,
+    ) -> PyResult<String> {
+        self.store_audio_transcript(transcript, source_path, level, tags, namespace)
+            .map(|r| r.id)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    // ── Phase 6: Adaptive Recall ──
+
+    #[pyo3(name = "feedback")]
+    fn py_feedback(&self, record_id: &str, useful: bool) -> PyResult<bool> {
+        self.feedback(record_id, useful)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    #[pyo3(name = "feedback_stats")]
+    fn py_feedback_stats(&self, record_id: &str) -> Option<(u32, u32, i32)> {
+        self.feedback_stats(record_id)
+    }
+
+    // ── Phase 6: Semantic Versioning ──
+
+    #[pyo3(name = "supersede")]
+    #[pyo3(signature = (old_id, new_content, level=None, tags=None, namespace=None))]
+    fn py_supersede(
+        &self,
+        old_id: &str,
+        new_content: &str,
+        level: Option<Level>,
+        tags: Option<Vec<String>>,
+        namespace: Option<&str>,
+    ) -> PyResult<String> {
+        self.supersede(old_id, new_content, level, tags, namespace)
+            .map(|r| r.id)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    #[pyo3(name = "superseded_by")]
+    fn py_superseded_by(&self, record_id: &str) -> Option<String> {
+        self.superseded_by(record_id)
+    }
+
+    #[pyo3(name = "version_chain")]
+    fn py_version_chain(&self, record_id: &str) -> Vec<Record> {
+        self.version_chain(record_id)
+    }
+
+    // ── Phase 6: Snapshots & Rollback ──
+
+    #[pyo3(name = "snapshot")]
+    fn py_snapshot(&self, label: &str) -> PyResult<String> {
+        self.snapshot(label)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    #[pyo3(name = "rollback")]
+    fn py_rollback(&self, label: &str) -> PyResult<usize> {
+        self.rollback(label)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    #[pyo3(name = "diff")]
+    fn py_diff(&self, label_a: &str, label_b: &str) -> PyResult<HashMap<String, Vec<String>>> {
+        self.diff(label_a, label_b)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    #[pyo3(name = "list_snapshots")]
+    fn py_list_snapshots(&self) -> Vec<String> {
+        self.list_snapshots()
+    }
+
+    // ── Phase 6: Agent-to-Agent Sharing ──
+
+    #[pyo3(name = "export_context")]
+    #[pyo3(signature = (query, top_k=None, namespace=None))]
+    fn py_export_context(
+        &self,
+        query: &str,
+        top_k: Option<usize>,
+        namespace: Option<&str>,
+    ) -> PyResult<String> {
+        let ns_vec: Vec<&str>;
+        let ns_slice = match namespace {
+            Some(ns) => { ns_vec = vec![ns]; Some(ns_vec.as_slice()) }
+            None => None,
+        };
+        self.export_context(query, top_k, ns_slice)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    #[pyo3(name = "import_context")]
+    fn py_import_context(&self, fragment_json: &str) -> PyResult<usize> {
+        self.import_context(fragment_json)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     #[pyo3(name = "get_credibility")]

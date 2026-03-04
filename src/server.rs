@@ -18,7 +18,7 @@ use crate::memory::AuraMemory;
 use crate::license;
 use lazy_static::lazy_static;
 use rust_embed::RustEmbed;
-use metrics::{counter, histogram};
+use metrics::{counter, histogram, gauge};
 use tower_http::cors::{CorsLayer, AllowOrigin};
 
 // Global State
@@ -363,8 +363,11 @@ async fn delete_memory(Json(payload): Json<DeleteRequest>) -> impl IntoResponse 
     if let Some(mem) = mutex.as_ref() {
         let success = mem.delete_synapse(&payload.id);
         if success {
+             counter!("aura_delete_total", "status" => "ok").increment(1);
+             gauge!("aura_record_count").set(mem.count() as f64);
              (StatusCode::OK, Json(DeleteResponse { success: true }))
         } else {
+             counter!("aura_delete_total", "status" => "not_found").increment(1);
              (StatusCode::NOT_FOUND, Json(DeleteResponse { success: false }))
         }
     } else {
@@ -406,6 +409,13 @@ async fn stats() -> impl IntoResponse {
         let (boosts, decays, immune) = mem.plasticity_stats();
         let phantoms = mem.phantom_count();
 
+        // Update gauge metrics
+        gauge!("aura_record_count").set(count as f64);
+        gauge!("aura_plasticity_boosts_total").set(boosts as f64);
+        gauge!("aura_plasticity_decays_total").set(decays as f64);
+        gauge!("aura_plasticity_immune_total").set(immune as f64);
+        gauge!("aura_phantom_count").set(phantoms as f64);
+
         (StatusCode::OK, Json(StatsResponse {
             total_memories: count,
             license: license_str.to_string(),
@@ -432,9 +442,19 @@ async fn stats() -> impl IntoResponse {
 async fn process(Json(payload): Json<ProcessRequest>) -> impl IntoResponse {
     let mutex = MEMORY.lock().unwrap();
     if let Some(mem) = mutex.as_ref() {
+        let start = Instant::now();
         match mem.process(&payload.text, payload.pin) {
-            Ok(status) => (StatusCode::OK, Json(ProcessResponse { status })),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ProcessResponse { status: e.to_string() })),
+            Ok(status) => {
+                let duration = start.elapsed().as_secs_f64();
+                histogram!("aura_store_duration_seconds").record(duration);
+                counter!("aura_store_total", "status" => "ok").increment(1);
+                gauge!("aura_record_count").set(mem.count() as f64);
+                (StatusCode::OK, Json(ProcessResponse { status }))
+            },
+            Err(e) => {
+                counter!("aura_store_total", "status" => "error").increment(1);
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ProcessResponse { status: e.to_string() }))
+            },
         }
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(ProcessResponse { status: "Memory not initialized".into() }))
@@ -445,8 +465,13 @@ async fn process(Json(payload): Json<ProcessRequest>) -> impl IntoResponse {
 async fn retrieve(Json(payload): Json<RetrieveRequest>) -> impl IntoResponse {
     let mutex = MEMORY.lock().unwrap();
     if let Some(mem) = mutex.as_ref() {
+        let start = Instant::now();
         match mem.retrieve_full(&payload.query, payload.top_k) {
             Ok(records_with_scores) => {
+                let duration = start.elapsed().as_secs_f64();
+                histogram!("aura_recall_duration_seconds").record(duration);
+                counter!("aura_recall_total", "status" => "ok").increment(1);
+                gauge!("aura_recall_result_count").set(records_with_scores.len() as f64);
                 let dtos: Vec<StoredRecordDTO> = records_with_scores.into_iter().map(|(r, tanimoto)| StoredRecordDTO {
                     id: r.id,
                     text: r.text,
@@ -457,7 +482,10 @@ async fn retrieve(Json(payload): Json<RetrieveRequest>) -> impl IntoResponse {
                 }).collect();
                 (StatusCode::OK, Json(RetrieveResponse { results: dtos }))
             },
-            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(RetrieveResponse { results: vec![] }))
+            Err(_) => {
+                counter!("aura_recall_total", "status" => "error").increment(1);
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(RetrieveResponse { results: vec![] }))
+            }
         }
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(RetrieveResponse { results: vec![] }))
@@ -491,6 +519,11 @@ async fn analytics() -> impl IntoResponse {
     let mutex = MEMORY.lock().unwrap();
     if let Some(mem) = mutex.as_ref() {
         let (by_dna, total, oldest, newest) = mem.get_analytics();
+        // Emit per-level record count gauges
+        for (dna, count) in &by_dna {
+            gauge!("aura_record_count_by_level", "level" => dna.clone()).set(*count as f64);
+        }
+        gauge!("aura_record_count").set(total as f64);
         (StatusCode::OK, Json(AnalyticsResponse { by_dna, total, oldest, newest }))
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(AnalyticsResponse {
@@ -504,6 +537,8 @@ async fn batch_delete(Json(payload): Json<BatchDeleteRequest>) -> impl IntoRespo
     let mutex = MEMORY.lock().unwrap();
     if let Some(mem) = mutex.as_ref() {
         let deleted = mem.batch_delete(&payload.ids);
+        counter!("aura_delete_total", "status" => "ok").increment(deleted as u64);
+        gauge!("aura_record_count").set(mem.count() as f64);
         (StatusCode::OK, Json(BatchDeleteResponse { deleted }))
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(BatchDeleteResponse { deleted: 0 }))
@@ -515,14 +550,26 @@ async fn batch_delete(Json(payload): Json<BatchDeleteRequest>) -> impl IntoRespo
 async fn ingest_batch(Json(payload): Json<IngestBatchRequest>) -> impl IntoResponse {
     let mutex = MEMORY.lock().unwrap();
     if let Some(mem) = mutex.as_ref() {
+        let batch_size = payload.texts.len();
+        let start = Instant::now();
         let result = if payload.pinned {
             mem.ingest_batch_pinned(payload.texts)
         } else {
             mem.ingest_batch(payload.texts)
         };
         match result {
-            Ok(count) => (StatusCode::OK, Json(IngestBatchResponse { ingested: count, pinned: payload.pinned })),
-            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(IngestBatchResponse { ingested: 0, pinned: payload.pinned })),
+            Ok(count) => {
+                let duration = start.elapsed().as_secs_f64();
+                histogram!("aura_batch_ingest_duration_seconds").record(duration);
+                counter!("aura_store_total", "status" => "ok").increment(count as u64);
+                gauge!("aura_record_count").set(mem.count() as f64);
+                gauge!("aura_batch_size").set(batch_size as f64);
+                (StatusCode::OK, Json(IngestBatchResponse { ingested: count, pinned: payload.pinned }))
+            },
+            Err(_) => {
+                counter!("aura_store_total", "status" => "error").increment(batch_size as u64);
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(IngestBatchResponse { ingested: 0, pinned: payload.pinned }))
+            },
         }
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(IngestBatchResponse { ingested: 0, pinned: false }))
@@ -653,6 +700,14 @@ pub fn start_server(port: u16, storage_path: &str) -> anyhow::Result<()> {
     {
         let mut global = MEMORY.lock().unwrap();
         *global = Some(mem);
+    }
+
+    // Set initial record count gauge
+    {
+        let global = MEMORY.lock().unwrap();
+        if let Some(mem) = global.as_ref() {
+            gauge!("aura_record_count").set(mem.count() as f64);
+        }
     }
 
     // ENV: AURA_API_KEY — if set, all API endpoints require Bearer token

@@ -8,6 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tracing::instrument;
+
 use crate::record::Record;
 use crate::levels::Level;
 use crate::ngram::NGramIndex;
@@ -40,6 +42,7 @@ pub struct RecallResult {
 // ── Signal Collection ──
 
 /// Collect SDR similarity results from aura-memory engine.
+#[instrument(skip_all, fields(top_k))]
 pub fn collect_sdr(
     sdr: &SDRInterpreter,
     index: &InvertedIndex,
@@ -93,6 +96,7 @@ pub fn collect_sdr(
 }
 
 /// Collect N-gram fuzzy match results, filtered to namespace-scoped records.
+#[instrument(skip_all, fields(top_k))]
 pub fn collect_ngram(
     ngram_index: &NGramIndex,
     records: &HashMap<String, Record>,
@@ -109,6 +113,7 @@ pub fn collect_ngram(
 }
 
 /// Collect Tag Jaccard similarity results.
+#[instrument(skip_all, fields(top_k))]
 pub fn collect_tags(
     tag_index: &HashMap<String, HashSet<String>>,
     records: &HashMap<String, Record>,
@@ -164,6 +169,7 @@ pub fn collect_tags(
 /// Reciprocal Rank Fusion — combines multiple ranked lists.
 ///
 /// RRF score = Σ(1 / (k + rank_i)) for each list where record appears.
+#[instrument(skip_all, fields(top_k))]
 pub fn rrf_fuse(
     records: &HashMap<String, Record>,
     ranked_lists: &[Vec<(String, f32)>],
@@ -512,6 +518,7 @@ fn estimate_tokens(text: &str) -> usize {
 /// When provided, it participates in RRF fusion alongside SDR, N-gram, and Tag Jaccard.
 ///
 /// `trust_config` is used for recency boost + source authority scoring.
+#[instrument(skip_all, fields(query, top_k, min_strength))]
 pub fn recall_pipeline(
     query: &str,
     top_k: usize,

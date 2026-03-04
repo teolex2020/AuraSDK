@@ -1,0 +1,27 @@
+{
+  "records": 1000,
+  "platform": "Windows 10",
+  "python": "3.12.7",
+  "timestamp": "2026-03-03T20:08:29Z",
+  "results": {
+    "store": {
+      "mean_ms": 1.1754,
+      "median_ms": 1.0052,
+      "p95_ms": 2.1754
+    },
+    "recall_structured": {
+      "mean_ms": 24.4485,
+      "median_ms": 22.6717,
+      "p95_ms": 38.0492
+    },
+    "recall_cached": {
+      "mean_us": 0.97,
+      "median_us": 0.9,
+      "min_us": 0.8
+    },
+    "maintenance": {
+      "mean_ms": 24.8885,
+      "median_ms": 2.8886
+    }
+  }
+}

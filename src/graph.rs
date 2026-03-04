@@ -340,8 +340,8 @@ mod tests {
         let mut tracker = SessionTracker::new();
         let mut records = HashMap::new();
 
-        let mut r1 = Record::new("test1".into(), Level::Working);
-        let mut r2 = Record::new("test2".into(), Level::Working);
+        let r1 = Record::new("test1".into(), Level::Working);
+        let r2 = Record::new("test2".into(), Level::Working);
         let id1 = r1.id.clone();
         let id2 = r2.id.clone();
         records.insert(id1.clone(), r1);
@@ -372,7 +372,6 @@ mod tests {
 
         let mut r2 = Record::new("test2".into(), Level::Working);
         r2.tags = vec!["rust".into(), "memory".into()];
-        let id2 = r2.id.clone();
 
         let connected = auto_connect(&mut r2, &tag_index, &mut records);
         assert_eq!(connected, 1);

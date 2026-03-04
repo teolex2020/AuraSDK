@@ -21,6 +21,9 @@
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
+// ── Storage abstraction (WASM-portable) ──
+pub mod backend;
+
 // ── FROM aura-memory (already Rust) ──
 mod types;
 pub mod sdr;
@@ -105,6 +108,23 @@ pub mod server {
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
+
+#[cfg(not(feature = "telemetry"))]
+pub mod telemetry {
+    //! Telemetry stub for builds without telemetry feature
+    use anyhow::{anyhow, Result};
+
+    pub struct TracerProvider;
+
+    pub fn init_telemetry() -> Result<TracerProvider> {
+        Err(anyhow!("Telemetry not enabled - rebuild with 'telemetry' feature"))
+    }
+
+    pub fn shutdown_telemetry(_: TracerProvider) {}
+}
+
 pub mod license;
 
 // ── FROM aura-cognitive (rewritten to Rust) ──
@@ -138,6 +158,10 @@ pub mod background_brain;
 
 // ── Main orchestrator (merges both) ──
 pub mod aura;
+
+// ── C FFI bindings ──
+#[cfg(feature = "ffi")]
+pub mod ffi;
 
 // ── Legacy aura-memory API ──
 mod memory;

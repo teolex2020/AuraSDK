@@ -30,9 +30,12 @@ from aura._core import (
     CircuitBreakerConfig,
 )
 
+from aura.events import AuraEvents
+
 __version__ = "1.2.1"
 __all__ = [
     "Aura",
+    "AuraEvents",
     "Level",
     "Record",
     "TagTaxonomy",

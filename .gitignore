@@ -57,6 +57,9 @@ aura_brain/
 # Internal docs (not for public)
 SPEC.md
 docs/LAUNCH.md
+docs/awesome-lists.md
+docs/devto-memory-article.md
+docs/presentation.html
 
 # Claude Code local config
 .claude/

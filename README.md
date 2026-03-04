@@ -12,7 +12,7 @@
   <a href="https://pypi.org/project/aura-memory/"><img src="https://img.shields.io/pypi/dm/aura-memory.svg" alt="Downloads"></a>
   <a href="https://github.com/teolex2020/AuraSDK/stargazers"><img src="https://img.shields.io/github/stars/teolex2020/AuraSDK?style=social" alt="GitHub stars"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
-  <a href="https://github.com/teolex2020/AuraSDK/actions/workflows/test.yml"><img src="https://img.shields.io/badge/tests-503_passed-brightgreen" alt="Tests"></a>
+  <a href="https://github.com/teolex2020/AuraSDK/actions/workflows/test.yml"><img src="https://img.shields.io/badge/tests-619_passed-brightgreen" alt="Tests"></a>
   <a href="https://www.uspto.gov/"><img src="https://img.shields.io/badge/Patent_Pending-US_63%2F969%2C703-blue.svg" alt="Patent Pending"></a>
 </p>
 
@@ -102,17 +102,31 @@ report = brain.run_maintenance()  # 8 phases, <1ms
 
 ## Key Features
 
+**Core Memory Engine**
 - **RRF Fusion Recall** — Multi-signal ranking: SDR + MinHash + Tag Jaccard (+ optional embeddings)
-- **Trust & Provenance** — Source authority scoring: user input outranks web scrapes, automatically
-- **Source Type Tracking** — Every memory carries provenance: `recorded`, `retrieved`, `inferred`, `generated`
-- **Two-Tier Memory** — Cognitive (ephemeral) + Core (permanent) with dedicated recall and promotion API
+- **Two-Tier Memory** — Cognitive (ephemeral) + Core (permanent) with decay, promotion, and archival
+- **Background Maintenance** — 8-phase lifecycle: decay, reflect, insights, consolidation, archival
 - **Namespace Isolation** — `namespace="sandbox"` keeps test data invisible to production recall
 - **Pluggable Embeddings** — Optional 4th RRF signal: bring your own embedding function
+
+**Trust & Safety**
+- **Trust & Provenance** — Source authority scoring: user input outranks web scrapes, automatically
+- **Source Type Tracking** — Every memory carries provenance: `recorded`, `retrieved`, `inferred`, `generated`
 - **Auto-Protect Guards** — Detects phone numbers, emails, wallets, API keys automatically
-- **Typed Connections** — Causal, reflective, associative graph links between memories
-- **Background Maintenance** — 8-phase cycle: decay, reflect, insights, consolidation, archival
 - **Encryption** — ChaCha20-Poly1305 with Argon2id key derivation
+
+**Adaptive Memory**
+- **Feedback Learning** — `brain.feedback(id, useful=True)` boosts useful memories, weakens noise
+- **Semantic Versioning** — `brain.supersede(old_id, new_content)` with full version chains
+- **Snapshots & Rollback** — `brain.snapshot("v1")` / `brain.rollback("v1")` / `brain.diff("v1","v2")`
+- **Agent-to-Agent Sharing** — `export_context()` / `import_context()` with trust metadata
+
+**Enterprise & Integrations**
+- **Multimodal Stubs** — `store_image()` / `store_audio_transcript()` with media provenance
+- **Prometheus Metrics** — `/metrics` endpoint with 10+ business-level counters and histograms
+- **OpenTelemetry** — `telemetry` feature flag with OTLP export and 17 instrumented spans
 - **MCP Server** — Claude Desktop integration out of the box
+- **WASM-Ready** — `StorageBackend` trait abstraction (`FsBackend` + `MemoryBackend`)
 - **Pure Rust Core** — No Python dependencies, no external services
 
 ---
@@ -261,10 +275,15 @@ Aura includes a standalone web dashboard for visual memory management. Download 
 | Integration | Description | Link |
 |-------------|-------------|------|
 | Ollama | Fully local AI assistant, no API key needed | [`ollama_agent.py`](examples/ollama_agent.py) |
-| LangChain | System prompt injection with memory context | [`langchain_agent.py`](examples/langchain_agent.py) |
+| LangChain | Drop-in Memory class + prompt injection | [`langchain_agent.py`](examples/langchain_agent.py) |
+| LlamaIndex | Chat engine with persistent memory recall | [`llamaindex_agent.py`](examples/llamaindex_agent.py) |
 | OpenAI Agents | Dynamic instructions with persistent memory | [`openai_agents.py`](examples/openai_agents.py) |
+| Claude SDK | System prompt injection + tool use patterns | [`claude_sdk_agent.py`](examples/claude_sdk_agent.py) |
 | CrewAI | Tool-based recall/store for crew agents | [`crewai_agent.py`](examples/crewai_agent.py) |
 | AutoGen | Memory protocol implementation | [`autogen_agent.py`](examples/autogen_agent.py) |
+| FastAPI | Per-user memory middleware with namespace isolation | [`fastapi_middleware.py`](examples/fastapi_middleware.py) |
+
+**FFI (C/Go/C#):** [`aura.h`](examples/aura.h) · [`go/main.go`](examples/go/main.go) · [`csharp/Program.cs`](examples/csharp/Program.cs)
 
 **More examples:** [`basic_usage.py`](examples/basic_usage.py) · [`encryption.py`](examples/encryption.py) · [`agent_memory.py`](examples/agent_memory.py) · [`edge_device.py`](examples/edge_device.py) · [`maintenance_daemon.py`](examples/maintenance_daemon.py) · [`research_bot.py`](examples/research_bot.py)
 
@@ -272,7 +291,7 @@ Aura includes a standalone web dashboard for visual memory management. Download 
 
 ## Architecture
 
-50 Rust modules · ~22,800 lines · **265 Rust + 238 Python = 503 tests**
+52 Rust modules · ~23,500 lines · **272 Rust + 347 Python = 619 tests**
 
 ```
 Python  ──  from aura import Aura  ──▶  aura._core (PyO3)
@@ -291,9 +310,17 @@ Rust    ────────────────────────
         │  ├── Tag Jaccard                            │
         │  └── Embedding (optional, pluggable)        │
         │                                             │
+        │  Adaptive Memory                            │
+        │  ├── Feedback learning (boost/weaken)       │
+        │  ├── Snapshots & rollback                   │
+        │  ├── Supersede (version chains)             │
+        │  └── Agent-to-agent sharing protocol        │
+        │                                             │
         │  Knowledge Graph · Living Memory            │
         │  Trust & Provenance · PII Guards            │
         │  Encryption (ChaCha20 + Argon2id)           │
+        │  StorageBackend (Fs / Memory / WASM)        │
+        │  Telemetry (Prometheus + OpenTelemetry)      │
         └─────────────────────────────────────────────┘
 ```
 
@@ -303,18 +330,36 @@ Rust    ────────────────────────
 
 See [docs/API.md](docs/API.md) for the complete API reference (40+ methods).
 
+## Roadmap
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the full development roadmap.
+
+**Completed (6 phases):**
+- Phase 1 — Community & Trust: benchmarks, CONTRIBUTING.md, issue templates
+- Phase 2 — Ecosystem Gaps: LlamaIndex, temporal queries, event callbacks
+- Phase 3 — Drop-in Adoption: LangChain Memory class, FastAPI middleware, Claude SDK
+- Phase 4 — New Markets: C FFI + Go/C# examples, WASM storage abstraction
+- Phase 5 — Enterprise: Prometheus + OpenTelemetry, multimodal stubs, stress tests (100K/1M)
+- Phase 6 — Competitive Moat: adaptive recall, snapshots, agent sharing, semantic versioning
+
+**Remaining:**
+- TypeScript/WASM build via `wasm-pack` + NPM package (storage abstraction done)
+- Cloudflare Workers edge runtime (depends on WASM)
+- Java FFI example, PyPI publish, benchmark CI
+
 ## Resources
 
 - [Demo Video (30s)](https://www.youtube.com/watch?v=ZyE9P2_uKxg) — Quick overview
 - [API Reference](docs/API.md) — Complete API docs
 - [Examples](examples/) — Ready-to-run scripts
+- [Roadmap](docs/ROADMAP.md) — Development plan
 - [Landing Page](https://aurasdk.dev) — Project overview
 
 ---
 
 ## Contributing
 
-Contributions welcome! Check the [open issues](https://github.com/teolex2020/AuraSDK/issues) or open a new one.
+Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions and guidelines, or check the [open issues](https://github.com/teolex2020/AuraSDK/issues).
 
 ⭐ **If Aura saves you time, a [GitHub star](https://github.com/teolex2020/AuraSDK) helps others discover it and helps us continue development.**
 
