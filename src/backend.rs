@@ -160,11 +160,9 @@ impl StorageBackend for FsBackend {
 
     fn list_dir(&self, path: &str) -> Result<Vec<String>> {
         let mut entries = Vec::new();
-        for entry in std::fs::read_dir(path).map_err(|e| anyhow::anyhow!("list_dir '{}': {}", path, e))? {
-            if let Ok(entry) = entry {
-                if let Some(name) = entry.file_name().to_str() {
-                    entries.push(name.to_string());
-                }
+        for entry in std::fs::read_dir(path).map_err(|e| anyhow::anyhow!("list_dir '{}': {}", path, e))?.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                entries.push(name.to_string());
             }
         }
         Ok(entries)
