@@ -36,7 +36,7 @@ use crate::embedding::EmbeddingStore;
 // SDK Wrapper modules
 use crate::trust::{self, TagTaxonomy, TrustConfig};
 use crate::guards;
-use crate::cache::RecallCache;
+use crate::cache::{RecallCache, StructuredRecallCache};
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::research::{ResearchEngine, ResearchProject};
 use crate::identity::{self, AgentPersona};
@@ -81,6 +81,7 @@ pub struct Aura {
     taxonomy: RwLock<TagTaxonomy>,
     trust_config: RwLock<TrustConfig>,
     recall_cache: RecallCache,
+    structured_recall_cache: StructuredRecallCache,
     circuit_breaker: CircuitBreaker,
     research_engine: ResearchEngine,
     maintenance_config: RwLock<MaintenanceConfig>,
@@ -175,6 +176,7 @@ impl Aura {
             taxonomy: RwLock::new(TagTaxonomy::default()),
             trust_config: RwLock::new(TrustConfig::default()),
             recall_cache: RecallCache::default(),
+            structured_recall_cache: StructuredRecallCache::default(),
             circuit_breaker: CircuitBreaker::default(),
             research_engine: ResearchEngine::new(),
             maintenance_config: RwLock::new(MaintenanceConfig::default()),
@@ -277,6 +279,7 @@ impl Aura {
                             self.cognitive_store.append_update(existing)?;
                             // Invalidate recall cache on write
                             self.recall_cache.clear();
+        self.structured_recall_cache.clear();
                             return Ok(existing.clone());
                         }
                     }
@@ -433,6 +436,7 @@ impl Aura {
 
         // Invalidate recall cache on write
         self.recall_cache.clear();
+        self.structured_recall_cache.clear();
 
         Ok(rec)
     }
@@ -493,15 +497,25 @@ impl Aura {
         session_id: Option<&str>,
         namespaces: Option<&[&str]>,
     ) -> Result<Vec<(f32, Record)>> {
+        let top = top_k.unwrap_or(20);
+        let min_str = min_strength.unwrap_or(0.1);
+
+        // Check structured recall cache
+        if let Some(cached) = self.structured_recall_cache.get(query, top, min_str, namespaces) {
+            return Ok(cached);
+        }
+
         let scored = self.recall_core(
             query,
-            top_k.unwrap_or(20),
-            min_strength.unwrap_or(0.1),
+            top,
+            min_str,
             expand_connections.unwrap_or(true),
             session_id,
             namespaces,
         )?;
-        // Trust-aware recency scoring is now applied inside recall_pipeline
+
+        // Cache the result
+        self.structured_recall_cache.put(query, top, min_str, namespaces, scored.clone());
 
         Ok(scored)
     }
@@ -522,8 +536,7 @@ impl Aura {
         namespaces: Option<&[&str]>,
     ) -> Result<Vec<(f32, Record)>> {
         let records = self.records.read();
-        let ns_records = Self::records_for_namespace(&records, namespaces);
-        let time_records = Self::records_before_timestamp(&ns_records, timestamp);
+        let time_records = Self::records_before_timestamp(&records, timestamp);
 
         let ngram = self.ngram_index.read();
         let tag_idx = self.tag_index.read();
@@ -547,6 +560,7 @@ impl Aura {
             &time_records,
             embedding_ranked,
             Some(&trust_config),
+            namespaces,
         );
 
         drop(records);
@@ -700,6 +714,7 @@ impl Aura {
     /// - `None` → only "default" namespace
     /// - `Some(&["default"])` → only "default"
     /// - `Some(&["default", "sandbox"])` → records from either namespace
+    #[allow(dead_code)]
     fn records_for_namespace(
         records: &HashMap<String, Record>,
         namespaces: Option<&[&str]>,
@@ -737,7 +752,6 @@ impl Aura {
         namespaces: Option<&[&str]>,
     ) -> Result<Vec<(f32, Record)>> {
         let records = self.records.read();
-        let ns_records = Self::records_for_namespace(&records, namespaces);
         let ngram = self.ngram_index.read();
         let tag_idx = self.tag_index.read();
         let aura_idx = self.aura_index.read();
@@ -757,9 +771,10 @@ impl Aura {
             &ngram,
             &tag_idx,
             &aura_idx,
-            &ns_records,
+            &records,
             embedding_ranked,
             Some(&trust_config),
+            namespaces,
         );
 
         // Drop read locks before taking write locks
@@ -894,6 +909,7 @@ impl Aura {
 
         // Invalidate recall cache on write
         self.recall_cache.clear();
+        self.structured_recall_cache.clear();
 
         Ok(Some(rec.clone()))
     }
@@ -924,6 +940,7 @@ impl Aura {
 
         // Invalidate recall cache on write
         self.recall_cache.clear();
+        self.structured_recall_cache.clear();
 
         Ok(true)
     }
@@ -1350,6 +1367,7 @@ impl Aura {
                 // Persist the change
                 let _ = self.cognitive_store.append_update(rec);
                 self.recall_cache.clear();
+        self.structured_recall_cache.clear();
                 Some(rec.level)
             } else {
                 None
@@ -1440,6 +1458,7 @@ impl Aura {
             &records,
             embedding_ranked,
             Some(&trust_config),
+            None, // default namespace
         );
 
         drop(records);
@@ -1636,6 +1655,7 @@ impl Aura {
 
         // Invalidate cache after maintenance
         self.recall_cache.clear();
+        self.structured_recall_cache.clear();
 
         MaintenanceReport {
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -2042,6 +2062,7 @@ impl Aura {
         // Persist change
         self.cognitive_store.append_update(rec)?;
         self.recall_cache.clear();
+        self.structured_recall_cache.clear();
 
         Ok(true)
     }
@@ -2126,6 +2147,7 @@ impl Aura {
         }
 
         self.recall_cache.clear();
+        self.structured_recall_cache.clear();
         Ok(new_rec)
     }
 
@@ -2266,6 +2288,7 @@ impl Aura {
         }
 
         self.recall_cache.clear();
+        self.structured_recall_cache.clear();
         Ok(count)
     }
 
@@ -2475,6 +2498,7 @@ impl Aura {
         }
 
         self.recall_cache.clear();
+        self.structured_recall_cache.clear();
         Ok(imported)
     }
 
@@ -2505,6 +2529,7 @@ impl Aura {
 
         // Invalidate recall cache
         self.recall_cache.clear();
+        self.structured_recall_cache.clear();
 
         Ok(count)
     }
@@ -2543,6 +2568,7 @@ impl Aura {
             &records,
             query,
             top_k,
+            &[crate::record::DEFAULT_NAMESPACE],
         );
 
         Ok(sdr_results
@@ -2628,6 +2654,7 @@ impl Aura {
 
         let _ = self.cognitive_store.append_update(records.get(record_id).unwrap());
         self.recall_cache.clear();
+        self.structured_recall_cache.clear();
         Some(records.get(record_id).unwrap().clone())
     }
 
