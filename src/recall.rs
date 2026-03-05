@@ -117,7 +117,7 @@ pub fn collect_ngram(
         .query(query, top_k * 4)
         .into_iter()
         .filter(|(_, rid)| {
-            records.get(rid).map_or(false, |r| in_namespace(r, namespaces))
+            records.get(rid).is_some_and(|r| in_namespace(r, namespaces))
         })
         .take(top_k)
         .map(|(sim, rid)| (rid, sim))
