@@ -100,6 +100,89 @@ impl Default for RecallCache {
     }
 }
 
+// ── Structured recall cache ──
+
+use crate::record::Record;
+
+/// Cache entry for recall_structured results.
+struct StructuredCacheEntry {
+    result: Vec<(f32, Record)>,
+    inserted_at: Instant,
+}
+
+/// Cache for recall_structured / recall_full results.
+/// Avoids re-running the full RRF pipeline for repeated queries.
+pub struct StructuredRecallCache {
+    entries: Mutex<HashMap<String, StructuredCacheEntry>>,
+    ttl_secs: u64,
+    max_entries: usize,
+}
+
+impl StructuredRecallCache {
+    pub fn new(ttl_secs: u64, max_entries: usize) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            ttl_secs,
+            max_entries,
+        }
+    }
+
+    fn make_key(query: &str, top_k: usize, min_strength: f32, namespaces: Option<&[&str]>) -> String {
+        let q = query.to_lowercase();
+        let q = q.trim();
+        match namespaces {
+            Some(ns) => format!("{}|{}|{:.2}|{}", q, top_k, min_strength, ns.join(",")),
+            None => format!("{}|{}|{:.2}|default", q, top_k, min_strength),
+        }
+    }
+
+    /// Get cached structured recall result.
+    pub fn get(&self, query: &str, top_k: usize, min_strength: f32, namespaces: Option<&[&str]>) -> Option<Vec<(f32, Record)>> {
+        let key = Self::make_key(query, top_k, min_strength, namespaces);
+        let mut entries = self.entries.lock();
+
+        if let Some(entry) = entries.get(&key) {
+            if entry.inserted_at.elapsed().as_secs() < self.ttl_secs {
+                return Some(entry.result.clone());
+            }
+            entries.remove(&key);
+        }
+        None
+    }
+
+    /// Store structured recall result.
+    pub fn put(&self, query: &str, top_k: usize, min_strength: f32, namespaces: Option<&[&str]>, result: Vec<(f32, Record)>) {
+        let key = Self::make_key(query, top_k, min_strength, namespaces);
+        let mut entries = self.entries.lock();
+
+        if entries.len() >= self.max_entries {
+            let oldest_key = entries
+                .iter()
+                .min_by_key(|(_, v)| v.inserted_at)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest_key {
+                entries.remove(&k);
+            }
+        }
+
+        entries.insert(key, StructuredCacheEntry {
+            result,
+            inserted_at: Instant::now(),
+        });
+    }
+
+    /// Clear the cache.
+    pub fn clear(&self) {
+        self.entries.lock().clear();
+    }
+}
+
+impl Default for StructuredRecallCache {
+    fn default() -> Self {
+        Self::new(300, 50) // 5 min TTL, max 50 entries
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

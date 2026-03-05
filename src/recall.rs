@@ -17,10 +17,17 @@ use crate::sdr::SDRInterpreter;
 use crate::index::InvertedIndex;
 use crate::storage::AuraStorage;
 use crate::graph::SessionTracker;
+use crate::record::DEFAULT_NAMESPACE;
 use crate::trust::{self, TrustConfig};
 
 /// RRF constant (higher = more weight to top ranks).
 pub const RRF_K: usize = 60;
+
+/// Check if a record belongs to one of the given namespaces.
+#[inline]
+fn in_namespace(rec: &Record, namespaces: &[&str]) -> bool {
+    namespaces.contains(&rec.namespace.as_str())
+}
 
 /// Graph walk parameters.
 pub const GRAPH_WALK_MAX_HOPS: usize = 2;
@@ -51,6 +58,7 @@ pub fn collect_sdr(
     records: &HashMap<String, Record>,
     query: &str,
     top_k: usize,
+    namespaces: &[&str],
 ) -> Vec<(String, f32)> {
     // Generate query SDR
     let query_sdr = sdr.text_to_sdr(query, false);
@@ -77,8 +85,9 @@ pub fn collect_sdr(
             }
         };
 
-        if !records.contains_key(&record_id) {
-            continue;
+        match records.get(&record_id) {
+            Some(rec) if in_namespace(rec, namespaces) => {}
+            _ => continue,
         }
 
         // Compute Tanimoto similarity
@@ -102,11 +111,14 @@ pub fn collect_ngram(
     records: &HashMap<String, Record>,
     query: &str,
     top_k: usize,
+    namespaces: &[&str],
 ) -> Vec<(String, f32)> {
     ngram_index
         .query(query, top_k * 4)
         .into_iter()
-        .filter(|(_, rid)| records.contains_key(rid))
+        .filter(|(_, rid)| {
+            records.get(rid).map_or(false, |r| in_namespace(r, namespaces))
+        })
         .take(top_k)
         .map(|(sim, rid)| (rid, sim))
         .collect()
@@ -119,6 +131,7 @@ pub fn collect_tags(
     records: &HashMap<String, Record>,
     query: &str,
     top_k: usize,
+    namespaces: &[&str],
 ) -> Vec<(String, f32)> {
     // Parse query words as potential tags
     let query_tags: HashSet<String> = query
@@ -148,6 +161,9 @@ pub fn collect_tags(
         .into_iter()
         .filter_map(|(rid, matched_tags)| {
             let rec = records.get(&rid)?;
+            if !in_namespace(rec, namespaces) {
+                return None;
+            }
             let rec_tags: HashSet<String> = rec.tags.iter().map(|t| t.to_lowercase()).collect();
             let union: HashSet<_> = query_tags.union(&rec_tags).collect();
             let intersection = matched_tags.len();
@@ -175,6 +191,7 @@ pub fn rrf_fuse(
     ranked_lists: &[Vec<(String, f32)>],
     min_strength: f32,
     top_k: usize,
+    namespaces: &[&str],
 ) -> Vec<(f32, Record)> {
     let mut scores: HashMap<String, f32> = HashMap::new();
     let num_lists = ranked_lists.len();
@@ -199,7 +216,7 @@ pub fn rrf_fuse(
         .into_iter()
         .filter_map(|(rid, score)| {
             let rec = records.get(&rid)?;
-            if rec.strength >= min_strength {
+            if rec.strength >= min_strength && in_namespace(rec, namespaces) {
                 Some((score, rec.clone()))
             } else {
                 None
@@ -219,6 +236,7 @@ pub fn graph_walk(
     matched: &mut Vec<(f32, Record)>,
     records: &HashMap<String, Record>,
     min_strength: f32,
+    namespaces: &[&str],
 ) {
     let mut matched_ids: HashSet<String> = matched.iter().map(|(_, r)| r.id.clone()).collect();
     let mut expanded_count = 0;
@@ -267,7 +285,7 @@ pub fn graph_walk(
                 break;
             }
             if let Some(rec) = records.get(&rid) {
-                if rec.strength >= min_strength {
+                if rec.strength >= min_strength && in_namespace(rec, namespaces) {
                     matched.push((score, rec.clone()));
                     matched_ids.insert(rid.clone());
                     new_frontier.push((score, rid));
@@ -288,6 +306,7 @@ pub fn causal_walk(
     matched: &mut Vec<(f32, Record)>,
     records: &HashMap<String, Record>,
     min_strength: f32,
+    namespaces: &[&str],
 ) {
     let mut matched_ids: HashSet<String> = matched.iter().map(|(_, r)| r.id.clone()).collect();
     let mut additions = Vec::new();
@@ -308,7 +327,7 @@ pub fn causal_walk(
             }
 
             let parent = match records.get(&parent_id) {
-                Some(p) if p.strength >= min_strength => p,
+                Some(p) if p.strength >= min_strength && in_namespace(p, namespaces) => p,
                 _ => break,
             };
 
@@ -533,11 +552,15 @@ pub fn recall_pipeline(
     records: &HashMap<String, Record>,
     embedding_ranked: Option<Vec<(String, f32)>>,
     trust_config: Option<&TrustConfig>,
+    namespaces: Option<&[&str]>,
 ) -> Vec<(f32, Record)> {
+    let default_ns = [DEFAULT_NAMESPACE];
+    let ns = namespaces.unwrap_or(&default_ns);
+
     // 1. Collect signals
-    let sdr_ranked = collect_sdr(sdr, inverted_index, storage, aura_index, records, query, top_k);
-    let ngram_ranked = collect_ngram(ngram_index, records, query, top_k);
-    let tag_ranked = collect_tags(tag_index, records, query, top_k);
+    let sdr_ranked = collect_sdr(sdr, inverted_index, storage, aura_index, records, query, top_k, ns);
+    let ngram_ranked = collect_ngram(ngram_index, records, query, top_k, ns);
+    let tag_ranked = collect_tags(tag_index, records, query, top_k, ns);
 
     // 2. RRF Fuse
     let mut lists = Vec::new();
@@ -561,12 +584,12 @@ pub fn recall_pipeline(
         return vec![];
     }
 
-    let mut matched = rrf_fuse(records, &lists, min_strength, top_k);
+    let mut matched = rrf_fuse(records, &lists, min_strength, top_k, ns);
 
     // 3. Graph expansion
     if expand_connections {
-        graph_walk(&mut matched, records, min_strength);
-        causal_walk(&mut matched, records, min_strength);
+        graph_walk(&mut matched, records, min_strength, ns);
+        causal_walk(&mut matched, records, min_strength, ns);
     }
 
     // 4. Trust-aware recency-weighted scoring
@@ -592,7 +615,7 @@ mod tests {
         let list1 = vec![(id1.clone(), 0.9), (id2.clone(), 0.5)];
         let list2 = vec![(id2.clone(), 0.8), (id1.clone(), 0.3)];
 
-        let fused = rrf_fuse(&records, &[list1, list2], 0.0, 10);
+        let fused = rrf_fuse(&records, &[list1, list2], 0.0, 10, &["default"]);
         assert_eq!(fused.len(), 2);
         // Both appear in both lists, so scores should be non-zero
         assert!(fused[0].0 > 0.0);
