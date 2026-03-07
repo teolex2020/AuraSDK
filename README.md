@@ -2,7 +2,7 @@
   <h1 align="center">AuraSDK</h1>
   <p align="center"><strong>Cognitive Memory Engine for AI Agents</strong></p>
   <p align="center">
-    Sub-millisecond recall · No LLM calls · No cloud · Pure Rust · ~3 MB
+    Learns from experience · <1ms recall · No LLM calls · No cloud · ~3 MB
   </p>
 </p>
 
@@ -24,9 +24,9 @@
 
 ---
 
-LLMs forget everything. Every conversation starts from zero. Existing memory solutions — Mem0, Zep, Cognee — require LLM calls for basic recall, adding latency, cloud dependency, and cost to every operation.
+LLMs forget everything. Every conversation starts from zero. Existing solutions bolt on vector databases and LLM calls for basic recall, adding latency, cloud dependency, and cost to every operation.
 
-Aura gives your AI agent persistent, hierarchical memory that decays, consolidates, and evolves — like a human brain. One `pip install`, works fully offline.
+Aura gives your AI agent an adaptive cognitive layer: memory that decays, consolidates, learns from feedback, and evolves over time. Like a brain, not a database. One `pip install`, works fully offline.
 
 ```bash
 pip install aura-memory
@@ -53,6 +53,7 @@ Your agent now remembers. No API keys. No embeddings. No config.
 
 | | **Aura** | Mem0 | Zep | Cognee | Letta/MemGPT |
 |---|---|---|---|---|---|
+| **Architecture** | **Cognitive engine** | Vector + LLM | Vector + LLM | Graph + LLM | LLM orchestration |
 | **LLM required** | **No** | Yes | Yes | Yes | Yes |
 | **Recall latency** | **<1ms** | ~200ms+ | ~200ms | LLM-bound | LLM-bound |
 | **Works offline** | **Fully** | Partial | No | No | With local LLM |
@@ -376,3 +377,4 @@ Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instruct
   Built in Kyiv, Ukraine 🇺🇦 — including during power outages.<br>
   <sub>Solo developer project. If you find this useful, your star means more than you think.</sub>
 </p>
+
