@@ -276,11 +276,11 @@ pub struct AuraStorage {
     file_path: PathBuf,
     offsets: RwLock<HashMap<String, u64>>,
     record_count: RwLock<u64>,
-    writer: Mutex<BufWriter<File>>,
+    writer: Mutex<Option<BufWriter<File>>>,
     dirty_header: Mutex<bool>,
     needs_flush: Mutex<bool>,
     anchor_ids: RwLock<std::collections::HashSet<String>>,
-    reader: Mutex<File>,
+    reader: Mutex<Option<File>>,
     // RAM Cache for high-speed retrieval (SDR + Metadata)
     pub header_cache: RwLock<HashMap<String, Arc<StoredHeader>>>,
     // Optional encryption key for data-at-rest encryption
@@ -322,7 +322,7 @@ impl AuraStorage {
             .truncate(false)
             .open(&file_path)?;
 
-        let writer = Mutex::new(BufWriter::new(writer_file));
+        let writer = Mutex::new(Some(BufWriter::new(writer_file)));
 
         let storage = Self {
             _path: path,
@@ -333,7 +333,7 @@ impl AuraStorage {
             dirty_header: Mutex::new(false),
             needs_flush: Mutex::new(false),
             anchor_ids: RwLock::new(std::collections::HashSet::new()),
-            reader: Mutex::new(reader_file),
+            reader: Mutex::new(Some(reader_file)),
             header_cache: RwLock::new(HashMap::new()),
             encryption_key,
             temporal_path,
@@ -500,6 +500,7 @@ impl AuraStorage {
     #[instrument(skip(self, record))]
     pub fn append(&self, record: &StoredRecord) -> Result<u64> {
         let mut writer = self.writer.lock();
+        let writer = writer.as_mut().ok_or_else(|| anyhow!("Storage is closed"))?;
 
         // Seek to end to append
         let offset = writer.seek(SeekFrom::End(0))?;
@@ -540,6 +541,7 @@ impl AuraStorage {
 
         // Single lock acquisition for writer
         let mut writer = self.writer.lock();
+        let writer = writer.as_mut().ok_or_else(|| anyhow!("Storage is closed"))?;
 
         // Single lock acquisition for offsets and anchors
         let mut offsets = self.offsets.write();
@@ -587,6 +589,10 @@ impl AuraStorage {
     #[instrument(skip(self))]
     pub fn flush(&self) -> Result<()> {
         let mut writer = self.writer.lock();
+        let writer = match writer.as_mut() {
+            Some(w) => w,
+            None => return Ok(()), // already closed
+        };
         writer.flush()?;
         *self.needs_flush.lock() = false;
 
@@ -625,13 +631,16 @@ impl AuraStorage {
         {
             let mut needs = self.needs_flush.lock();
             if *needs {
-                self.writer.lock().flush()?;
+                let mut writer = self.writer.lock();
+                let writer = writer.as_mut().ok_or_else(|| anyhow!("Storage is closed"))?;
+                writer.flush()?;
                 *needs = false;
             }
         }
 
         // For reading, we use a persistent handle to avoid exhaustion
         let mut file = self.reader.lock();
+        let file = file.as_mut().ok_or_else(|| anyhow!("Storage is closed"))?;
         file.seek(SeekFrom::Start(offset))?;
         let mut reader = BufReader::new(&mut *file);
 
@@ -818,18 +827,25 @@ impl AuraStorage {
         tracing::info!("Loaded {} temporal links from {:?}", applied, self.temporal_path);
         Ok(())
     }
+
+    /// Flush all pending writes and release open file handles.
+    pub fn close(&self) -> Result<()> {
+        self.flush()?;
+
+        let mut reader = self.reader.lock();
+        reader.take();
+
+        let mut writer = self.writer.lock();
+        writer.take();
+
+        Ok(())
+    }
 }
 
 impl Drop for AuraStorage {
     fn drop(&mut self) {
-        // Ensure all pending writes are flushed to disk on drop.
-        // This prevents data loss when the process exits or panics.
-        if let Some(needs) = self.needs_flush.try_lock() {
-            if *needs {
-                if let Err(e) = self.flush() {
-                    eprintln!("AuraStorage: failed to flush on drop: {}", e);
-                }
-            }
+        if let Err(e) = self.close() {
+            eprintln!("AuraStorage: failed to close on drop: {}", e);
         }
     }
 }
@@ -879,7 +895,22 @@ mod tests {
         let headers = storage2.header_cache.read();
         let next_a = headers.get("A").unwrap().next_id.read();
         assert_eq!(next_a.as_deref(), Some("B"));
-        
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_close_releases_storage_handles() -> Result<()> {
+        let dir = tempdir()?;
+        let storage_path = dir.path().join("close_test");
+        std::fs::create_dir_all(&storage_path)?;
+
+        let storage = AuraStorage::new(&storage_path)?;
+        storage.append(&mock_record("close"))?;
+        storage.close()?;
+
+        std::fs::remove_dir_all(&storage_path)?;
+        assert!(!storage_path.exists());
         Ok(())
     }
 
