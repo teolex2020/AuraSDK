@@ -327,33 +327,10 @@ Rust    ────────────────────────
 
 ---
 
-## API Reference
-
-See [docs/API.md](docs/API.md) for the complete API reference (40+ methods).
-
-## Roadmap
-
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the full development roadmap.
-
-**Completed (6 phases):**
-- Phase 1 — Community & Trust: benchmarks, CONTRIBUTING.md, issue templates
-- Phase 2 — Ecosystem Gaps: LlamaIndex, temporal queries, event callbacks
-- Phase 3 — Drop-in Adoption: LangChain Memory class, FastAPI middleware, Claude SDK
-- Phase 4 — New Markets: C FFI + Go/C# examples, WASM storage abstraction
-- Phase 5 — Enterprise: Prometheus + OpenTelemetry, multimodal stubs, stress tests (100K/1M)
-- Phase 6 — Competitive Moat: adaptive recall, snapshots, agent sharing, semantic versioning
-
-**Remaining:**
-- TypeScript/WASM build via `wasm-pack` + NPM package (storage abstraction done)
-- Cloudflare Workers edge runtime (depends on WASM)
-- Java FFI example, PyPI publish, benchmark CI
-
 ## Resources
 
 - [Demo Video (30s)](https://www.youtube.com/watch?v=ZyE9P2_uKxg) — Quick overview
-- [API Reference](docs/API.md) — Complete API docs
 - [Examples](examples/) — Ready-to-run scripts
-- [Roadmap](docs/ROADMAP.md) — Development plan
 - [Landing Page](https://aurasdk.dev) — Project overview
 
 ---
