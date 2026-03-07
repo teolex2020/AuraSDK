@@ -32,7 +32,7 @@ from aura._core import (
 
 from aura.events import AuraEvents
 
-__version__ = "1.3.0"
+__version__ = "1.3.2"
 __all__ = [
     "Aura",
     "AuraEvents",

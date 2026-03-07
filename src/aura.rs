@@ -41,6 +41,7 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::research::{ResearchEngine, ResearchProject};
 use crate::identity::{self, AgentPersona};
 use crate::background_brain::{self, BackgroundBrain, MaintenanceConfig, MaintenanceReport};
+use crate::storage::StoredRecord;
 
 /// Maximum content size (100KB).
 const MAX_CONTENT_SIZE: usize = 100 * 1024;
@@ -738,6 +739,52 @@ impl Aura {
             .filter(|(_, r)| r.created_at <= timestamp)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    fn record_to_stored_record(rec: &Record) -> StoredRecord {
+        StoredRecord {
+            id: rec.id.clone(),
+            dna: rec.level.to_dna().to_string(),
+            timestamp: rec.created_at,
+            intensity: rec.strength,
+            stability: if rec.level == Level::Identity { 100.0 } else { 1.0 },
+            decay_velocity: 0.0,
+            entropy: 0.0,
+            sdr_indices: Vec::new(),
+            text: rec.content.clone(),
+            offset: 0,
+        }
+    }
+
+    fn ingest_batch_with_pin(&self, texts: Vec<String>, pin: bool) -> Result<usize> {
+        if texts.is_empty() {
+            return Ok(0);
+        }
+
+        let mut ids = Vec::with_capacity(texts.len());
+        for text in texts {
+            let rec = self.store(
+                &text,
+                if pin { Some(Level::Identity) } else { None },
+                None,
+                Some(pin),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            ids.push(rec.id);
+        }
+
+        for pair in ids.windows(2) {
+            if let [from_id, to_id] = pair {
+                self.storage.set_next_id(from_id, to_id);
+            }
+        }
+
+        Ok(ids.len())
     }
 
     /// Core recall pipeline.
@@ -2006,8 +2053,9 @@ impl Aura {
         self.stop_background();
 
         self.flush()?;
-        self.storage.flush()?;
         let _ = self.index.save();
+        self.cognitive_store.close()?;
+        self.storage.close()?;
         Ok(())
     }
 
@@ -2554,6 +2602,145 @@ impl Aura {
         Ok(format!("Stored record {} (level={})", result.id, result.level))
     }
 
+    /// Legacy-compatible delete helper for server mode.
+    pub fn delete_synapse(&self, id: &str) -> bool {
+        self.delete(id).unwrap_or(false)
+    }
+
+    /// Legacy-compatible full retrieval for server mode.
+    pub fn retrieve_full(&self, raw_query: &str, top_k: usize) -> Result<Vec<(StoredRecord, f32)>> {
+        let results = self.recall_full(
+            raw_query,
+            Some(top_k),
+            Some(true),
+            Some(0.1),
+            Some(true),
+            None,
+            None,
+        )?;
+
+        Ok(results
+            .into_iter()
+            .map(|(score, rec)| (Self::record_to_stored_record(&rec), score))
+            .collect())
+    }
+
+    /// Batch delete helper for server mode.
+    pub fn batch_delete(&self, ids: &[String]) -> usize {
+        ids.iter()
+            .filter(|id| self.delete(id).ok() == Some(true))
+            .count()
+    }
+
+    /// Paginated memory listing for server mode.
+    pub fn list_memories(&self, offset: usize, limit: usize, filter_dna: Option<&str>) -> (Vec<StoredRecord>, usize) {
+        let cache = self.storage.header_cache.read();
+
+        let mut entries: Vec<_> = cache.values()
+            .filter(|h| match filter_dna {
+                Some(dna) if dna == "phantom" => h.dna == "phantom",
+                Some(dna) if dna != "all" => h.dna == dna,
+                _ => h.dna != "phantom",
+            })
+            .collect();
+
+        let total = entries.len();
+        entries.sort_by(|a, b| {
+            b.timestamp()
+                .partial_cmp(&a.timestamp())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let records = entries
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|h| StoredRecord {
+                id: h.id.clone(),
+                dna: h.dna.clone(),
+                timestamp: h.timestamp(),
+                intensity: h.intensity(),
+                stability: h.stability(),
+                decay_velocity: h.decay_velocity(),
+                entropy: h.entropy(),
+                sdr_indices: h.sdr_indices.clone(),
+                text: h.text.clone(),
+                offset: 0,
+            })
+            .collect();
+
+        (records, total)
+    }
+
+    /// Analytics view for server mode.
+    pub fn get_analytics(&self) -> (HashMap<String, usize>, usize, f64, f64) {
+        let cache = self.storage.header_cache.read();
+        let mut by_dna = HashMap::new();
+        let mut oldest = f64::MAX;
+        let mut newest = f64::MIN;
+
+        for header in cache.values() {
+            *by_dna.entry(header.dna.clone()).or_insert(0) += 1;
+            let ts = header.timestamp();
+            if ts < oldest {
+                oldest = ts;
+            }
+            if ts > newest {
+                newest = ts;
+            }
+        }
+
+        let total = cache.len();
+        if total == 0 {
+            oldest = 0.0;
+            newest = 0.0;
+        }
+
+        (by_dna, total, oldest, newest)
+    }
+
+    /// Count phantom records imported via SDR exchange.
+    pub fn phantom_count(&self) -> usize {
+        self.storage.phantom_count()
+    }
+
+    /// Batch ingest with temporal links, compatible with server mode.
+    pub fn ingest_batch(&self, texts: Vec<String>) -> Result<usize> {
+        self.ingest_batch_with_pin(texts, false)
+    }
+
+    /// Batch ingest with pinned identity-level records.
+    pub fn ingest_batch_pinned(&self, texts: Vec<String>) -> Result<usize> {
+        self.ingest_batch_with_pin(texts, true)
+    }
+
+    /// O(1) sequence prediction based on temporal links.
+    pub fn retrieve_prediction(&self, current_id: &str) -> Result<Option<StoredRecord>> {
+        Ok(self.storage.get_prediction(current_id).map(|next| StoredRecord {
+            id: next.id.clone(),
+            dna: next.dna.clone(),
+            timestamp: next.timestamp(),
+            intensity: next.intensity(),
+            stability: next.stability(),
+            decay_velocity: next.decay_velocity(),
+            entropy: next.entropy(),
+            sdr_indices: next.sdr_indices.clone(),
+            text: next.text.clone(),
+            offset: 0,
+        }))
+    }
+
+    /// Surprise metric: 1 - Tanimoto(predicted, actual).
+    pub fn surprise(&self, predicted_id: &str, actual_text: &str) -> Result<f32> {
+        let actual_sdr = self.sdr.text_to_sdr(actual_text, false);
+        if let Some(predicted) = self.storage.get_header(predicted_id) {
+            let similarity = self.sdr.tanimoto_sparse(&predicted.sdr_indices, &actual_sdr);
+            Ok(1.0 - similarity)
+        } else {
+            Ok(1.0)
+        }
+    }
+
     /// Retrieve top-k via SDR similarity only.
     pub fn retrieve(&self, query: &str, top_k: Option<usize>) -> Result<Vec<String>> {
         let top_k = top_k.unwrap_or(5);
@@ -2699,10 +2886,7 @@ fn extract_namespaces(ns: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>) -> PyRes
 
 impl Drop for Aura {
     fn drop(&mut self) {
-        self.stop_background();
-        let _ = self.flush();
-        let _ = self.storage.flush();
-        let _ = self.index.save();
+        let _ = self.close();
     }
 }
 
@@ -3234,6 +3418,22 @@ impl Aura {
     fn py_close(&self) -> PyResult<()> {
         self.close()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        &self,
+        _exc_type: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>,
+        _exc_val: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>,
+        _exc_tb: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>,
+    ) -> PyResult<bool> {
+        self.close()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(false)
     }
 
     #[pyo3(name = "flush")]

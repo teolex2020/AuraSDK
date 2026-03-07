@@ -194,13 +194,12 @@ impl CognitiveStore {
         let crc = crc32fast::hash(payload);
 
         let mut writer = self.writer.lock();
-        if let Some(w) = writer.as_mut() {
-            w.write_u8(op)?;
-            w.write_u32::<LittleEndian>(payload.len() as u32)?;
-            w.write_u32::<LittleEndian>(crc)?;
-            w.write_all(payload)?;
-            w.flush()?;
-        }
+        let w = writer.as_mut().ok_or_else(|| anyhow!("Cognitive store is closed"))?;
+        w.write_u8(op)?;
+        w.write_u32::<LittleEndian>(payload.len() as u32)?;
+        w.write_u32::<LittleEndian>(crc)?;
+        w.write_all(payload)?;
+        w.flush()?;
 
         Ok(())
     }
@@ -281,6 +280,14 @@ impl CognitiveStore {
 
     // ── Serialization ──
 
+    /// Flush pending writes and release the append handle.
+    pub fn close(&self) -> Result<()> {
+        self.flush()?;
+        let mut writer = self.writer.lock();
+        writer.take();
+        Ok(())
+    }
+
     fn serialize_record(&self, rec: &Record) -> Result<Vec<u8>> {
         let json = serde_json::to_vec(rec)?;
         Ok(json)
@@ -349,6 +356,22 @@ mod tests {
 
         let records2 = store.load_all()?;
         assert_eq!(records2.len(), 10);
+        Ok(())
+    }
+
+    #[test]
+    fn test_close_releases_cognitive_store_handle() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("close_test");
+        std::fs::create_dir_all(&store_path)?;
+
+        let store = CognitiveStore::new(&store_path)?;
+        let rec = Record::new("close".into(), Level::Working);
+        store.append_store(&rec)?;
+        store.close()?;
+
+        std::fs::remove_dir_all(&store_path)?;
+        assert!(!store_path.exists());
         Ok(())
     }
 }
