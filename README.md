@@ -12,7 +12,7 @@
   <a href="https://pypi.org/project/aura-memory/"><img src="https://img.shields.io/pypi/dm/aura-memory.svg" alt="Downloads"></a>
   <a href="https://github.com/teolex2020/AuraSDK/stargazers"><img src="https://img.shields.io/github/stars/teolex2020/AuraSDK?style=social" alt="GitHub stars"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
-  <a href="https://github.com/teolex2020/AuraSDK/actions/workflows/test.yml"><img src="https://img.shields.io/badge/tests-619_passed-brightgreen" alt="Tests"></a>
+  <a href="https://github.com/teolex2020/AuraSDK/actions/workflows/test.yml"><img src="https://img.shields.io/badge/tests-622_passed-brightgreen" alt="Tests"></a>
   <a href="https://www.uspto.gov/"><img src="https://img.shields.io/badge/Patent_Pending-US_63%2F969%2C703-blue.svg" alt="Patent Pending"></a>
 </p>
 
@@ -26,7 +26,7 @@
 
 LLMs forget everything. Every conversation starts from zero. Existing solutions bolt on vector databases and LLM calls for basic recall, adding latency, cloud dependency, and cost to every operation.
 
-Aura gives your AI agent an adaptive cognitive layer: memory that decays, consolidates, learns from feedback, and evolves over time. Like a brain, not a database. One `pip install`, works fully offline.
+Aura gives your AI agent an adaptive cognitive layer: memory that decays, consolidates, learns from feedback, and evolves over time. Every record carries a semantic type (fact, decision, trend, preference, contradiction, serendipity) that shapes how it decays, promotes, and surfaces in recall. Like a brain, not a database. One `pip install`, works fully offline.
 
 ```bash
 pip install aura-memory
@@ -37,8 +37,10 @@ from aura import Aura, Level
 
 brain = Aura("./agent_memory")
 
-brain.store("User prefers dark mode", level=Level.Identity, tags=["ui"])
-brain.store("Deploy to staging first", level=Level.Decisions, tags=["workflow"])
+brain.store("User prefers dark mode", level=Level.Identity, tags=["ui"],
+            semantic_type="preference")
+brain.store("Deploy to staging first", level=Level.Decisions, tags=["workflow"],
+            semantic_type="decision")
 
 context = brain.recall("user preferences")  # <1ms — inject into any LLM prompt
 ```
@@ -59,6 +61,7 @@ Your agent now remembers. No API keys. No embeddings. No config.
 | **Works offline** | **Fully** | Partial | No | No | With local LLM |
 | **Cost per operation** | **$0** | API billing | Credit-based | LLM + DB cost | LLM cost |
 | **Binary size** | **~3 MB** | ~50 MB+ | Cloud service | Heavy (Neo4j+) | Python pkg |
+| **Semantic memory types** | **Built-in (6 types)** | No | No | No | No |
 | **Memory decay & promotion** | **Built-in** | Via LLM | Via LLM | No | Via LLM |
 | **Trust & provenance** | **Built-in** | No | No | No | No |
 | **Encryption at rest** | **ChaCha20 + Argon2** | No | No | No | No |
@@ -91,12 +94,20 @@ CORE TIER (slow decay — weeks to months)
 COGNITIVE TIER (fast decay — hours to days)
   Decisions [0.90]  Choices made. Action items.
   Working   [0.80]  Current tasks. Recent context.
+
+SEMANTIC TYPES (modulate decay & promotion)
+  fact          Default knowledge record.
+  decision      More persistent than a standard fact. Promotes earlier.
+  preference    Long-lived user or agent preference.
+  contradiction Preserved longer for conflict analysis.
+  trend         Time-sensitive pattern tracked over repeated activation.
+  serendipity   Cross-domain discovery record.
 ```
 
-One call runs the full lifecycle — decay, promote, merge duplicates, archive expired:
+One call runs the lifecycle — decay, promotion, consolidation, and archival:
 
 ```python
-report = brain.run_maintenance()  # 8 phases, <1ms
+report = brain.run_maintenance()  # background memory maintenance
 ```
 
 ---
@@ -104,11 +115,13 @@ report = brain.run_maintenance()  # 8 phases, <1ms
 ## Key Features
 
 **Core Memory Engine**
-- **RRF Fusion Recall** — Multi-signal ranking: SDR + MinHash + Tag Jaccard (+ optional embeddings)
+- **Fast Local Recall** - Multi-signal ranking with optional embedding support
 - **Two-Tier Memory** — Cognitive (ephemeral) + Core (permanent) with decay, promotion, and archival
-- **Background Maintenance** — 8-phase lifecycle: decay, reflect, insights, consolidation, archival
+- **Semantic Memory Types** — 6 roles (`fact`, `decision`, `trend`, `preference`, `contradiction`, `serendipity`) that influence memory behavior and insighting
+- **Phase-Based Insights** — Detects conflicts, trends, preference patterns, and cross-domain links
+- **Background Maintenance** — Continuous memory hygiene: decay, reflect, insights, consolidation, archival
 - **Namespace Isolation** — `namespace="sandbox"` keeps test data invisible to production recall
-- **Pluggable Embeddings** — Optional 4th RRF signal: bring your own embedding function
+- **Pluggable Embeddings** - Optional embedding support: bring your own embedding function
 
 **Trust & Safety**
 - **Trust & Provenance** — Source authority scoring: user input outranks web scrapes, automatically
@@ -170,7 +183,7 @@ brain.store("Authentication failed for user admin")
 results = brain.recall_structured("login problems", top_k=5)
 ```
 
-Without embeddings, Aura falls back to SDR + MinHash + Tag Jaccard — still fast, still effective.
+Without embeddings, Aura continues to use its local recall pipeline - still fast, still effective.
 
 ### Encryption
 
@@ -178,6 +191,29 @@ Without embeddings, Aura falls back to SDR + MinHash + Tag Jaccard — still fas
 brain = Aura("./secret_data", password="my-secure-password")
 brain.store("Top secret information")
 assert brain.is_encrypted()  # ChaCha20-Poly1305 + Argon2id
+```
+
+### Semantic Memory Types
+
+```python
+brain = Aura("./data")
+
+# Decisions are treated as higher-value memory
+brain.store("Use PostgreSQL over MySQL", semantic_type="decision", tags=["db"])
+
+# Preferences persist longer than generic working notes
+brain.store("User prefers dark mode", semantic_type="preference", tags=["ui"])
+
+# Contradictions are preserved for conflict analysis
+brain.store("User said vegan but ordered steak", semantic_type="contradiction")
+
+# Search by semantic type
+decisions = brain.search(semantic_type="decision")
+
+# Cross-domain insights surface higher-level patterns
+insights = brain.insights(phase=2)
+# Example:
+# [{'insight_type': 'preference_pattern', 'description': 'Preference cluster around ui', ...}]
 ```
 
 ### Namespace Isolation
@@ -246,7 +282,7 @@ Add to Claude Desktop config (Settings → Developer → Edit Config):
 }
 ```
 
-Provides 8 tools: `recall`, `recall_structured`, `store`, `store_code`, `store_decision`, `search`, `insights`, `consolidate`.
+Provides 8 tools: `recall`, `recall_structured`, `store`, `store_code`, `store_decision`, `search`, `insights` (with phase filtering), `consolidate`. Store and search support `semantic_type` filtering.
 
 ---
 
@@ -292,38 +328,17 @@ Aura includes a standalone web dashboard for visual memory management. Download 
 
 ## Architecture
 
-52 Rust modules · ~23,500 lines · **272 Rust + 347 Python = 619 tests**
+Aura uses a Rust core with Python bindings and a local-first memory runtime.
 
-```
-Python  ──  from aura import Aura  ──▶  aura._core (PyO3)
-                                              │
-Rust    ──────────────────────────────────────┘
-        ┌─────────────────────────────────────────────┐
-        │  Aura Engine                                │
-        │                                             │
-        │  Two-Tier Memory                            │
-        │  ├── Cognitive Tier (Working + Decisions)   │
-        │  └── Core Tier (Domain + Identity)          │
-        │                                             │
-        │  Recall Engine (RRF Fusion, k=60)           │
-        │  ├── SDR similarity (256k bit)              │
-        │  ├── MinHash N-gram                         │
-        │  ├── Tag Jaccard                            │
-        │  └── Embedding (optional, pluggable)        │
-        │                                             │
-        │  Adaptive Memory                            │
-        │  ├── Feedback learning (boost/weaken)       │
-        │  ├── Snapshots & rollback                   │
-        │  ├── Supersede (version chains)             │
-        │  └── Agent-to-agent sharing protocol        │
-        │                                             │
-        │  Knowledge Graph · Living Memory            │
-        │  Trust & Provenance · PII Guards            │
-        │  Encryption (ChaCha20 + Argon2id)           │
-        │  StorageBackend (Fs / Memory / WASM)        │
-        │  Telemetry (Prometheus + OpenTelemetry)      │
-        └─────────────────────────────────────────────┘
-```
+Publicly documented concepts are:
+
+- Two-tier memory: cognitive + core
+- Semantic roles for records
+- Local multi-signal recall
+- Trust, provenance, and namespace isolation
+- Maintenance, insights, consolidation, and versioning
+
+The public repository documents the user-facing behavior and integration surface. Detailed internal architecture, tuning, and research notes are intentionally not published.
 
 ---
 
@@ -346,7 +361,8 @@ Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instruct
 ## License & Intellectual Property
 
 - **Code License:** MIT — see [LICENSE](LICENSE).
-- **Patent Notice:** The core cognitive architecture (DNA Layering, Cognitive Crystallization, SDR Indexing, Synaptic Synthesis) is **Patent Pending** (US Provisional Application No. **63/969,703**). See [PATENT](PATENT) for details. Commercial integration of these architectural concepts into enterprise products requires a commercial license. The open-source SDK is freely available under MIT for non-commercial, academic, and standard agent integrations.
+- **Patent Notice:** Core architectural concepts are **Patent Pending** (US Provisional Application No. **63/969,703**). See [PATENT](PATENT) for details. The SDK source code is available under MIT. Separate commercial licensing is available for organizations that want contractual rights around patented architecture, OEM embedding, enterprise deployment, or dedicated support.
+- **Commercial Licensing:** If you want to embed Aura's architecture into a commercial product, see [COMMERCIAL.md](COMMERCIAL.md).
 
 ---
 
@@ -354,4 +370,5 @@ Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instruct
   Built in Kyiv, Ukraine 🇺🇦 — including during power outages.<br>
   <sub>Solo developer project. If you find this useful, your star means more than you think.</sub>
 </p>
+
 

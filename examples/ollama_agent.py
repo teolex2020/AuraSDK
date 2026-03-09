@@ -1,6 +1,4 @@
-"""Aura + Ollama: fully local AI assistant with persistent memory.
-
-No cloud. No API keys. No embeddings. Everything runs on your machine.
+"""Aura + Ollama: local AI assistant with persistent memory.
 
 Requirements:
     pip install aura-memory requests
@@ -11,27 +9,25 @@ Run:
 """
 
 import json
-import sys
 import os
+import sys
+
 import requests
 
-# Fix Windows console encoding for emoji/unicode
 if sys.platform == "win32":
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-from aura import Aura, Level, AgentPersona
+
+from aura import AgentPersona, Aura, Level
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL = "llama3.2"  # change to your preferred model
+MODEL = "llama3.2"
 
 
 def chat(brain: Aura, messages: list, user_input: str) -> str:
     """Send a message to Ollama with Aura memory context."""
-
-    # 1. Recall relevant memories (RRF Fusion: SDR + MinHash + Tag Jaccard)
     context = brain.recall(user_input, token_budget=2000)
 
-    # 2. Build system prompt with memory
     system_prompt = f"""You are a helpful assistant with persistent memory.
 You remember things about the user across conversations.
 
@@ -40,7 +36,6 @@ You remember things about the user across conversations.
 Use the memories above to personalize your responses.
 If the user shares new information worth remembering, say [REMEMBER: ...] at the end."""
 
-    # 3. Send to Ollama
     messages.append({"role": "user", "content": user_input})
     payload = {
         "model": MODEL,
@@ -59,11 +54,11 @@ If the user shares new information worth remembering, say [REMEMBER: ...] at the
 
     messages.append({"role": "assistant", "content": reply})
 
-    # 4. Extract [REMEMBER: ...] tags and store as memories
     import re
+
     for match in re.findall(r"\[REMEMBER:\s*(.+?)\]", reply):
         brain.store(match.strip(), level=Level.Decisions, tags=["learned", "from-conversation"])
-        print(f"  💾 Stored memory: {match.strip()[:60]}")
+        print(f"  Stored memory: {match.strip()[:60]}")
 
     return reply
 
@@ -71,19 +66,18 @@ If the user shares new information worth remembering, say [REMEMBER: ...] at the
 def main():
     brain = Aura("./ollama_agent_data")
 
-    # Set agent persona
     persona = AgentPersona()
     persona.name = "Nova"
     persona.role = "Personal AI Assistant"
     brain.set_persona(persona)
 
     print("=" * 60)
-    print("  Aura + Ollama — Fully Local AI with Memory")
-    print("  No cloud, no API keys, no embeddings")
+    print("  Aura + Ollama - Local AI with Memory")
+    print("  No cloud, no API keys")
     print("=" * 60)
     print(f"  Model: {MODEL}")
     print(f"  Records in memory: {brain.count()}")
-    print(f"  Type 'quit' to exit, 'stats' for memory stats")
+    print("  Type 'quit' to exit, 'stats' for memory stats")
     print("=" * 60)
 
     messages = []
@@ -109,17 +103,11 @@ def main():
                 print(f"  [{r['level']}] {r['content'][:80]}")
             continue
 
-        # Store user messages as Working memory (short-term)
-        brain.store(
-            f"User said: {user_input}",
-            level=Level.Working,
-            tags=["conversation"],
-        )
+        brain.store(f"User said: {user_input}", level=Level.Working, tags=["conversation"])
 
         reply = chat(brain, messages, user_input)
         print(f"\nNova: {reply}")
 
-    # Run maintenance before closing (decay old Working memories)
     brain.run_maintenance()
     brain.close()
     print("\nMemories saved. Goodbye!")

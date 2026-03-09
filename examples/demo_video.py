@@ -1,44 +1,38 @@
-"""Aura SDK -- Scripted Terminal Demo for Video Recording.
+"""Aura SDK -- scripted product demo.
 
-Auto-running demo that showcases every major Aura feature in ~60 seconds.
-No user input needed. Optimized for screen recording.
+This example is intentionally public-facing: it shows user-visible behavior
+without explaining internal implementation details.
 
 Run:
     python examples/demo_video.py
 """
 
-import sys
 import os
-import time
 import shutil
+import sys
+import time
 
-# Windows ANSI support + encoding fix
 if sys.platform == "win32":
-    os.system("")  # enable VT100 processing on Windows
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from aura import Aura, Level, TrustConfig, AgentPersona
+from aura import AgentPersona, Aura, Level, TrustConfig
 
-# -- ANSI Colors --
 BOLD = "\033[1m"
-DIM = "\033[2m"
 RESET = "\033[0m"
 CYAN = "\033[36m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
-RED = "\033[31m"
 MAGENTA = "\033[35m"
-WHITE = "\033[97m"
+DIM = "\033[2m"
 
 DEMO_DIR = "./demo_video_data"
 DEMO_ENC = "./demo_video_encrypted"
-
 section_num = 0
 
 
-def header(title):
+def header(title: str) -> None:
     global section_num
     section_num += 1
     line = "-" * 60
@@ -47,271 +41,141 @@ def header(title):
     print(f"{CYAN}{line}{RESET}\n")
 
 
-def ms(t0):
+def elapsed_ms(t0: float) -> float:
     return (time.perf_counter() - t0) * 1000
 
 
-def kv(key, value, indent=2):
-    pad = " " * indent
-    print(f"{pad}{YELLOW}{key}:{RESET} {GREEN}{value}{RESET}")
+def pause(seconds: float = 0.6) -> None:
+    time.sleep(seconds)
 
 
-def pause(s=0.8):
-    time.sleep(s)
-
-
-def banner(text):
+def banner(lines: list[str]) -> None:
     line = "=" * 60
     print(f"\n{BOLD}{CYAN}{line}{RESET}")
-    for t in text:
-        print(f"{BOLD}{CYAN}  {t}{RESET}")
+    for text in lines:
+        print(f"{BOLD}{CYAN}  {text}{RESET}")
     print(f"{BOLD}{CYAN}{line}{RESET}\n")
 
 
-def main():
+def main() -> None:
+    for path in [DEMO_DIR, DEMO_ENC]:
+        shutil.rmtree(path, ignore_errors=True)
+
     total_t0 = time.perf_counter()
-
-    banner([
-        "Aura SDK -- Meet Your Agent's Brain",
-        "Cognitive memory for AI agents",
-        "No LLM | No cloud | <1ms recall",
-    ])
-    pause(1.0)
-
-    # Clean up from previous runs
-    for d in [DEMO_DIR, DEMO_ENC]:
-        shutil.rmtree(d, ignore_errors=True)
+    banner(
+        [
+            "Aura SDK -- Local Memory for AI Agents",
+            "Persistent context without external services",
+            "Fast recall, trust-aware storage, encrypted local data",
+        ]
+    )
 
     brain = Aura(DEMO_DIR)
 
-    # Warm-up (cold cache mitigation)
-    brain.store("warmup", tags=["warmup"])
-    brain.recall("warmup")
-    brain.delete(brain.search(tags=["warmup"])[0].id)
-
-    # ================================================================
-    # SECTION 1: Agent Identity
-    # ================================================================
-    header("AGENT IDENTITY")
-
+    header("Agent Identity")
     persona = AgentPersona()
     persona.name = "Atlas"
     persona.role = "Research Assistant"
     brain.set_persona(persona)
-    kv("Agent", "Atlas (Research Assistant)")
-
-    brain.store_user_profile({
-        "name": "Teo",
-        "role": "Developer",
-        "language": "Ukrainian",
-    })
-    kv("User", "Teo (Developer)")
-    kv("Records", brain.count())
+    brain.store_user_profile({"name": "Teo", "role": "Developer", "language": "Ukrainian"})
+    print(f"  {YELLOW}Agent:{RESET} {GREEN}Atlas{RESET}")
+    print(f"  {YELLOW}User:{RESET} {GREEN}Teo{RESET}")
     pause()
 
-    # ================================================================
-    # SECTION 2: 4-Level Memory Hierarchy
-    # ================================================================
-    header("4-LEVEL MEMORY HIERARCHY")
-
-    memories = [
+    header("Store Memories")
+    samples = [
         ("User prefers concise answers and dark mode", Level.Identity, ["preference", "ui"]),
-        ("Rust ownership prevents data races at compile time", Level.Domain, ["rust", "lang"]),
-        ("We chose PostgreSQL over MongoDB for ACID compliance", Level.Decisions, ["database", "architecture"]),
-        ("Fix auth bug: users getting 403 on /api/auth endpoint", Level.Working, ["bug", "auth"]),
+        ("Rust ownership helps prevent common bugs", Level.Domain, ["rust", "lang"]),
+        ("Use PostgreSQL for billing data", Level.Decisions, ["database", "work"]),
+        ("Fix blocked-user auth issue", Level.Working, ["bug", "auth"]),
     ]
-
-    level_info = {
-        "IDENTITY": ("core", "0.99"),
-        "DOMAIN": ("core", "0.95"),
-        "DECISIONS": ("cognitive", "0.90"),
-        "WORKING": ("cognitive", "0.80"),
-    }
-
-    ids = []
-    for content, level, tags in memories:
+    for content, level, tags in samples:
         t0 = time.perf_counter()
-        rid = brain.store(content, level=level, tags=tags)
-        elapsed = ms(t0)
-        ids.append(rid)
-        lname = str(level).split(".")[-1]
-        tier, decay = level_info[lname]
-        print(f"  {YELLOW}{lname:10}{RESET} | {DIM}{tier:9}{RESET} | {DIM}decay={decay}{RESET} | {MAGENTA}{elapsed:.2f}ms{RESET}")
-        print(f"  {DIM}  {content[:55]}...{RESET}")
-        time.sleep(0.2)
-
-    print(f"\n  {GREEN}Total records: {brain.count()}{RESET}")
+        brain.store(content, level=level, tags=tags)
+        print(
+            f"  {YELLOW}{str(level).split('.')[-1]:10}{RESET} | "
+            f"{MAGENTA}{elapsed_ms(t0):.2f}ms{RESET} | {DIM}{content[:50]}{RESET}"
+        )
     pause()
 
-    # ================================================================
-    # SECTION 3: RRF Fusion Recall
-    # ================================================================
-    header("RRF FUSION RECALL (<1ms)")
-
-    # Formatted recall
+    header("Recall Context")
     t0 = time.perf_counter()
-    context = brain.recall("authentication issues", token_budget=2000)
-    elapsed = ms(t0)
-
-    print(f"  {MAGENTA}recall() latency: {elapsed:.2f}ms{RESET}")
-    print(f"  {DIM}No LLM. No embeddings. Pure Rust computation.{RESET}\n")
-    for line in context.strip().split("\n"):
+    context = brain.recall("authentication issues", token_budget=1200)
+    print(f"  {MAGENTA}recall(): {elapsed_ms(t0):.2f}ms{RESET}\n")
+    for line in context.strip().splitlines():
         if line.strip():
             print(f"  {DIM}{line}{RESET}")
-
-    pause(0.5)
-
-    # Structured recall
-    t0 = time.perf_counter()
-    results = brain.recall_structured("rust performance", top_k=5)
-    elapsed = ms(t0)
-
-    print(f"\n  {MAGENTA}recall_structured() latency: {elapsed:.2f}ms{RESET}\n")
-    for r in results:
-        score = r["score"]
-        lvl = r["level"]
-        txt = r["content"][:50]
-        print(f"  {YELLOW}[{lvl:10}]{RESET} score={GREEN}{score:.3f}{RESET} | {txt}")
     pause()
 
-    # ================================================================
-    # SECTION 4: Trust & Provenance
-    # ================================================================
-    header("TRUST & PROVENANCE")
-
+    header("Trust-Aware Results")
     tc = TrustConfig()
     tc.source_trust = {"user": 1.0, "api": 0.8, "web_scrape": 0.5}
     brain.set_trust_config(tc)
-
-    brain.store("Python 3.13 released with JIT compiler", level=Level.Domain,
-                tags=["python"], channel="user")
-    brain.store("Python 3.13 might have JIT compiler", level=Level.Working,
-                tags=["python"], channel="web_scrape")
-
-    results = brain.recall_structured("Python JIT", top_k=2)
-    print(f"  {BOLD}Same topic, different sources:{RESET}\n")
+    brain.store("Python release notes mention performance improvements", level=Level.Domain, tags=["python"], channel="user")
+    brain.store("A forum post claims major Python speedups", level=Level.Working, tags=["python"], channel="web_scrape")
+    results = brain.recall_structured("python performance", top_k=2)
     for r in results:
-        trust = r.get("trust", "?")
-        src = r.get("source", "?")
-        bar_len = int(float(r["score"]) * 20)
-        bar = "=" * bar_len + " " * (20 - bar_len)
-        print(f"  [{bar}] {GREEN}{r['score']:.3f}{RESET}  trust={trust}  src={src}")
+        print(f"  score={GREEN}{r['score']:.3f}{RESET} trust={r.get('trust', '?')} src={r.get('source', '?')}")
         print(f"    {DIM}{r['content'][:60]}{RESET}")
-
-    print(f"\n  {BOLD}Domain credibility (60+ pre-scored):{RESET}")
-    for domain in ["arxiv.org", "nature.com", "reddit.com", "unknown-blog.xyz"]:
-        cred = brain.get_credibility(domain)
-        bar_len = int(cred * 20)
-        bar = "=" * bar_len + " " * (20 - bar_len)
-        print(f"  [{bar}] {cred:.2f}  {domain}")
     pause()
 
-    # ================================================================
-    # SECTION 5: Knowledge Graph
-    # ================================================================
-    header("KNOWLEDGE GRAPH")
-
-    # Connect auth bug with database decision
-    id_bug = ids[3]   # Working: auth bug
-    id_db = ids[2]    # Decisions: PostgreSQL
-    brain.connect(id_bug, id_db, weight=0.9, relationship="causal")
-
-    stats = brain.stats()
-    kv("Connections", stats.get("total_connections", 0))
-    kv("Tags tracked", stats.get("total_tags", 0))
-
-    t0 = time.perf_counter()
+    header("Connected Knowledge")
+    auth_records = brain.search(tags=["auth"])
+    decision_records = brain.search(level=Level.Decisions)
+    if auth_records and decision_records:
+        brain.connect(auth_records[0].id, decision_records[0].id, weight=0.9, relationship="causal")
     results = brain.recall_structured("database auth", top_k=3, expand_connections=True)
-    elapsed = ms(t0)
-    print(f"\n  {MAGENTA}Recall with connection expansion: {elapsed:.2f}ms{RESET}")
     for r in results:
         print(f"  {YELLOW}[{r['level']:10}]{RESET} {r['content'][:55]}")
     pause()
 
-    # ================================================================
-    # SECTION 6: Maintenance Cycle
-    # ================================================================
-    header("8-PHASE MAINTENANCE CYCLE")
-
+    header("Maintenance")
     t0 = time.perf_counter()
     report = brain.run_maintenance()
-    elapsed = ms(t0)
-
-    print(f"  {MAGENTA}Full cycle: {elapsed:.2f}ms{RESET}\n")
-    print(f"  Decayed:      {YELLOW}{report.decay.decayed}{RESET}     Promoted:   {YELLOW}{report.reflect.promoted}{RESET}")
-    print(f"  Merged:       {YELLOW}{report.consolidation.native_merged}{RESET}     Archived:   {YELLOW}{report.records_archived}{RESET}")
-    print(f"  Insights:     {YELLOW}{report.insights_found}{RESET}     Cross-conn: {YELLOW}{report.cross_connections}{RESET}")
-    print(f"\n  {GREEN}Total records after cycle: {report.total_records}{RESET}")
+    print(f"  {MAGENTA}maintenance(): {elapsed_ms(t0):.2f}ms{RESET}")
+    print(f"  Decayed: {report.decay.decayed} | Promoted: {report.reflect.promoted}")
+    print(f"  Merged: {report.consolidation.native_merged} | Archived: {report.records_archived}")
+    print(f"  Insights: {report.insights_found}")
     pause()
 
-    # ================================================================
-    # SECTION 7: Two-Tier Architecture
-    # ================================================================
-    header("TWO-TIER ARCHITECTURE")
-
-    ts = brain.tier_stats()
-    print(f"  {BOLD}Cognitive Tier{RESET} {DIM}(ephemeral, fast decay){RESET}")
-    print(f"    +-- Working:   {YELLOW}{ts.get('cognitive_working', 0)}{RESET}")
-    print(f"    +-- Decisions: {YELLOW}{ts.get('cognitive_decisions', 0)}{RESET}")
-    print()
-    print(f"  {BOLD}Core Tier{RESET} {DIM}(permanent, slow decay){RESET}")
-    print(f"    +-- Domain:    {YELLOW}{ts.get('core_domain', 0)}{RESET}")
-    print(f"    +-- Identity:  {YELLOW}{ts.get('core_identity', 0)}{RESET}")
-
-    cog = brain.recall_cognitive("bug")
-    core = brain.recall_core_tier("user preferences")
-    print(f"\n  recall_cognitive('bug'):           {GREEN}{len(cog)} results{RESET}")
-    print(f"  recall_core_tier('preferences'):   {GREEN}{len(core)} results{RESET}")
+    header("Tiered Memory")
+    tier = brain.tier_stats()
+    print(f"  Cognitive tier: {tier.get('cognitive_total', 0)}")
+    print(f"  Core tier:      {tier.get('core_total', 0)}")
+    print(f"  Cognitive recall results: {len(brain.recall_cognitive('bug'))}")
+    print(f"  Core recall results:      {len(brain.recall_core_tier('preferences'))}")
     pause()
 
-    # ================================================================
-    # SECTION 8: Encryption
-    # ================================================================
-    header("ENCRYPTION AT REST")
+    header("Encrypted Storage")
+    secure = Aura(DEMO_ENC, password="demo-secret")
+    secure.store("Private deployment note", tags=["private"])
+    secure.close()
+    secure = Aura(DEMO_ENC, password="demo-secret")
+    print(f"  {YELLOW}Encrypted:{RESET} {GREEN}{secure.is_encrypted()}{RESET}")
+    print(f"  {YELLOW}Recovered:{RESET} {GREEN}{bool(secure.recall('deployment note').strip())}{RESET}")
+    secure.close()
 
-    brain2 = Aura(DEMO_ENC, password="demo-secret")
-    brain2.store("Top secret: deployment key is XK-42-ZZ", tags=["secret"])
-    kv("Encrypted", brain2.is_encrypted())
-    brain2.close()
-
-    # Reopen and verify
-    brain2 = Aura(DEMO_ENC, password="demo-secret")
-    result = brain2.recall("deployment key")
-    print(f"\n  {DIM}Closed, reopened with password -- data persists:{RESET}")
-    for line in result.strip().split("\n"):
-        if line.strip():
-            print(f"  {DIM}{line}{RESET}")
-    kv("Algorithm", "ChaCha20-Poly1305 + Argon2id")
-    brain2.close()
-    pause()
-
-    # ================================================================
-    # FINALE
-    # ================================================================
     brain.close()
-    total_elapsed = ms(total_t0)
+    total = elapsed_ms(total_t0) / 1000
+    banner(
+        [
+            "Aura SDK -- Local Agent Memory",
+            "",
+            f"Total demo time: {total:.1f}s",
+            f"Records retained: {report.total_records}",
+            "",
+            "pip install aura-memory",
+            "github.com/teolex2020/AuraSDK",
+        ]
+    )
 
-    banner([
-        "Aura SDK -- Cognitive Memory for AI Agents",
-        "",
-        f"  Total demo time:  {total_elapsed / 1000:.1f}s",
-        f"  Records created:  {report.total_records}",
-        f"  Recall latency:   <1ms",
-        "",
-        "  pip install aura-memory",
-        "  github.com/teolex2020/AuraSDK",
-    ])
-
-    # Cleanup
-    for d in [DEMO_DIR, DEMO_ENC]:
-        shutil.rmtree(d, ignore_errors=True)
+    for path in [DEMO_DIR, DEMO_ENC]:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except KeyboardInterrupt:
-        print(f"\n{RED}Interrupted.{RESET}")
     finally:
-        for d in [DEMO_DIR, DEMO_ENC]:
-            shutil.rmtree(d, ignore_errors=True)
+        for path in [DEMO_DIR, DEMO_ENC]:
+            shutil.rmtree(path, ignore_errors=True)

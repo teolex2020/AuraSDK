@@ -69,6 +69,8 @@ New examples are always welcome. Place them in `examples/` and follow the existi
 - Minimal dependencies
 - Works with `pip install aura-memory` only
 
+Do not include internal architecture commentary, unpublished benchmark methodology, strategic notes, or private commercialization material in examples, docs, comments, or PR descriptions.
+
 ## Code Style
 
 ### Rust
@@ -89,9 +91,10 @@ src/           Rust core (50 modules, ~22,800 lines)
 python/aura/   Python bindings (PyO3) + MCP server
 tests/         Python test suite (238 tests)
 examples/      Runnable examples (16 scripts)
-docs/          API reference, roadmap, launch plan
 benchmarks/    Performance benchmarks
 ```
+
+Public documentation is intentionally kept lightweight. Internal design notes, roadmap material, launch plans, and architecture research should not be added to the public repository unless explicitly requested.
 
 ## What We Value
 

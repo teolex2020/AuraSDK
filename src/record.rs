@@ -57,6 +57,18 @@ pub struct Record {
     /// Default: "recorded".
     #[serde(default = "default_source_type")]
     pub source_type: String,
+    /// Semantic classification of the record's cognitive role.
+    /// Values: "fact" (knowledge), "decision" (choice + rationale),
+    /// "trend" (pattern/repeated observation), "serendipity" (cross-domain link),
+    /// "preference" (user style/taste), "contradiction" (detected conflict).
+    /// Default: "fact".
+    #[serde(default = "default_semantic_type")]
+    pub semantic_type: String,
+    /// Activation velocity — exponential moving average of activation rate.
+    /// Updated on each activate() call. Used for trending detection.
+    /// Range: 0.0+ (higher = more actively trending). Default: 0.0.
+    #[serde(default)]
+    pub activation_velocity: f32,
 }
 
 /// Default namespace for records.
@@ -68,12 +80,29 @@ pub const DEFAULT_SOURCE_TYPE: &str = "recorded";
 /// Valid epistemological source types.
 pub const VALID_SOURCE_TYPES: &[&str] = &["recorded", "retrieved", "inferred", "generated"];
 
+/// Default semantic type for records.
+pub const DEFAULT_SEMANTIC_TYPE: &str = "fact";
+
+/// Valid semantic types for cognitive classification.
+pub const VALID_SEMANTIC_TYPES: &[&str] = &[
+    "fact",          // Knowledge, information
+    "decision",      // Choice + rationale
+    "trend",         // Repeated pattern or observation
+    "serendipity",   // Cross-domain unexpected connection
+    "preference",    // User style, taste, habit
+    "contradiction", // Detected conflict between records
+];
+
 fn default_namespace() -> String {
     DEFAULT_NAMESPACE.to_string()
 }
 
 fn default_source_type() -> String {
     DEFAULT_SOURCE_TYPE.to_string()
+}
+
+fn default_semantic_type() -> String {
+    DEFAULT_SEMANTIC_TYPE.to_string()
 }
 
 impl Record {
@@ -103,6 +132,8 @@ impl Record {
             caused_by_id: None,
             namespace: DEFAULT_NAMESPACE.to_string(),
             source_type: DEFAULT_SOURCE_TYPE.to_string(),
+            semantic_type: DEFAULT_SEMANTIC_TYPE.to_string(),
+            activation_velocity: 0.0,
         }
     }
 
@@ -125,25 +156,57 @@ impl Record {
             + 0.15 * act_score
     }
 
-    /// Activate this record (boost strength, update timestamp).
+    /// Activate this record (boost strength, update timestamp, update velocity).
     pub fn activate(&mut self) {
-        self.strength = (self.strength + 0.2).min(1.0);
-        self.activation_count += 1;
-        self.last_activated = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
+
+        // Update activation velocity via EMA.
+        // Instantaneous rate = 1/gap_days. EMA alpha = 0.3.
+        let gap_days = ((now - self.last_activated) / 86400.0).max(0.001);
+        let instant_rate = (1.0 / gap_days as f32).min(100.0); // cap for numerical safety
+        const EMA_ALPHA: f32 = 0.3;
+        self.activation_velocity =
+            EMA_ALPHA * instant_rate + (1.0 - EMA_ALPHA) * self.activation_velocity;
+
+        self.strength = (self.strength + 0.2).min(1.0);
+        self.activation_count += 1;
+        self.last_activated = now;
     }
 
-    /// Apply daily decay based on level.
+    /// Apply daily decay based on level and semantic type.
     ///
     /// Uses adaptive decay: rate interpolates from base toward 0.999
     /// as activation_count grows (ceiling effect for frequently used records).
+    /// Semantic type provides a retention modifier:
+    /// - decision/preference/contradiction: 1.1x (decay slower)
+    /// - trend: 0.95x (decay slightly faster — trends should prove themselves)
+    /// - fact/serendipity: 1.0x (default)
     pub fn apply_decay(&mut self) {
         let base_rate = self.level.decay_rate();
         let ceiling_factor = (self.activation_count as f32 / 10.0).min(1.0);
-        let effective_rate = base_rate + (0.999 - base_rate) * ceiling_factor;
+        let adaptive_rate = base_rate + (0.999 - base_rate) * ceiling_factor;
+
+        // Semantic retention modifier
+        let semantic_modifier = self.semantic_decay_modifier();
+        let effective_rate = (adaptive_rate * semantic_modifier).min(0.999);
+
         self.strength *= effective_rate;
+    }
+
+    /// Semantic type retention modifier for decay.
+    ///
+    /// Values > 1.0 slow decay (retain longer), < 1.0 speed decay.
+    fn semantic_decay_modifier(&self) -> f32 {
+        match self.semantic_type.as_str() {
+            "decision" => 1.05,
+            "preference" => 1.08,
+            "contradiction" => 1.10,
+            "trend" => 0.97,
+            _ => 1.0, // fact, serendipity
+        }
     }
 
     /// Whether this record is still alive (not archived).
@@ -227,6 +290,21 @@ impl Record {
         }
     }
 
+    /// Validate a semantic_type string.
+    ///
+    /// Must be one of: "fact", "decision", "trend", "serendipity", "preference", "contradiction".
+    pub fn validate_semantic_type(st: &str) -> Result<(), String> {
+        if VALID_SEMANTIC_TYPES.contains(&st) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Invalid semantic_type '{}'. Must be one of: {}",
+                st,
+                VALID_SEMANTIC_TYPES.join(", ")
+            ))
+        }
+    }
+
     /// Days since last activation.
     pub fn days_since_activation(&self) -> f64 {
         let now = SystemTime::now()
@@ -272,6 +350,10 @@ impl Record {
     fn get_namespace(&self) -> &str { &self.namespace }
     #[getter]
     fn get_source_type(&self) -> &str { &self.source_type }
+    #[getter]
+    fn get_semantic_type(&self) -> &str { &self.semantic_type }
+    #[getter]
+    fn get_activation_velocity(&self) -> f32 { self.activation_velocity }
     #[getter]
     fn get_importance(&self) -> f32 { self.importance() }
 

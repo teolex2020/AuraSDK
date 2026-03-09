@@ -57,6 +57,20 @@ aura_brain/
 # Internal docs (not for public)
 SPEC.md
 docs/
+design/
+research/
+notes/
+private/
+internal/
+architecture/
+roadmap/
+RFC*
+*.draft.md
+*_internal.md
+*_private.md
+*_notes.md
+LAUNCH.md
+COMMERCIAL_NOTES.md
 
 # Claude Code local config
 .claude/

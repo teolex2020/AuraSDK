@@ -502,16 +502,26 @@ fn format_record(rec: &Record, records: &HashMap<String, Record>) -> String {
         _ => "", // "recorded" is the default — no label needed
     };
 
+    // Semantic role label (only shown for non-default types)
+    let semantic_label = match rec.semantic_type.as_str() {
+        "decision" => " {decision}",
+        "preference" => " {preference}",
+        "trend" => " {trend}",
+        "serendipity" => " {serendipity}",
+        "contradiction" => " {contradiction}",
+        _ => "", // "fact" is the default — no label needed
+    };
+
     let mut base = match rec.content_type.as_str() {
         "code" => {
             let lang = rec.metadata.get("language").map(|s| s.as_str()).unwrap_or("");
-            format!("  - [CODE]{}{}\n```{}\n{}\n```", source_label, tags_str, lang, rec.content)
+            format!("  - [CODE]{}{}{}\n```{}\n{}\n```", source_label, semantic_label, tags_str, lang, rec.content)
         }
         "json" => {
-            format!("  - [JSON]{}{}\n```json\n{}\n```", source_label, tags_str, rec.content)
+            format!("  - [JSON]{}{}{}\n```json\n{}\n```", source_label, semantic_label, tags_str, rec.content)
         }
         _ => {
-            format!("  - {}{}{}", rec.content, source_label, tags_str)
+            format!("  - {}{}{}{}", rec.content, source_label, semantic_label, tags_str)
         }
     };
 

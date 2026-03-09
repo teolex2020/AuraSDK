@@ -177,7 +177,7 @@ pub extern "C" fn aura_store(
     let ns = cstr_to_str(namespace);
 
     match aura.store_with_channel(
-        content_str, lv, tags, None, None, None, None, None, None, None, None, ns,
+        content_str, lv, tags, None, None, None, None, None, None, None, None, ns, None,
     ) {
         Ok(rec) => match CString::new(rec.id.as_str()) {
             Ok(c) => c.into_raw(),

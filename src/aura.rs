@@ -205,8 +205,9 @@ impl Aura {
         deduplicate: Option<bool>,
         caused_by_id: Option<&str>,
         namespace: Option<&str>,
+        semantic_type: Option<&str>,
     ) -> Result<Record> {
-        self.store_with_channel(content, level, tags, pin, content_type, source_type, metadata, deduplicate, caused_by_id, None, None, namespace)
+        self.store_with_channel(content, level, tags, pin, content_type, source_type, metadata, deduplicate, caused_by_id, None, None, namespace, semantic_type)
     }
 
     /// Store with explicit channel for provenance stamping.
@@ -226,6 +227,7 @@ impl Aura {
         channel: Option<&str>,
         auto_promote: Option<bool>,
         namespace: Option<&str>,
+        semantic_type: Option<&str>,
     ) -> Result<Record> {
         // Validation
         if content.is_empty() {
@@ -247,6 +249,9 @@ impl Aura {
         crate::record::Record::validate_source_type(source_type)
             .map_err(|e| anyhow::anyhow!(e))?;
         let deduplicate = deduplicate.unwrap_or(true);
+        let semantic_type = semantic_type.unwrap_or(crate::record::DEFAULT_SEMANTIC_TYPE);
+        crate::record::Record::validate_semantic_type(semantic_type)
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         // ── Namespace resolution & validation ──
         let ns = namespace.unwrap_or(crate::record::DEFAULT_NAMESPACE);
@@ -317,6 +322,7 @@ impl Aura {
             rec.caused_by_id = Some(parent_id.to_string());
         }
         rec.namespace = ns.to_string();
+        rec.semantic_type = semantic_type.to_string();
 
         // ── Guard: Stamp provenance ──
         {
@@ -774,6 +780,7 @@ impl Aura {
                 None,
                 None,
                 None,
+                None,
             )?;
             ids.push(rec.id);
         }
@@ -856,6 +863,7 @@ impl Aura {
         content_type: Option<&str>,
         source_type: Option<&str>,
         namespaces: Option<&[&str]>,
+        semantic_type: Option<&str>,
     ) -> Vec<Record> {
         let records = self.records.read();
         let limit = limit.unwrap_or(20);
@@ -885,6 +893,11 @@ impl Aura {
                 }
                 if let Some(st) = source_type {
                     if r.source_type != st {
+                        return false;
+                    }
+                }
+                if let Some(sem) = semantic_type {
+                    if r.semantic_type != sem {
                         return false;
                     }
                 }
@@ -1139,6 +1152,28 @@ impl Aura {
             }
         }
 
+        // Semantic-aware promotion: decisions and preferences have lower thresholds
+        let semantic_promotable: Vec<String> = records
+            .values()
+            .filter(|r| {
+                let is_valuable_type = matches!(r.semantic_type.as_str(), "decision" | "preference");
+                is_valuable_type
+                    && r.activation_count >= 3  // Lower than standard 5
+                    && r.strength >= 0.5        // Lower than standard 0.7
+                    && r.level < Level::Identity
+            })
+            .map(|r| r.id.clone())
+            .collect();
+
+        for id in &semantic_promotable {
+            if let Some(rec) = records.get_mut(id) {
+                if rec.promote() {
+                    promoted += 1;
+                    let _ = self.cognitive_store.append_update(rec);
+                }
+            }
+        }
+
         // Contextual hub promotion (10+ connections, avg weight >= 0.4)
         let hub_promotable: Vec<String> = records
             .values()
@@ -1160,10 +1195,16 @@ impl Aura {
             }
         }
 
-        // Archive dead records
+        // Archive dead records (contradictions get a reprieve — higher archival threshold)
         let dead: Vec<String> = records
             .values()
-            .filter(|r| !r.is_alive())
+            .filter(|r| {
+                if r.semantic_type == "contradiction" {
+                    r.strength < 0.02 // Much harder to archive
+                } else {
+                    !r.is_alive() // Standard: strength < 0.05
+                }
+            })
             .map(|r| r.id.clone())
             .collect();
 
@@ -1183,6 +1224,12 @@ impl Aura {
     pub fn insights(&self) -> Vec<insights::Insight> {
         let records = self.records.read();
         insights::detect_all(&records)
+    }
+
+    /// Run only Phase 2 (cross-domain) detectors.
+    pub fn insights_cross_domain(&self) -> Vec<insights::Insight> {
+        let records = self.records.read();
+        insights::detect_phase2(&records)
     }
 
     /// End a session (co-activation strengthening).
@@ -1795,6 +1842,7 @@ impl Aura {
             Some(false), // Don't dedup research
             None,
             None,
+            None,
         )?;
 
         Ok(rec)
@@ -1817,6 +1865,7 @@ impl Aura {
             Some(Level::Identity),
             Some(vec![identity::PROFILE_TAG.into()]),
             Some(1),
+            None,
             None,
             None,
             None,
@@ -1854,6 +1903,7 @@ impl Aura {
             Some(false), // Don't dedup
             None,
             None,
+            None,
         )
     }
 
@@ -1864,6 +1914,7 @@ impl Aura {
             Some(Level::Identity),
             Some(vec![identity::PROFILE_TAG.into()]),
             Some(1),
+            None,
             None,
             None,
             None,
@@ -1885,6 +1936,7 @@ impl Aura {
             Some(Level::Identity),
             Some(vec![identity::PERSONA_TAG.into()]),
             Some(1),
+            None,
             None,
             None,
             None,
@@ -1915,6 +1967,7 @@ impl Aura {
             Some(false),
             None,
             None,
+            Some("preference"),
         )
     }
 
@@ -1925,6 +1978,7 @@ impl Aura {
             Some(Level::Identity),
             Some(vec![identity::PERSONA_TAG.into()]),
             Some(1),
+            None,
             None,
             None,
             None,
@@ -1975,6 +2029,7 @@ impl Aura {
             None,
             None,
             namespace,
+            None,
         )
     }
 
@@ -2012,6 +2067,7 @@ impl Aura {
             None,
             None,
             namespace,
+            None,
         )
     }
 
@@ -2183,6 +2239,7 @@ impl Aura {
             None,
             None,
             Some(&effective_ns),
+            None,
         )?;
 
         // Update old record's superseded_by with actual new ID
@@ -2531,6 +2588,7 @@ impl Aura {
                 None,
                 Some(false), // Don't auto-promote external memories
                 None,
+                None,
             )?;
 
             // Reduce strength for imported memories (needs local validation)
@@ -2592,6 +2650,7 @@ impl Aura {
             if pin { Some(Level::Identity) } else { None },
             None,
             Some(pin),
+            None,
             None,
             None,
             None,
@@ -2900,7 +2959,7 @@ impl Aura {
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
     }
 
-    #[pyo3(name = "store", signature = (content, level=None, tags=None, pin=None, content_type=None, source_type=None, metadata=None, deduplicate=None, caused_by_id=None, channel=None, auto_promote=None, namespace=None))]
+    #[pyo3(name = "store", signature = (content, level=None, tags=None, pin=None, content_type=None, source_type=None, metadata=None, deduplicate=None, caused_by_id=None, channel=None, auto_promote=None, namespace=None, semantic_type=None))]
     fn py_store(
         &self,
         py: Python<'_>,
@@ -2916,9 +2975,10 @@ impl Aura {
         channel: Option<&str>,
         auto_promote: Option<bool>,
         namespace: Option<&str>,
+        semantic_type: Option<&str>,
     ) -> PyResult<String> {
         let rec = py.allow_threads(|| {
-            self.store_with_channel(content, level, tags, pin, content_type, source_type, metadata, deduplicate, caused_by_id, channel, auto_promote, namespace)
+            self.store_with_channel(content, level, tags, pin, content_type, source_type, metadata, deduplicate, caused_by_id, channel, auto_promote, namespace, semantic_type)
         }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(rec.id.clone())
     }
@@ -3076,7 +3136,7 @@ impl Aura {
         Ok(py_results)
     }
 
-    #[pyo3(name = "search", signature = (query=None, level=None, tags=None, limit=None, content_type=None, source_type=None, namespace=None))]
+    #[pyo3(name = "search", signature = (query=None, level=None, tags=None, limit=None, content_type=None, source_type=None, namespace=None, semantic_type=None))]
     fn py_search(
         &self,
         py: Python<'_>,
@@ -3087,11 +3147,12 @@ impl Aura {
         content_type: Option<&str>,
         source_type: Option<&str>,
         namespace: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>,
+        semantic_type: Option<&str>,
     ) -> PyResult<Vec<Record>> {
         let ns_vec = extract_namespaces(namespace)?;
         let ns_refs: Option<Vec<&str>> = ns_vec.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
         let ns_slice: Option<&[&str]> = ns_refs.as_deref();
-        Ok(py.allow_threads(|| self.search(query, level, tags, limit, content_type, source_type, ns_slice)))
+        Ok(py.allow_threads(|| self.search(query, level, tags, limit, content_type, source_type, ns_slice, semantic_type)))
     }
 
     #[pyo3(name = "get")]
@@ -3148,6 +3209,45 @@ impl Aura {
     fn py_end_session(&self, py: Python<'_>, session_id: &str) -> PyResult<HashMap<String, usize>> {
         py.allow_threads(|| self.end_session(session_id))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Run all insight detectors (phase 0 + 1 + 2) and return list of dicts.
+    #[pyo3(name = "insights", signature = (phase=None))]
+    fn py_insights(&self, py: Python<'_>, phase: Option<u8>) -> PyResult<Vec<PyObject>> {
+        let records = self.records.read();
+        let raw = match phase {
+            Some(0) => crate::insights::detect_phase0(&records),
+            Some(1) => crate::insights::detect_phase1(&records),
+            Some(2) => crate::insights::detect_phase2(&records),
+            None => crate::insights::detect_all(&records),
+            Some(p) => return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Invalid phase {}. Must be 0, 1, or 2.", p),
+            )),
+        };
+
+        let results: Vec<PyObject> = raw
+            .into_iter()
+            .map(|insight| {
+                let dict = pyo3::types::PyDict::new_bound(py);
+                let _ = dict.set_item("insight_type", &insight.insight_type);
+                let _ = dict.set_item("severity", format!("{:?}", insight.severity));
+                let _ = dict.set_item("phase", match insight.phase {
+                    crate::insights::Phase::RecordHealth => "record_health",
+                    crate::insights::Phase::Relationships => "relationships",
+                    crate::insights::Phase::CrossDomain => "cross_domain",
+                });
+                let _ = dict.set_item("record_ids", &insight.record_ids);
+                let _ = dict.set_item("description", &insight.description);
+                let evidence_dict = pyo3::types::PyDict::new_bound(py);
+                for (k, v) in &insight.evidence {
+                    let _ = evidence_dict.set_item(k, v);
+                }
+                let _ = dict.set_item("evidence", &evidence_dict);
+                dict.unbind().into_any()
+            })
+            .collect();
+
+        Ok(results)
     }
 
     #[pyo3(name = "stats")]
@@ -3585,7 +3685,7 @@ mod tests {
             "Teo loves Rust",
             Some(Level::Identity),
             Some(vec!["person".into()]),
-            None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None,
         )?;
 
         assert_eq!(rec.content, "Teo loves Rust");
@@ -3603,8 +3703,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("The quick brown fox jumps over the lazy dog", None, None, None, None, None, None, None, None, None)?;
-        aura.store("The quick brown fox jumps over the lazy dog", None, None, None, None, None, None, None, None, None)?;
+        aura.store("The quick brown fox jumps over the lazy dog", None, None, None, None, None, None, None, None, None, None)?;
+        aura.store("The quick brown fox jumps over the lazy dog", None, None, None, None, None, None, None, None, None, None)?;
 
         // Should be deduplicated to 1 record
         assert_eq!(aura.count(None), 1);
@@ -3617,8 +3717,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("test1", Some(Level::Working), None, None, None, None, None, Some(false), None, None)?;
-        aura.store("test2", Some(Level::Identity), None, None, None, None, None, Some(false), None, None)?;
+        aura.store("test1", Some(Level::Working), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store("test2", Some(Level::Identity), None, None, None, None, None, Some(false), None, None, None)?;
 
         let stats = aura.stats();
         assert_eq!(stats["total_records"], 2);
@@ -3637,7 +3737,7 @@ mod tests {
             "My phone is +380991234567",
             None,
             Some(vec!["personal".into()]),
-            None, None, None, None, Some(false), None, None,
+            None, None, None, None, Some(false), None, None, None,
         )?;
 
         // Should have auto-added "contact" tag
@@ -3658,6 +3758,7 @@ mod tests {
             Some("telegram"),
             None,
             None,
+            None,
         )?;
 
         assert_eq!(rec.metadata.get("source").unwrap(), "user-telegram");
@@ -3670,7 +3771,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("Teo loves Rust programming", Some(Level::Identity), None, None, None, None, None, Some(false), None, None)?;
+        aura.store("Teo loves Rust programming", Some(Level::Identity), None, None, None, None, None, Some(false), None, None, None)?;
 
         // First recall — cache miss
         let r1 = aura.recall("Who is Teo?", None, None, None, None, None)?;
@@ -3679,7 +3780,7 @@ mod tests {
         assert_eq!(r1, r2);
 
         // Store invalidates cache
-        aura.store("Teo is 25 years old", None, None, None, None, None, None, Some(false), None, None)?;
+        aura.store("Teo is 25 years old", None, None, None, None, None, None, Some(false), None, None, None)?;
 
         Ok(())
     }
@@ -3694,7 +3795,7 @@ mod tests {
             "Teo loves Rust programming",
             Some(Level::Domain),
             Some(vec!["fact".into()]),
-            None, None, None, None, Some(false), None, None,
+            None, None, None, None, Some(false), None, None, None,
         )?;
 
         // Store a failure record
@@ -3702,7 +3803,7 @@ mod tests {
             "Failed to register on site X: captcha required",
             Some(Level::Decisions),
             Some(vec!["outcome-failure".into()]),
-            None, None, None, None, Some(false), None, None,
+            None, None, None, None, Some(false), None, None, None,
         )?;
 
         // recall_full should find records matching "Teo Rust"
@@ -3741,7 +3842,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("test record", None, None, None, None, None, None, Some(false), None, None)?;
+        aura.store("test record", None, None, None, None, None, None, Some(false), None, None, None)?;
 
         let report = aura.run_maintenance();
         assert!(report.total_records > 0);
@@ -3861,10 +3962,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("session note about testing", Some(Level::Working), None, None, None, None, None, Some(false), None, None)?;
-        aura.store("recent decision on architecture", Some(Level::Decisions), None, None, None, None, None, Some(false), None, None)?;
-        aura.store("domain fact about Rust language", Some(Level::Domain), None, None, None, None, None, Some(false), None, None)?;
-        aura.store("core identity preferences", Some(Level::Identity), None, None, None, None, None, Some(false), None, None)?;
+        aura.store("session note about testing", Some(Level::Working), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store("recent decision on architecture", Some(Level::Decisions), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store("domain fact about Rust language", Some(Level::Domain), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store("core identity preferences", Some(Level::Identity), None, None, None, None, None, Some(false), None, None, None)?;
 
         // No query — returns all cognitive records
         let cognitive = aura.recall_cognitive(None, None, None);
@@ -3886,10 +3987,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("session note about testing", Some(Level::Working), None, None, None, None, None, Some(false), None, None)?;
-        aura.store("recent decision on architecture", Some(Level::Decisions), None, None, None, None, None, Some(false), None, None)?;
-        aura.store("domain fact about Rust language", Some(Level::Domain), None, None, None, None, None, Some(false), None, None)?;
-        aura.store("core identity preferences", Some(Level::Identity), None, None, None, None, None, Some(false), None, None)?;
+        aura.store("session note about testing", Some(Level::Working), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store("recent decision on architecture", Some(Level::Decisions), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store("domain fact about Rust language", Some(Level::Domain), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store("core identity preferences", Some(Level::Identity), None, None, None, None, None, Some(false), None, None, None)?;
 
         // No query — returns all core records
         let core = aura.recall_core_tier(None, None, None);
@@ -3911,12 +4012,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("w1", Some(Level::Working), None, None, None, None, None, Some(false), None, None)?;
-        aura.store("w2", Some(Level::Working), None, None, None, None, None, Some(false), None, None)?;
-        aura.store("d1", Some(Level::Decisions), None, None, None, None, None, Some(false), None, None)?;
-        aura.store("dom1", Some(Level::Domain), None, None, None, None, None, Some(false), None, None)?;
-        aura.store("id1", Some(Level::Identity), None, None, None, None, None, Some(false), None, None)?;
-        aura.store("id2", Some(Level::Identity), None, None, None, None, None, Some(false), None, None)?;
+        aura.store("w1", Some(Level::Working), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store("w2", Some(Level::Working), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store("d1", Some(Level::Decisions), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store("dom1", Some(Level::Domain), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store("id1", Some(Level::Identity), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store("id2", Some(Level::Identity), None, None, None, None, None, Some(false), None, None, None)?;
 
         let ts = aura.tier_stats();
         assert_eq!(ts["cognitive_total"], 3);
@@ -3936,7 +4037,7 @@ mod tests {
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
         // Store a working-level record
-        let rec = aura.store("frequently recalled fact", Some(Level::Working), None, None, None, None, None, Some(false), None, None)?;
+        let rec = aura.store("frequently recalled fact", Some(Level::Working), None, None, None, None, None, Some(false), None, None, None)?;
 
         // Simulate frequent recalls to bump activation_count
         {
@@ -3963,7 +4064,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        let rec = aura.store("promotable", Some(Level::Working), None, None, None, None, None, Some(false), None, None)?;
+        let rec = aura.store("promotable", Some(Level::Working), None, None, None, None, None, Some(false), None, None, None)?;
         assert_eq!(rec.level, Level::Working);
 
         let new_level = aura.promote_record(&rec.id);
@@ -3994,8 +4095,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("User is 25 years old", Some(Level::Identity), Some(vec!["user".into()]), None, None, None, None, Some(false), None, None)?;
-        aura.store_with_channel("Test case: user is 30 years old", Some(Level::Identity), Some(vec!["user".into()]), None, None, None, None, Some(false), None, None, None, Some("test-data"))?;
+        aura.store("User is 25 years old", Some(Level::Identity), Some(vec!["user".into()]), None, None, None, None, Some(false), None, None, None)?;
+        aura.store_with_channel("Test case: user is 30 years old", Some(Level::Identity), Some(vec!["user".into()]), None, None, None, None, Some(false), None, None, None, Some("test-data"), None)?;
 
         let results = aura.recall_structured("user age", None, None, None, None, Some(&["default"]))?;
         assert!(results.iter().all(|(_, r)| r.namespace == "default"));
@@ -4013,14 +4114,14 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("Real data about cats", None, Some(vec!["animal".into()]), None, None, None, None, Some(false), None, None)?;
-        aura.store_with_channel("Test data about cats", None, Some(vec!["animal".into()]), None, None, None, None, Some(false), None, None, None, Some("sandbox"))?;
+        aura.store("Real data about cats", None, Some(vec!["animal".into()]), None, None, None, None, Some(false), None, None, None)?;
+        aura.store_with_channel("Test data about cats", None, Some(vec!["animal".into()]), None, None, None, None, Some(false), None, None, None, Some("sandbox"), None)?;
 
-        let results = aura.search(None, None, Some(vec!["animal".into()]), None, None, None, Some(&["default"]));
+        let results = aura.search(None, None, Some(vec!["animal".into()]), None, None, None, Some(&["default"]), None);
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("Real"));
 
-        let results = aura.search(None, None, Some(vec!["animal".into()]), None, None, None, Some(&["sandbox"]));
+        let results = aura.search(None, None, Some(vec!["animal".into()]), None, None, None, Some(&["sandbox"]), None);
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("Test"));
 
@@ -4032,8 +4133,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("A", None, None, None, None, None, None, Some(false), None, None)?;
-        aura.store_with_channel("B", None, None, None, None, None, None, Some(false), None, None, None, Some("project-x"))?;
+        aura.store("A", None, None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store_with_channel("B", None, None, None, None, None, None, Some(false), None, None, None, Some("project-x"), None)?;
 
         let ns = aura.list_namespaces();
         assert!(ns.contains(&"default".to_string()));
@@ -4047,16 +4148,16 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        let rec = aura.store("Moveable record content here", None, None, None, None, None, None, Some(false), None, None)?;
+        let rec = aura.store("Moveable record content here", None, None, None, None, None, None, Some(false), None, None, None)?;
         assert_eq!(rec.namespace, "default");
 
         let moved = aura.move_record(&rec.id, "archive").unwrap();
         assert_eq!(moved.namespace, "archive");
 
-        let results = aura.search(Some("Moveable"), None, None, None, None, None, Some(&["default"]));
+        let results = aura.search(Some("Moveable"), None, None, None, None, None, Some(&["default"]), None);
         assert!(results.is_empty());
 
-        let results = aura.search(Some("Moveable"), None, None, None, None, None, Some(&["archive"]));
+        let results = aura.search(Some("Moveable"), None, None, None, None, None, Some(&["archive"]), None);
         assert_eq!(results.len(), 1);
 
         Ok(())
@@ -4067,9 +4168,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("A", None, None, None, None, None, None, Some(false), None, None)?;
-        aura.store("B", None, None, None, None, None, None, Some(false), None, None)?;
-        aura.store_with_channel("C", None, None, None, None, None, None, Some(false), None, None, None, Some("sandbox"))?;
+        aura.store("A", None, None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store("B", None, None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store_with_channel("C", None, None, None, None, None, None, Some(false), None, None, None, Some("sandbox"), None)?;
 
         let stats = aura.namespace_stats();
         assert_eq!(*stats.get("default").unwrap_or(&0), 2);
@@ -4083,8 +4184,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("The quick brown fox jumps over the lazy dog repeatedly", None, None, None, None, None, None, None, None, None)?;
-        aura.store_with_channel("The quick brown fox jumps over the lazy dog repeatedly", None, None, None, None, None, None, None, None, None, None, Some("sandbox"))?;
+        aura.store("The quick brown fox jumps over the lazy dog repeatedly", None, None, None, None, None, None, None, None, None, None)?;
+        aura.store_with_channel("The quick brown fox jumps over the lazy dog repeatedly", None, None, None, None, None, None, None, None, None, None, Some("sandbox"), None)?;
 
         let stats = aura.namespace_stats();
         assert_eq!(*stats.get("default").unwrap_or(&0), 1);
@@ -4098,11 +4199,11 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        let rec = aura.store("No namespace specified here", None, None, None, None, None, None, Some(false), None, None)?;
+        let rec = aura.store("No namespace specified here", None, None, None, None, None, None, Some(false), None, None, None)?;
         assert_eq!(rec.namespace, "default");
 
         // Search without namespace (None defaults to "default")
-        let results = aura.search(Some("No namespace"), None, None, None, None, None, None);
+        let results = aura.search(Some("No namespace"), None, None, None, None, None, None, None);
         assert_eq!(results.len(), 1);
 
         Ok(())
@@ -4115,9 +4216,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("User health data about blood pressure monitoring", None, Some(vec!["health".into()]), None, None, None, None, Some(false), None, None)?;
-        aura.store_with_channel("Test case health scenario about blood pressure", None, Some(vec!["health".into()]), None, None, None, None, Some(false), None, None, None, Some("sandbox"))?;
-        aura.store_with_channel("Project health metrics dashboard", None, Some(vec!["health".into()]), None, None, None, None, Some(false), None, None, None, Some("project-x"))?;
+        aura.store("User health data about blood pressure monitoring", None, Some(vec!["health".into()]), None, None, None, None, Some(false), None, None, None)?;
+        aura.store_with_channel("Test case health scenario about blood pressure", None, Some(vec!["health".into()]), None, None, None, None, Some(false), None, None, None, Some("sandbox"), None)?;
+        aura.store_with_channel("Project health metrics dashboard", None, Some(vec!["health".into()]), None, None, None, None, Some(false), None, None, None, Some("project-x"), None)?;
 
         // Single namespace — only default
         let results = aura.recall_structured("health blood pressure", None, None, None, None, Some(&["default"]))?;
@@ -4138,12 +4239,12 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("Record A in default", None, Some(vec!["multi".into()]), None, None, None, None, Some(false), None, None)?;
-        aura.store_with_channel("Record B in sandbox", None, Some(vec!["multi".into()]), None, None, None, None, Some(false), None, None, None, Some("sandbox"))?;
-        aura.store_with_channel("Record C in project", None, Some(vec!["multi".into()]), None, None, None, None, Some(false), None, None, None, Some("project-x"))?;
+        aura.store("Record A in default", None, Some(vec!["multi".into()]), None, None, None, None, Some(false), None, None, None)?;
+        aura.store_with_channel("Record B in sandbox", None, Some(vec!["multi".into()]), None, None, None, None, Some(false), None, None, None, Some("sandbox"), None)?;
+        aura.store_with_channel("Record C in project", None, Some(vec!["multi".into()]), None, None, None, None, Some(false), None, None, None, Some("project-x"), None)?;
 
         // Search across 2 namespaces
-        let results = aura.search(None, None, Some(vec!["multi".into()]), None, None, None, Some(&["default", "sandbox"]));
+        let results = aura.search(None, None, Some(vec!["multi".into()]), None, None, None, Some(&["default", "sandbox"]), None);
         assert_eq!(results.len(), 2);
         let found_ns: std::collections::HashSet<String> = results.iter().map(|r| r.namespace.clone()).collect();
         assert!(found_ns.contains("default"));
@@ -4151,7 +4252,7 @@ mod tests {
         assert!(!found_ns.contains("project-x"));
 
         // Search across all 3
-        let results = aura.search(None, None, Some(vec!["multi".into()]), None, None, None, Some(&["default", "sandbox", "project-x"]));
+        let results = aura.search(None, None, Some(vec!["multi".into()]), None, None, None, Some(&["default", "sandbox", "project-x"]), None);
         assert_eq!(results.len(), 3);
 
         Ok(())
@@ -4162,14 +4263,14 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("Only in default ns content here", None, None, None, None, None, None, Some(false), None, None)?;
+        aura.store("Only in default ns content here", None, None, None, None, None, None, Some(false), None, None, None)?;
 
         // Single-element slice should behave same as old Option<&str>
-        let results = aura.search(Some("Only in default"), None, None, None, None, None, Some(&["default"]));
+        let results = aura.search(Some("Only in default"), None, None, None, None, None, Some(&["default"]), None);
         assert_eq!(results.len(), 1);
 
         // None should also work (defaults to ["default"])
-        let results = aura.search(Some("Only in default"), None, None, None, None, None, None);
+        let results = aura.search(Some("Only in default"), None, None, None, None, None, None, None);
         assert_eq!(results.len(), 1);
 
         Ok(())
