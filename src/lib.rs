@@ -156,6 +156,18 @@ pub mod embedding;
 // ── Living Memory (Background Brain) ──
 pub mod background_brain;
 
+// ── Epistemic Belief Layer ──
+pub mod belief;
+
+// ── Concept Discovery Layer ──
+pub mod concept;
+
+// ── Causal Pattern Discovery Layer ──
+pub mod causal;
+
+// ── Policy Hint Layer ──
+pub mod policy;
+
 // ── Main orchestrator (merges both) ──
 pub mod aura;
 
@@ -198,6 +210,15 @@ fn _core(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<background_brain::DecayReport>()?;
     m.add_class::<background_brain::ReflectReport>()?;
     m.add_class::<background_brain::ConsolidationReport>()?;
+    m.add_class::<background_brain::EpistemicPhaseReport>()?;
+    m.add_class::<background_brain::BeliefPhaseReport>()?;
+    m.add_class::<background_brain::ConceptPhaseReport>()?;
+    m.add_class::<background_brain::CausalPhaseReport>()?;
+    m.add_class::<background_brain::PolicyPhaseReport>()?;
+    m.add_class::<background_brain::PhaseTimings>()?;
+    m.add_class::<background_brain::LayerStability>()?;
+    m.add_class::<concept::SurfacedConcept>()?;
+    m.add_class::<policy::SurfacedPolicyHint>()?;
 
     // Identity
     m.add_class::<identity::AgentPersona>()?;

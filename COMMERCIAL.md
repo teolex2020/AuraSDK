@@ -11,6 +11,19 @@ If you want to:
 
 please reach out directly for commercial terms.
 
+## Commercial Model
+
+Aura follows an `open-core + commercial extensions` strategy:
+
+- public SDK and core developer surface remain visible for adoption
+- advanced tuning, premium cognitive workflows, enterprise packaging, and commercial support remain monetizable
+
+See also:
+
+- [MONETIZATION.md](MONETIZATION.md)
+- [V2_POSITIONING.md](V2_POSITIONING.md)
+- [CHANGELOG.md](CHANGELOG.md)
+
 ## Contact
 
 Open a private inquiry through the repository owner contact listed on GitHub, or use the project website:
@@ -21,5 +34,5 @@ Open a private inquiry through the repository owner contact listed on GitHub, or
 ## Notes
 
 - Public documentation covers the user-facing SDK surface.
-- Internal architecture, tuning, research notes, and commercialization materials are intentionally not published.
+- Internal premium tuning, commercialization materials, and selected implementation details may remain intentionally unpublished or commercially licensed.
 - Patent notice and intellectual property details remain in [PATENT](PATENT) and [README.md](README.md).

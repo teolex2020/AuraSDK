@@ -149,6 +149,178 @@ pub struct ConsolidationReport {
     pub meta_created: usize,
 }
 
+/// Epistemic phase report — support/conflict propagation from local graph structure.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default)]
+pub struct EpistemicPhaseReport {
+    /// Number of records whose epistemic state changed this cycle.
+    pub updated_records: usize,
+    /// Sum of confirming neighbor counts across all live records.
+    pub total_support_links: usize,
+    /// Sum of conflicting neighbor counts across all live records.
+    pub total_conflict_links: usize,
+    /// Number of records with materially non-zero volatility after the update.
+    pub volatile_records: usize,
+}
+
+/// Belief phase report — epistemic layer stats from a single maintenance cycle.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default)]
+pub struct BeliefPhaseReport {
+    /// Number of new beliefs created this cycle.
+    pub beliefs_created: usize,
+    /// Number of stale beliefs pruned.
+    pub beliefs_pruned: usize,
+    /// Number of belief revisions (winner changed).
+    pub revisions: usize,
+    /// Number of beliefs with a clear winner.
+    pub resolved: usize,
+    /// Number of beliefs with no clear winner.
+    pub unresolved: usize,
+    /// Total active beliefs after this cycle.
+    pub total_beliefs: usize,
+    /// Total active hypotheses after this cycle.
+    pub total_hypotheses: usize,
+    /// Churn rate = revisions / max(total_beliefs, 1).
+    /// Values > 0.10 on stable data indicate belief layer instability.
+    pub churn_rate: f32,
+}
+
+/// Concept phase report — concept discovery stats from a single maintenance cycle.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default)]
+pub struct ConceptPhaseReport {
+    /// Number of eligible belief seeds found.
+    pub seeds_found: usize,
+    /// Total concept candidates discovered.
+    pub candidates_found: usize,
+    /// Candidates that reached Stable state.
+    pub stable_count: usize,
+    /// Candidates that were Rejected.
+    pub rejected_count: usize,
+    /// Average abstraction score across all candidates.
+    pub avg_abstraction_score: f32,
+    // ── Centroid diagnostics ──
+    /// Non-empty centroids built.
+    pub centroids_built: usize,
+    /// Partitions with >= 2 seeds.
+    pub partitions_with_multiple_seeds: usize,
+    /// Total pairwise centroid comparisons.
+    pub pairwise_comparisons: usize,
+    /// Pairs above similarity threshold.
+    pub pairwise_above_threshold: usize,
+    /// Min pairwise Tanimoto.
+    pub tanimoto_min: f32,
+    /// Max pairwise Tanimoto.
+    pub tanimoto_max: f32,
+    /// Avg pairwise Tanimoto.
+    pub tanimoto_avg: f32,
+    /// Avg centroid size (bits).
+    pub avg_centroid_size: f32,
+}
+
+/// Causal phase report — causal pattern discovery stats from a single maintenance cycle.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default)]
+pub struct CausalPhaseReport {
+    /// Number of raw record-level causal edges found.
+    pub edges_found: usize,
+    /// Total causal pattern candidates after aggregation.
+    pub candidates_found: usize,
+    /// Patterns that reached Stable state.
+    pub stable_count: usize,
+    /// Patterns that were Rejected.
+    pub rejected_count: usize,
+    /// Average causal_strength across all candidates.
+    pub avg_causal_strength: f32,
+}
+
+/// Policy phase report — policy hint discovery stats from a single maintenance cycle.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default)]
+pub struct PolicyPhaseReport {
+    /// Number of causal seeds considered.
+    pub seeds_found: usize,
+    /// Total policy hints after generation.
+    pub hints_found: usize,
+    /// Hints that reached Stable state.
+    pub stable_hints: usize,
+    /// Hints suppressed by conflict.
+    pub suppressed_hints: usize,
+    /// Hints that were Rejected.
+    pub rejected_hints: usize,
+    /// Average policy_strength across all hints.
+    pub avg_policy_strength: f32,
+}
+
+/// Per-phase timing in milliseconds.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default)]
+pub struct PhaseTimings {
+    /// Phase 0: Level fix (ms).
+    pub level_fix_ms: f64,
+    /// Phase 1: Decay (ms).
+    pub decay_ms: f64,
+    /// Phase 2: Reflect (ms).
+    pub reflect_ms: f64,
+    /// Phase 2.5: Epistemic update (ms).
+    pub epistemic_ms: f64,
+    /// Phase 3: Insights (ms).
+    pub insights_ms: f64,
+    /// SDR lookup build (ms) — shared by belief/concept/causal.
+    pub sdr_build_ms: f64,
+    /// Phase 3.5: Belief update (ms).
+    pub belief_ms: f64,
+    /// Phase 3.7: Concept discovery (ms).
+    pub concept_ms: f64,
+    /// Phase 3.8: Causal discovery (ms).
+    pub causal_ms: f64,
+    /// Phase 3.9: Policy discovery (ms).
+    pub policy_ms: f64,
+    /// Phase 4: Consolidation (ms).
+    pub consolidation_ms: f64,
+    /// Phase 5: Cross-connections (ms).
+    pub cross_connections_ms: f64,
+    /// Phase 6+7: Tasks + archival (ms).
+    pub tasks_archival_ms: f64,
+    /// Total cycle time (ms).
+    pub total_ms: f64,
+}
+
+/// Per-layer identity stability counters.
+/// Tracks how many entities survived, appeared, or disappeared between cycles.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default)]
+pub struct LayerStability {
+    // ── Belief layer ──
+    /// Belief IDs retained from previous cycle.
+    pub belief_retained: usize,
+    /// New belief IDs this cycle.
+    pub belief_new: usize,
+    /// Belief IDs dropped since previous cycle.
+    pub belief_dropped: usize,
+    /// Belief identity churn rate = (new + dropped) / max(total, 1).
+    pub belief_churn: f32,
+
+    // ── Concept layer ──
+    pub concept_retained: usize,
+    pub concept_new: usize,
+    pub concept_dropped: usize,
+    pub concept_churn: f32,
+
+    // ── Causal layer ──
+    pub causal_retained: usize,
+    pub causal_new: usize,
+    pub causal_dropped: usize,
+    pub causal_churn: f32,
+
+    // ── Policy layer ──
+    pub policy_retained: usize,
+    pub policy_new: usize,
+    pub policy_dropped: usize,
+    pub policy_churn: f32,
+}
+
 /// Full maintenance cycle report.
 #[cfg_attr(feature = "python", pyclass(get_all))]
 #[derive(Debug, Clone)]
@@ -156,12 +328,21 @@ pub struct MaintenanceReport {
     pub timestamp: String,
     pub decay: DecayReport,
     pub reflect: ReflectReport,
+    pub epistemic: EpistemicPhaseReport,
     pub insights_found: usize,
+    pub belief: BeliefPhaseReport,
+    pub concept: ConceptPhaseReport,
+    pub causal: CausalPhaseReport,
+    pub policy: PolicyPhaseReport,
     pub consolidation: ConsolidationReport,
     pub cross_connections: usize,
     pub task_reminders: Vec<String>,
     pub records_archived: usize,
     pub total_records: usize,
+    /// Per-phase timing breakdown.
+    pub timings: PhaseTimings,
+    /// Cross-cycle identity stability.
+    pub stability: LayerStability,
 }
 
 // ── Phase Implementations ──
@@ -216,6 +397,130 @@ pub fn fix_memory_levels(
     }
 
     stats
+}
+
+/// Phase 2.5: Epistemic update — derive support/conflict mass from local structure.
+///
+/// Conservative heuristics:
+/// - supporting neighbors: same namespace, semantically aligned, and connected or strongly tag-overlapping
+/// - conflicting neighbors: explicit contradiction markers, conflict-like relations, or WORKING/IDENTITY tag clashes
+pub fn update_epistemic_state(records: &mut HashMap<String, Record>) -> EpistemicPhaseReport {
+    let live_ids: Vec<String> = records.values()
+        .filter(|r| r.is_alive())
+        .map(|r| r.id.clone())
+        .collect();
+
+    let mut tag_groups: HashMap<String, Vec<String>> = HashMap::new();
+    for rec in records.values().filter(|r| r.is_alive()) {
+        for tag in &rec.tags {
+            tag_groups.entry(tag.clone()).or_default().push(rec.id.clone());
+        }
+    }
+
+    let mut updates: Vec<(String, u32, u32)> = Vec::with_capacity(live_ids.len());
+    let mut report = EpistemicPhaseReport::default();
+
+    for rid in live_ids {
+        let Some(rec) = records.get(&rid) else {
+            continue;
+        };
+
+        let mut neighbors: HashSet<String> = rec.connections.keys().cloned().collect();
+        for tag in &rec.tags {
+            if let Some(ids) = tag_groups.get(tag) {
+                for nid in ids {
+                    if nid != &rid {
+                        neighbors.insert(nid.clone());
+                    }
+                }
+            }
+        }
+
+        let namespace = rec.namespace.clone();
+        let level = rec.level;
+        let semantic_type = rec.semantic_type.clone();
+        let rec_tags: HashSet<&str> = rec.tags.iter().map(|t| t.as_str()).collect();
+
+        let mut confirming = 0u32;
+        let mut conflicting = 0u32;
+
+        for nid in neighbors {
+            let Some(other) = records.get(&nid) else {
+                continue;
+            };
+            if !other.is_alive() || other.namespace != namespace {
+                continue;
+            }
+
+            let other_tags: HashSet<&str> = other.tags.iter().map(|t| t.as_str()).collect();
+            let shared_tags = rec_tags.intersection(&other_tags).count();
+            let relation = rec.connection_type(&nid)
+                .or_else(|| other.connection_type(&rid));
+            let connection_weight = rec.connections.get(&nid)
+                .copied()
+                .or_else(|| other.connections.get(&rid).copied())
+                .unwrap_or(0.0);
+            let connected = connection_weight >= 0.10 || relation.is_some();
+
+            if !connected && shared_tags == 0 {
+                continue;
+            }
+
+            let explicit_conflict_relation = relation.is_some_and(|rel| {
+                rel.contains("conflict") || rel.contains("contradict")
+            });
+            // Contradiction propagation requires strong evidence:
+            // at least 2 shared tags. Auto-connections alone are too noisy
+            // (a record sharing 1 tag like "safety" shouldn't be pulled
+            // into conflict with an unrelated contradiction).
+            let contradiction_pair =
+                (semantic_type == "contradiction" || other.semantic_type == "contradiction")
+                    && shared_tags >= 2;
+            let level_conflict = shared_tags > 0
+                && matches!(
+                    (level, other.level),
+                    (Level::Working, Level::Identity) | (Level::Identity, Level::Working)
+                );
+
+            if explicit_conflict_relation || contradiction_pair || level_conflict {
+                conflicting += 1;
+                continue;
+            }
+
+            let reinforcing_relation = matches!(relation, Some("causal" | "associative" | "coactivation"));
+            let shared_semantic = semantic_type == other.semantic_type;
+            if (shared_semantic && shared_tags > 0)
+                || (reinforcing_relation && connected)
+                || shared_tags >= 2
+            {
+                confirming += 1;
+            }
+        }
+
+        report.total_support_links += confirming as usize;
+        report.total_conflict_links += conflicting as usize;
+        updates.push((rid, confirming, conflicting));
+    }
+
+    for (rid, confirming, conflicting) in updates {
+        if let Some(rec) = records.get_mut(&rid) {
+            let prev_support = rec.support_mass;
+            let prev_conflict = rec.conflict_mass;
+            let prev_volatility = rec.volatility;
+            rec.update_epistemic_signals(confirming, conflicting);
+            if prev_support != rec.support_mass
+                || prev_conflict != rec.conflict_mass
+                || (prev_volatility - rec.volatility).abs() > f32::EPSILON
+            {
+                report.updated_records += 1;
+            }
+            if rec.volatility >= 0.05 {
+                report.volatile_records += 1;
+            }
+        }
+    }
+
+    report
 }
 
 /// Phase 2: Guarded reflect — prevents overpromotion.
@@ -616,6 +921,74 @@ mod tests {
         assert!(config.reflect_enabled);
         assert_eq!(config.level_fix_interval, 10);
         assert!(!config.archival_rules.is_empty());
+    }
+
+    #[test]
+    fn test_update_epistemic_state_support_and_conflict() {
+        let mut records = HashMap::new();
+
+        let mut r1 = Record::new("Deploy to staging before production".into(), Level::Domain);
+        r1.tags = vec!["deploy".into(), "safety".into()];
+        r1.semantic_type = "decision".into();
+
+        let mut r2 = Record::new("Always use staging for safe deploys".into(), Level::Domain);
+        r2.tags = vec!["deploy".into(), "safety".into()];
+        r2.semantic_type = "decision".into();
+        r1.add_typed_connection(&r2.id, 0.7, "coactivation");
+        r2.add_typed_connection(&r1.id, 0.7, "coactivation");
+
+        let mut r3 = Record::new("Skip staging for production deploys".into(), Level::Working);
+        r3.tags = vec!["deploy".into(), "safety".into()];
+        r3.semantic_type = "contradiction".into();
+
+        let id1 = r1.id.clone();
+        let id2 = r2.id.clone();
+        let id3 = r3.id.clone();
+        records.insert(id1.clone(), r1);
+        records.insert(id2.clone(), r2);
+        records.insert(id3.clone(), r3);
+
+        let report = update_epistemic_state(&mut records);
+
+        assert!(report.updated_records >= 3);
+        assert!(report.total_support_links >= 2);
+        assert!(report.total_conflict_links >= 2);
+        assert!(records.get(&id1).unwrap().support_mass >= 1);
+        assert!(records.get(&id1).unwrap().conflict_mass >= 1);
+        assert!(records.get(&id3).unwrap().conflict_mass >= 1);
+    }
+
+    #[test]
+    fn test_update_epistemic_state_tracks_volatility_on_change() {
+        let mut records = HashMap::new();
+
+        let mut r1 = Record::new("User prefers dark mode in the editor".into(), Level::Identity);
+        r1.tags = vec!["ui".into(), "theme".into()];
+        r1.semantic_type = "preference".into();
+
+        let mut r2 = Record::new("Dark theme is used for coding".into(), Level::Working);
+        r2.tags = vec!["ui".into(), "theme".into()];
+        r2.semantic_type = "preference".into();
+
+        let id1 = r1.id.clone();
+        let id2 = r2.id.clone();
+        records.insert(id1.clone(), r1);
+        records.insert(id2.clone(), r2);
+
+        let _ = update_epistemic_state(&mut records);
+        let first_vol = records.get(&id1).unwrap().volatility;
+
+        let mut r3 = Record::new("User rejects dark mode in the editor".into(), Level::Working);
+        r3.tags = vec!["ui".into(), "theme".into()];
+        r3.semantic_type = "contradiction".into();
+        let id3 = r3.id.clone();
+        records.insert(id3, r3);
+
+        let report = update_epistemic_state(&mut records);
+        let second_vol = records.get(&id1).unwrap().volatility;
+
+        assert!(report.total_conflict_links > 0);
+        assert!(second_vol > first_vol);
     }
 
     #[test]

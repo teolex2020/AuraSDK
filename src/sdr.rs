@@ -402,4 +402,31 @@ mod tests {
         assert_eq!(s1, s2, "Same input should produce identical SDR");
         assert!(!s1.is_empty(), "SDR should not be empty");
     }
+
+    #[test]
+    fn test_paraphrase_tanimoto_range() {
+        // Verify SDR Tanimoto ranges for claim grouping calibration.
+        // Same-topic paraphrases should score > 0.15 (CLAIM_SIMILARITY_THRESHOLD),
+        // while cross-topic pairs should score < 0.15.
+        let sdr = SDRInterpreter::default();
+
+        // Same-topic pair (near-identical)
+        let sa = sdr.text_to_sdr("deploy to staging before production release", false);
+        let sb = sdr.text_to_sdr("deploy to staging before production release always", false);
+        let sim_identical = sdr.tanimoto_sparse(&sa, &sb);
+        assert!(sim_identical > 0.15, "near-identical: {:.3}", sim_identical);
+
+        // Same-topic pair (moderate paraphrase)
+        let sa = sdr.text_to_sdr("Always run integration tests before merging pull requests", false);
+        let sb = sdr.text_to_sdr("Run all integration tests before merging any pull request", false);
+        let sim_paraphrase = sdr.tanimoto_sparse(&sa, &sb);
+        assert!(sim_paraphrase > 0.15, "moderate paraphrase: {:.3}", sim_paraphrase);
+
+        // Cross-topic pair (should be low)
+        let sa = sdr.text_to_sdr("Configure blue-green deployment pipeline for zero-downtime releases", false);
+        let sb = sdr.text_to_sdr("Configure PostgreSQL connection pool with maximum twenty-five connections", false);
+        let sim_cross = sdr.tanimoto_sparse(&sa, &sb);
+        assert!(sim_cross < 0.15, "cross-topic: {:.3}", sim_cross);
+
+    }
 }

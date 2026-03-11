@@ -69,6 +69,29 @@ pub struct Record {
     /// Range: 0.0+ (higher = more actively trending). Default: 0.0.
     #[serde(default)]
     pub activation_velocity: f32,
+
+    // ── Epistemic fields (Belief layer support) ──
+
+    /// Epistemic confidence — how reliable this record is.
+    /// Initialized from source_type: recorded=0.90, retrieved=0.75,
+    /// inferred=0.60, generated=0.50. Range: 0.0–1.0.
+    #[serde(default = "default_confidence")]
+    pub confidence: f32,
+
+    /// Number of independent confirming neighbors (records that support
+    /// the same claim via causal/associative connections).
+    #[serde(default)]
+    pub support_mass: u32,
+
+    /// Number of conflicting neighbors (records that contradict this one).
+    #[serde(default)]
+    pub conflict_mass: u32,
+
+    /// Truth-instability — EMA of epistemic state changes
+    /// (confidence flips, conflict arrivals, level changes).
+    /// Higher = less stable epistemically. Range: 0.0–1.0.
+    #[serde(default)]
+    pub volatility: f32,
 }
 
 /// Default namespace for records.
@@ -105,6 +128,11 @@ fn default_semantic_type() -> String {
     DEFAULT_SEMANTIC_TYPE.to_string()
 }
 
+/// Default confidence for deserialization (assumes "recorded" source).
+fn default_confidence() -> f32 {
+    0.90
+}
+
 impl Record {
     /// Create a new record with defaults.
     pub fn new(content: String, level: Level) -> Self {
@@ -134,6 +162,10 @@ impl Record {
             source_type: DEFAULT_SOURCE_TYPE.to_string(),
             semantic_type: DEFAULT_SEMANTIC_TYPE.to_string(),
             activation_velocity: 0.0,
+            confidence: Self::default_confidence_for_source(DEFAULT_SOURCE_TYPE),
+            support_mass: 0,
+            conflict_mass: 0,
+            volatility: 0.0,
         }
     }
 
@@ -305,6 +337,62 @@ impl Record {
         }
     }
 
+    // ── Epistemic helpers ──
+
+    /// Base confidence from source type.
+    pub fn default_confidence_for_source(source_type: &str) -> f32 {
+        match source_type {
+            "recorded" => 0.90,
+            "retrieved" => 0.75,
+            "inferred" => 0.60,
+            "generated" => 0.50,
+            _ => 0.50,
+        }
+    }
+
+    /// Update epistemic signals after a maintenance cycle.
+    ///
+    /// Call this during maintenance with pre-computed neighbor counts.
+    /// - `confirming`: number of neighbors that support this record
+    /// - `conflicting`: number of neighbors that contradict this record
+    pub fn update_epistemic_signals(
+        &mut self,
+        confirming: u32,
+        conflicting: u32,
+    ) {
+        let prev_confidence = self.confidence;
+        let prev_support = self.support_mass;
+        let prev_conflict = self.conflict_mass;
+
+        self.support_mass = confirming;
+        self.conflict_mass = conflicting;
+
+        // Volatility tracks epistemic-state movement, not retention change.
+        // We use normalized deltas so stable repeated states converge downward.
+        const VOLATILITY_ALPHA: f32 = 0.3;
+        let confidence_delta = (self.confidence - prev_confidence).abs();
+        let support_den = prev_support.max(confirming).max(1) as f32;
+        let conflict_den = prev_conflict.max(conflicting).max(1) as f32;
+        let support_delta = (confirming.abs_diff(prev_support) as f32 / support_den) * 0.2;
+        let conflict_delta = (conflicting.abs_diff(prev_conflict) as f32 / conflict_den) * 0.8;
+        let instant_volatility = (confidence_delta + support_delta + conflict_delta).min(1.0);
+        self.volatility = VOLATILITY_ALPHA * instant_volatility
+            + (1.0 - VOLATILITY_ALPHA) * self.volatility;
+    }
+
+    /// Epistemic health score — combines confidence with support/conflict ratio.
+    /// Higher = more epistemically solid.
+    pub fn epistemic_health(&self) -> f32 {
+        let support_ln = (1.0 + self.support_mass as f32).ln();
+        let conflict_ln = (1.0 + self.conflict_mass as f32).ln();
+        let ratio = if support_ln + conflict_ln > 0.0 {
+            support_ln / (support_ln + conflict_ln)
+        } else {
+            0.5 // no evidence either way
+        };
+        self.confidence * ratio * (1.0 - self.volatility * 0.5)
+    }
+
     /// Days since last activation.
     pub fn days_since_activation(&self) -> f64 {
         let now = SystemTime::now()
@@ -354,6 +442,16 @@ impl Record {
     fn get_semantic_type(&self) -> &str { &self.semantic_type }
     #[getter]
     fn get_activation_velocity(&self) -> f32 { self.activation_velocity }
+    #[getter]
+    fn get_confidence(&self) -> f32 { self.confidence }
+    #[getter]
+    fn get_support_mass(&self) -> u32 { self.support_mass }
+    #[getter]
+    fn get_conflict_mass(&self) -> u32 { self.conflict_mass }
+    #[getter]
+    fn get_volatility(&self) -> f32 { self.volatility }
+    #[getter]
+    fn get_epistemic_health(&self) -> f32 { self.epistemic_health() }
     #[getter]
     fn get_importance(&self) -> f32 { self.importance() }
 
@@ -465,6 +563,69 @@ mod tests {
 
         assert_eq!(restored.connection_type("x"), Some("associative"));
         assert_eq!(restored.connections.get("x").copied(), Some(0.7));
+    }
+
+    // ── Epistemic field tests ──────────────────────────────────
+
+    #[test]
+    fn test_default_confidence_by_source() {
+        assert!((Record::default_confidence_for_source("recorded") - 0.90).abs() < 0.001);
+        assert!((Record::default_confidence_for_source("retrieved") - 0.75).abs() < 0.001);
+        assert!((Record::default_confidence_for_source("inferred") - 0.60).abs() < 0.001);
+        assert!((Record::default_confidence_for_source("generated") - 0.50).abs() < 0.001);
+        assert!((Record::default_confidence_for_source("unknown") - 0.50).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_new_record_has_epistemic_defaults() {
+        let rec = Record::new("test".into(), Level::Working);
+        assert!((rec.confidence - 0.90).abs() < 0.001); // default source = "recorded"
+        assert_eq!(rec.support_mass, 0);
+        assert_eq!(rec.conflict_mass, 0);
+        assert!((rec.volatility).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_update_epistemic_signals() {
+        let mut rec = Record::new("test".into(), Level::Working);
+        rec.update_epistemic_signals(5, 1);
+        assert_eq!(rec.support_mass, 5);
+        assert_eq!(rec.conflict_mass, 1);
+        // volatility should be > 0 due to conflict_signal
+        assert!(rec.volatility > 0.0);
+    }
+
+    #[test]
+    fn test_epistemic_health_no_evidence() {
+        let rec = Record::new("test".into(), Level::Working);
+        let health = rec.epistemic_health();
+        // confidence=0.9, no support/conflict -> ratio=0.5, volatility=0
+        assert!((health - 0.9 * 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_epistemic_health_with_support() {
+        let mut rec = Record::new("test".into(), Level::Working);
+        rec.support_mass = 10;
+        rec.conflict_mass = 0;
+        let health = rec.epistemic_health();
+        // ratio = ln(11)/(ln(11)+ln(1)) = 1.0 (ln(1)=0)
+        assert!((health - 0.9).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_backward_compat_no_epistemic_fields() {
+        let rec = Record::new("old record".into(), Level::Working);
+        let mut json_val: serde_json::Value = serde_json::to_value(&rec).unwrap();
+        json_val.as_object_mut().unwrap().remove("confidence");
+        json_val.as_object_mut().unwrap().remove("support_mass");
+        json_val.as_object_mut().unwrap().remove("conflict_mass");
+        json_val.as_object_mut().unwrap().remove("volatility");
+        let restored: Record = serde_json::from_value(json_val).unwrap();
+        assert!((restored.confidence - 0.90).abs() < 0.001);
+        assert_eq!(restored.support_mass, 0);
+        assert_eq!(restored.conflict_mass, 0);
+        assert!((restored.volatility).abs() < 0.001);
     }
 
     #[test]

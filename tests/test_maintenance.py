@@ -17,6 +17,7 @@ class TestMaintenance:
         assert hasattr(report, "total_records")
         assert hasattr(report, "decay")
         assert hasattr(report, "reflect")
+        assert hasattr(report, "epistemic")
         assert hasattr(report, "consolidation")
         assert hasattr(report, "insights_found")
         assert hasattr(report, "cross_connections")

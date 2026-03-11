@@ -41,6 +41,10 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::research::{ResearchEngine, ResearchProject};
 use crate::identity::{self, AgentPersona};
 use crate::background_brain::{self, BackgroundBrain, MaintenanceConfig, MaintenanceReport};
+use crate::belief::{BeliefEngine, BeliefStore, CoarseKeyMode, SdrLookup};
+use crate::concept::{ConceptEngine, ConceptSeedMode, ConceptSimilarityMode, ConceptStore};
+use crate::causal::{CausalEngine, CausalStore};
+use crate::policy::{PolicyEngine, PolicyStore};
 use crate::storage::StoredRecord;
 
 /// Maximum content size (100KB).
@@ -88,10 +92,35 @@ pub struct Aura {
     maintenance_config: RwLock<MaintenanceConfig>,
     background: RwLock<Option<BackgroundBrain>>,
 
+    // ── Epistemic Belief Layer ──
+    belief_engine: RwLock<BeliefEngine>,
+    belief_store: BeliefStore,
+
+    // ── Concept Discovery Layer ──
+    concept_engine: RwLock<ConceptEngine>,
+    concept_store: ConceptStore,
+
+    // ── Causal Pattern Discovery Layer ──
+    causal_engine: RwLock<CausalEngine>,
+    causal_store: CausalStore,
+
+    // ── Policy Hint Layer ──
+    policy_engine: RwLock<PolicyEngine>,
+    policy_store: PolicyStore,
+
+    // ── Cross-cycle stability tracking ──
+    prev_belief_keys: RwLock<HashSet<String>>,
+    prev_concept_keys: RwLock<HashSet<String>>,
+    prev_causal_keys: RwLock<HashSet<String>>,
+    prev_policy_keys: RwLock<HashSet<String>>,
+
     // ── Optional Embedding Support ──
     embedding_store: EmbeddingStore,
     #[cfg(feature = "python")]
     embedding_fn: RwLock<Option<PyObject>>,
+
+    // ── Belief Reranking (Phase 4 — tri-state: Off/Shadow/Limited) ──
+    belief_rerank_mode: std::sync::atomic::AtomicU8,
 
     // ── Config ──
     #[allow(dead_code)]
@@ -132,7 +161,30 @@ impl Aura {
 
         // Initialize cognitive components
         let cognitive_store = CognitiveStore::new(&path_buf)?;
-        let loaded_records = cognitive_store.load_all()?;
+        let mut loaded_records = cognitive_store.load_all()?;
+
+        // Fix legacy records: confidence defaults to 0.90 on deserialization,
+        // but should match the stored source_type for non-"recorded" records.
+        let mut migrated_ids: Vec<String> = Vec::new();
+        for rec in loaded_records.values_mut() {
+            let expected = Record::default_confidence_for_source(&rec.source_type);
+            // Only fix if confidence is at the default 0.90 and source_type disagrees
+            if (rec.confidence - 0.90).abs() < 0.001
+                && (expected - 0.90).abs() > 0.001
+            {
+                rec.confidence = expected;
+                migrated_ids.push(rec.id.clone());
+            }
+        }
+        // Persist only the migrated records
+        if !migrated_ids.is_empty() {
+            for id in &migrated_ids {
+                if let Some(rec) = loaded_records.get(id) {
+                    let _ = cognitive_store.append_update(rec);
+                }
+            }
+            tracing::info!(count = migrated_ids.len(), "Migrated legacy record confidence values");
+        }
 
         // Build indexes from loaded records
         let mut ngram_index = NGramIndex::new(None, None);
@@ -156,6 +208,26 @@ impl Aura {
 
         // Audit log
         let audit_log = AuditLog::new(&path_buf).ok();
+
+        // Epistemic belief layer
+        let belief_store = BeliefStore::new(&path_buf);
+        let belief_engine = belief_store.load().unwrap_or_default();
+
+        // Concept discovery layer
+        // Concepts are derived state — always start empty, rebuild after first
+        // maintenance. The concepts.cog file is only a cache for inspection.
+        let concept_store = ConceptStore::new(&path_buf);
+        let concept_engine = ConceptEngine::new();
+
+        // Causal pattern discovery layer
+        // Same pattern as concepts: derived state, always start empty.
+        let causal_store = CausalStore::new(&path_buf);
+        let causal_engine = CausalEngine::new();
+
+        // Policy hint layer
+        // Same pattern: derived state, always start empty.
+        let policy_store = PolicyStore::new(&path_buf);
+        let policy_engine = PolicyEngine::new();
 
         Ok(Self {
             sdr,
@@ -182,10 +254,28 @@ impl Aura {
             research_engine: ResearchEngine::new(),
             maintenance_config: RwLock::new(MaintenanceConfig::default()),
             background: RwLock::new(None),
+            // Epistemic belief layer
+            belief_engine: RwLock::new(belief_engine),
+            belief_store,
+            // Concept discovery layer
+            concept_engine: RwLock::new(concept_engine),
+            concept_store,
+            // Causal pattern discovery layer
+            causal_engine: RwLock::new(causal_engine),
+            causal_store,
+            // Policy hint layer
+            policy_engine: RwLock::new(policy_engine),
+            policy_store,
+            // Cross-cycle stability tracking
+            prev_belief_keys: RwLock::new(HashSet::new()),
+            prev_concept_keys: RwLock::new(HashSet::new()),
+            prev_causal_keys: RwLock::new(HashSet::new()),
+            prev_policy_keys: RwLock::new(HashSet::new()),
             // Optional embedding support
             embedding_store: EmbeddingStore::new(),
             #[cfg(feature = "python")]
             embedding_fn: RwLock::new(None),
+            belief_rerank_mode: std::sync::atomic::AtomicU8::new(recall::BeliefRerankMode::Off as u8),
             path: path_buf,
         })
     }
@@ -315,6 +405,8 @@ impl Aura {
         rec.tags = tags;
         rec.content_type = content_type.to_string();
         rec.source_type = source_type.to_string();
+        // Recompute confidence from actual source_type (Record::new() defaults to "recorded")
+        rec.confidence = Record::default_confidence_for_source(source_type);
         if let Some(meta) = metadata {
             rec.metadata = meta;
         }
@@ -794,27 +886,25 @@ impl Aura {
         Ok(ids.len())
     }
 
-    /// Core recall pipeline.
-    #[instrument(skip(self), fields(top_k, min_strength))]
-    fn recall_core(
+    /// Raw recall pipeline: signals → RRF → graph walk → trust scoring.
+    /// Does NOT apply belief reranking. Does NOT activate/strengthen records.
+    /// Used as the clean baseline for diagnostic APIs.
+    fn recall_raw(
         &self,
         query: &str,
         top_k: usize,
         min_strength: f32,
         expand_connections: bool,
-        session_id: Option<&str>,
         namespaces: Option<&[&str]>,
-    ) -> Result<Vec<(f32, Record)>> {
+    ) -> Vec<(f32, Record)> {
         let records = self.records.read();
         let ngram = self.ngram_index.read();
         let tag_idx = self.tag_index.read();
         let aura_idx = self.aura_index.read();
-
-        // Optional 4th signal: embedding similarity
         let embedding_ranked = self.collect_embedding_signal(query, top_k);
         let trust_config = self.trust_config.read();
 
-        let scored = recall::recall_pipeline(
+        recall::recall_pipeline(
             query,
             top_k,
             min_strength,
@@ -829,28 +919,107 @@ impl Aura {
             embedding_ranked,
             Some(&trust_config),
             namespaces,
-        );
+        )
+    }
 
-        // Drop read locks before taking write locks
-        drop(records);
-        drop(ngram);
-        drop(tag_idx);
-        drop(aura_idx);
-        drop(trust_config);
-
-        // Activate and strengthen
+    /// Post-recall side effects: activate records and log audit.
+    fn recall_finalize(
+        &self,
+        scored: &[(f32, Record)],
+        query: &str,
+        session_id: Option<&str>,
+    ) {
         {
             let mut records = self.records.write();
             let mut tracker = self.session_tracker.write();
-            recall::activate_and_strengthen(&scored, &mut records, &mut tracker, session_id);
+            recall::activate_and_strengthen(scored, &mut records, &mut tracker, session_id);
         }
-
-        // Audit
         if let Some(ref log) = self.audit_log {
             let _ = log.log_retrieve(query, scored.len());
         }
+    }
 
+    /// Core recall pipeline: raw baseline + optional belief reranking + side effects.
+    #[instrument(skip(self), fields(top_k, min_strength))]
+    fn recall_core(
+        &self,
+        query: &str,
+        top_k: usize,
+        min_strength: f32,
+        expand_connections: bool,
+        session_id: Option<&str>,
+        namespaces: Option<&[&str]>,
+    ) -> Result<Vec<(f32, Record)>> {
+        let mut scored = self.recall_raw(query, top_k, min_strength, expand_connections, namespaces);
+
+        // Phase 4: belief-aware reranking (only in Limited mode)
+        let rerank_mode = recall::BeliefRerankMode::from_u8(
+            self.belief_rerank_mode.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        if rerank_mode == recall::BeliefRerankMode::Limited {
+            let belief_eng = self.belief_engine.read();
+            let _report = recall::apply_belief_rerank(&mut scored, &belief_eng, top_k);
+        }
+
+        self.recall_finalize(&scored, query, session_id);
         Ok(scored)
+    }
+
+    /// Recall with parallel shadow belief scoring.
+    ///
+    /// Returns (baseline_results, shadow_report). The baseline is the raw
+    /// pipeline output (steps 1-4) WITHOUT belief reranking, regardless of
+    /// the current mode setting. Shadow scoring is purely observational.
+    pub fn recall_structured_with_shadow(
+        &self,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+        namespaces: Option<&[&str]>,
+    ) -> Result<(Vec<(f32, Record)>, recall::ShadowRecallReport)> {
+        let top = top_k.unwrap_or(20);
+        let min_str = min_strength.unwrap_or(0.1);
+
+        let scored = self.recall_raw(
+            query, top, min_str, expand_connections.unwrap_or(true), namespaces,
+        );
+
+        // Shadow scoring on raw baseline
+        let belief_eng = self.belief_engine.read();
+        let shadow_report = recall::compute_shadow_belief_scores(&scored, &belief_eng, top);
+
+        self.recall_finalize(&scored, query, session_id);
+        Ok((scored, shadow_report))
+    }
+
+    /// Recall with limited reranking and a diagnostic report.
+    ///
+    /// Applies a single pass of limited belief reranking on the raw baseline
+    /// (regardless of mode setting) and returns a `LimitedRerankReport`.
+    /// The raw baseline is used to avoid double-reranking when mode is Limited.
+    pub fn recall_structured_with_rerank_report(
+        &self,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+        namespaces: Option<&[&str]>,
+    ) -> Result<(Vec<(f32, Record)>, recall::LimitedRerankReport)> {
+        let top = top_k.unwrap_or(20);
+        let min_str = min_strength.unwrap_or(0.1);
+
+        let mut scored = self.recall_raw(
+            query, top, min_str, expand_connections.unwrap_or(true), namespaces,
+        );
+
+        let belief_eng = self.belief_engine.read();
+        let report = recall::apply_belief_rerank(&mut scored, &belief_eng, top);
+
+        self.recall_finalize(&scored, query, session_id);
+        Ok((scored, report))
     }
 
     /// Search with filters.
@@ -1614,9 +1783,14 @@ impl Aura {
         self.maintenance_config.read().clone()
     }
 
-    /// Run a single maintenance cycle (all 8 phases).
+    /// Run a single maintenance cycle across all maintenance phases.
     #[instrument(skip(self))]
     pub fn run_maintenance(&self) -> MaintenanceReport {
+        use std::time::Instant;
+
+        let cycle_start = Instant::now();
+        let mut timings = background_brain::PhaseTimings::default();
+
         let config = self.maintenance_config.read().clone();
         let taxonomy = self.taxonomy.read().clone();
 
@@ -1630,11 +1804,14 @@ impl Aura {
         };
 
         // Phase 0: Level fix (every Nth cycle)
+        let t0 = Instant::now();
         if cycle % config.level_fix_interval == 0 {
             background_brain::fix_memory_levels(&mut records, &taxonomy);
         }
+        timings.level_fix_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         // Phase 1: Decay
+        let t1 = Instant::now();
         let decay = if config.decay_enabled {
             let mut decayed = 0;
             let mut to_archive = Vec::new();
@@ -1672,25 +1849,219 @@ impl Aura {
         } else {
             background_brain::DecayReport::default()
         };
+        timings.decay_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         // Phase 2: Guarded reflect
+        let t2 = Instant::now();
         let reflect = if config.reflect_enabled {
             background_brain::guarded_reflect(&mut records, &taxonomy)
         } else {
             background_brain::ReflectReport::default()
         };
+        timings.reflect_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+        // Phase 2.5: Epistemic update
+        let t25 = Instant::now();
+        let epistemic = background_brain::update_epistemic_state(&mut records);
+        timings.epistemic_ms = t25.elapsed().as_secs_f64() * 1000.0;
 
         // Phase 3: Insights
+        let t3 = Instant::now();
         let insights_found = if config.insights_enabled {
             let found = insights::detect_all(&records);
             found.len()
         } else {
             0
         };
+        timings.insights_ms = t3.elapsed().as_secs_f64() * 1000.0;
+
+        // Phase 3.5: Belief update (read-only — builds beliefs, does not affect recall)
+        // Take a read-only snapshot of record refs to avoid holding write lock during
+        // belief computation and disk persistence.
+        let belief_snapshot: HashMap<String, Record> = records.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        // Release records lock before belief work (Phase 4 will re-acquire)
+        drop(records);
+
+        // Build SDR lookup for content-aware claim grouping.
+        // IMPORTANT: always use is_identity=false (general bit range) so
+        // records at different levels (Domain vs Decisions) can still be
+        // compared. The stored SDR uses level-dependent bit ranges which
+        // would give Tanimoto ≈ 0 across range boundaries.
+        // Shared by belief phase (3.5) and concept phase (3.7).
+        let t_sdr = Instant::now();
+        let sdr_lookup: SdrLookup = belief_snapshot.iter()
+            .map(|(rid, rec)| {
+                let sdr_vec = self.sdr.text_to_sdr(&rec.content, false);
+                (rid.clone(), sdr_vec)
+            })
+            .collect();
+        timings.sdr_build_ms = t_sdr.elapsed().as_secs_f64() * 1000.0;
+
+        let t35 = Instant::now();
+        let belief_phase_report = {
+            let mut engine = self.belief_engine.write();
+            let br = engine.update_with_sdr(&belief_snapshot, &sdr_lookup);
+            // Persist belief state (best-effort)
+            let _ = self.belief_store.save(&engine);
+            background_brain::BeliefPhaseReport {
+                beliefs_created: br.beliefs_created,
+                beliefs_pruned: br.beliefs_pruned,
+                revisions: br.revisions,
+                resolved: br.resolved,
+                unresolved: br.unresolved,
+                total_beliefs: br.total_beliefs,
+                total_hypotheses: br.total_hypotheses,
+                churn_rate: br.churn_rate,
+            }
+        };
+        timings.belief_ms = t35.elapsed().as_secs_f64() * 1000.0;
+
+        // Phase 3.7: Concept discovery (read-only — finds stable abstractions over beliefs)
+        let t37 = Instant::now();
+        let concept_phase_report = {
+            let engine = self.belief_engine.read();
+            let mut concept_eng = self.concept_engine.write();
+            let cr = concept_eng.discover(&engine, &belief_snapshot, &sdr_lookup);
+            // Persist concept state (best-effort)
+            let _ = self.concept_store.save(&concept_eng);
+            background_brain::ConceptPhaseReport {
+                seeds_found: cr.seeds_found,
+                candidates_found: cr.candidates_found,
+                stable_count: cr.stable_count,
+                rejected_count: cr.rejected_count,
+                avg_abstraction_score: cr.avg_abstraction_score,
+                centroids_built: cr.centroids_built,
+                partitions_with_multiple_seeds: cr.partitions_with_multiple_seeds,
+                pairwise_comparisons: cr.pairwise_comparisons,
+                pairwise_above_threshold: cr.pairwise_above_threshold,
+                tanimoto_min: cr.tanimoto_min,
+                tanimoto_max: cr.tanimoto_max,
+                tanimoto_avg: cr.tanimoto_avg,
+                avg_centroid_size: cr.avg_centroid_size,
+            }
+        };
+        timings.concept_ms = t37.elapsed().as_secs_f64() * 1000.0;
+
+        // Phase 3.8: Causal pattern discovery (read-only — finds candidate causal relations)
+        let t38 = Instant::now();
+        let causal_phase_report = {
+            let engine = self.belief_engine.read();
+            let mut causal_eng = self.causal_engine.write();
+            let cr = causal_eng.discover(&engine, &belief_snapshot, &sdr_lookup);
+            // Persist causal state (best-effort)
+            let _ = self.causal_store.save(&causal_eng);
+            background_brain::CausalPhaseReport {
+                edges_found: cr.edges_found,
+                candidates_found: cr.candidates_found,
+                stable_count: cr.stable_count,
+                rejected_count: cr.rejected_count,
+                avg_causal_strength: cr.avg_causal_strength,
+            }
+        };
+        timings.causal_ms = t38.elapsed().as_secs_f64() * 1000.0;
+
+        // Phase 3.9: Policy hint discovery (read-only — advisory hints from causal patterns)
+        let t39 = Instant::now();
+        let policy_phase_report = {
+            let causal_eng = self.causal_engine.read();
+            let concept_eng = self.concept_engine.read();
+            let belief_eng = self.belief_engine.read();
+            let mut policy_eng = self.policy_engine.write();
+            let pr = policy_eng.discover(&causal_eng, &concept_eng, &belief_eng, &belief_snapshot);
+            // Persist policy state (best-effort)
+            let _ = self.policy_store.save(&policy_eng);
+            background_brain::PolicyPhaseReport {
+                seeds_found: pr.seeds_found,
+                hints_found: pr.hints_found,
+                stable_hints: pr.stable_hints,
+                suppressed_hints: pr.suppressed_hints,
+                rejected_hints: pr.rejected_hints,
+                avg_policy_strength: pr.avg_policy_strength,
+            }
+        };
+        timings.policy_ms = t39.elapsed().as_secs_f64() * 1000.0;
+
+        // ── Compute cross-cycle identity stability ──
+        let stability = {
+            let belief_eng = self.belief_engine.read();
+            let concept_eng = self.concept_engine.read();
+            let causal_eng = self.causal_engine.read();
+            let policy_eng = self.policy_engine.read();
+
+            // Current semantic keys (stable identities, not random IDs).
+            // Each engine has a key_index: semantic_key → entity_id.
+            // Using semantic keys ensures churn measures real identity change,
+            // not just ID regeneration on full rebuild.
+            let cur_belief: HashSet<String> = belief_eng.key_index.keys().cloned().collect();
+            let cur_concept: HashSet<String> = concept_eng.key_index.keys().cloned().collect();
+            let cur_causal: HashSet<String> = causal_eng.key_index.keys().cloned().collect();
+            let cur_policy: HashSet<String> = policy_eng.key_index.keys().cloned().collect();
+
+            // Previous keys
+            let prev_b = self.prev_belief_keys.read();
+            let prev_c = self.prev_concept_keys.read();
+            let prev_ca = self.prev_causal_keys.read();
+            let prev_p = self.prev_policy_keys.read();
+
+            let b_retained = cur_belief.intersection(&prev_b).count();
+            let b_new = cur_belief.len() - b_retained;
+            let b_dropped = prev_b.len() - b_retained;
+            let b_total = cur_belief.len().max(1);
+
+            let c_retained = cur_concept.intersection(&prev_c).count();
+            let c_new = cur_concept.len() - c_retained;
+            let c_dropped = prev_c.len() - c_retained;
+            let c_total = cur_concept.len().max(1);
+
+            let ca_retained = cur_causal.intersection(&prev_ca).count();
+            let ca_new = cur_causal.len() - ca_retained;
+            let ca_dropped = prev_ca.len() - ca_retained;
+            let ca_total = cur_causal.len().max(1);
+
+            let p_retained = cur_policy.intersection(&prev_p).count();
+            let p_new = cur_policy.len() - p_retained;
+            let p_dropped = prev_p.len() - p_retained;
+            let p_total = cur_policy.len().max(1);
+
+            drop(prev_b);
+            drop(prev_c);
+            drop(prev_ca);
+            drop(prev_p);
+
+            // Update previous keys for next cycle
+            *self.prev_belief_keys.write() = cur_belief;
+            *self.prev_concept_keys.write() = cur_concept;
+            *self.prev_causal_keys.write() = cur_causal;
+            *self.prev_policy_keys.write() = cur_policy;
+
+            background_brain::LayerStability {
+                belief_retained: b_retained,
+                belief_new: b_new,
+                belief_dropped: b_dropped,
+                belief_churn: (b_new + b_dropped) as f32 / b_total as f32,
+
+                concept_retained: c_retained,
+                concept_new: c_new,
+                concept_dropped: c_dropped,
+                concept_churn: (c_new + c_dropped) as f32 / c_total as f32,
+
+                causal_retained: ca_retained,
+                causal_new: ca_new,
+                causal_dropped: ca_dropped,
+                causal_churn: (ca_new + ca_dropped) as f32 / ca_total as f32,
+
+                policy_retained: p_retained,
+                policy_new: p_new,
+                policy_dropped: p_dropped,
+                policy_churn: (p_new + p_dropped) as f32 / p_total as f32,
+            }
+        };
 
         // Phase 4: Consolidation (fast pass only — no LLM)
+        let t4 = Instant::now();
         let consolidation_report = if config.consolidation_enabled {
-            drop(records);
             let mut records = self.records.write();
             let mut ngram = self.ngram_index.write();
             let mut tag_idx = self.tag_index.write();
@@ -1710,15 +2081,15 @@ impl Aura {
                 meta_created: 0,
             }
         } else {
-            // Need to drop records lock if not used
-            drop(records);
             background_brain::ConsolidationReport::default()
         };
+        timings.consolidation_ms = t4.elapsed().as_secs_f64() * 1000.0;
 
         // Re-acquire records for remaining phases
         let mut records = self.records.write();
 
         // Phase 5: Cross-connections
+        let t5 = Instant::now();
         let cross_connections = if config.synthesis_enabled {
             let discoveries = background_brain::discover_cross_connections(&records, 3);
             let count = discoveries.len();
@@ -1729,19 +2100,21 @@ impl Aura {
         } else {
             0
         };
+        timings.cross_connections_ms = t5.elapsed().as_secs_f64() * 1000.0;
 
-        // Phase 6: Scheduled tasks
+        // Phase 6: Scheduled tasks + Phase 7: Archival
+        let t67 = Instant::now();
         let task_reminders = background_brain::check_scheduled_tasks(
             &records,
             &config.task_tag,
         );
 
-        // Phase 7: Archival
         let records_archived = if config.archival_enabled {
             background_brain::archive_old_records(&mut records, &config, &taxonomy)
         } else {
             0
         };
+        timings.tasks_archival_ms = t67.elapsed().as_secs_f64() * 1000.0;
 
         // Persist changes
         drop(records);
@@ -1751,16 +2124,25 @@ impl Aura {
         self.recall_cache.clear();
         self.structured_recall_cache.clear();
 
+        timings.total_ms = cycle_start.elapsed().as_secs_f64() * 1000.0;
+
         MaintenanceReport {
             timestamp: chrono::Utc::now().to_rfc3339(),
             decay,
             reflect,
+            epistemic,
             insights_found,
+            belief: belief_phase_report,
+            concept: concept_phase_report,
+            causal: causal_phase_report,
+            policy: policy_phase_report,
             consolidation: consolidation_report,
             cross_connections,
             task_reminders,
             records_archived,
             total_records,
+            timings,
+            stability,
         }
     }
 
@@ -1790,6 +2172,198 @@ impl Aura {
     pub fn is_background_running(&self) -> bool {
         let bg = self.background.read();
         bg.as_ref().is_some_and(|b| b.is_running())
+    }
+
+    // ── Inspection Helpers (observability) ──
+
+    /// Return a snapshot of all current beliefs (cloned).
+    /// Optional filter by state: "resolved", "unresolved", "singleton", "empty".
+    pub fn get_beliefs(&self, state_filter: Option<&str>) -> Vec<crate::belief::Belief> {
+        let engine = self.belief_engine.read();
+        engine.beliefs.values()
+            .filter(|b| {
+                match state_filter {
+                    Some("resolved") => b.state == crate::belief::BeliefState::Resolved,
+                    Some("unresolved") => b.state == crate::belief::BeliefState::Unresolved,
+                    Some("singleton") => b.state == crate::belief::BeliefState::Singleton,
+                    Some("empty") => b.state == crate::belief::BeliefState::Empty,
+                    _ => true,
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Return a snapshot of all current concepts (cloned).
+    /// Optional filter by state: "stable", "candidate", "rejected".
+    pub fn get_concepts(&self, state_filter: Option<&str>) -> Vec<crate::concept::ConceptCandidate> {
+        let engine = self.concept_engine.read();
+        engine.concepts.values()
+            .filter(|c| {
+                match state_filter {
+                    Some("stable") => c.state == crate::concept::ConceptState::Stable,
+                    Some("candidate") => c.state == crate::concept::ConceptState::Candidate,
+                    Some("rejected") => c.state == crate::concept::ConceptState::Rejected,
+                    _ => true,
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Return surfaced concepts for external inspection.
+    /// Returns bounded, sorted, provenance-checked concepts suitable for public consumption.
+    /// This is inspection-only — surfaced concepts do not affect recall, compression, or behavior.
+    pub fn get_surfaced_concepts(&self, limit: Option<usize>) -> Vec<crate::concept::SurfacedConcept> {
+        let engine = self.concept_engine.read();
+        crate::concept::surface_concepts(&engine, limit)
+    }
+
+    /// Return surfaced concepts for a specific namespace.
+    pub fn get_surfaced_concepts_for_namespace(
+        &self,
+        namespace: &str,
+        limit: Option<usize>,
+    ) -> Vec<crate::concept::SurfacedConcept> {
+        let engine = self.concept_engine.read();
+        crate::concept::surface_concepts_filtered(&engine, limit, Some(namespace))
+    }
+
+    /// Return a snapshot of all current causal patterns (cloned).
+    /// Optional filter by state: "stable", "candidate", "rejected".
+    pub fn get_causal_patterns(&self, state_filter: Option<&str>) -> Vec<crate::causal::CausalPattern> {
+        let engine = self.causal_engine.read();
+        engine.patterns.values()
+            .filter(|p| {
+                match state_filter {
+                    Some("stable") => p.state == crate::causal::CausalState::Stable,
+                    Some("candidate") => p.state == crate::causal::CausalState::Candidate,
+                    Some("rejected") => p.state == crate::causal::CausalState::Rejected,
+                    _ => true,
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Return a snapshot of all current policy hints (cloned).
+    /// Optional filter by state: "stable", "candidate", "suppressed", "rejected".
+    pub fn get_policy_hints(&self, state_filter: Option<&str>) -> Vec<crate::policy::PolicyHint> {
+        let engine = self.policy_engine.read();
+        engine.hints.values()
+            .filter(|h| {
+                match state_filter {
+                    Some("stable") => h.state == crate::policy::PolicyState::Stable,
+                    Some("candidate") => h.state == crate::policy::PolicyState::Candidate,
+                    Some("suppressed") => h.state == crate::policy::PolicyState::Suppressed,
+                    Some("rejected") => h.state == crate::policy::PolicyState::Rejected,
+                    _ => true,
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    // ── Surfaced Policy Output ──
+
+    /// Return filtered, sorted, bounded advisory policy hints suitable for
+    /// external consumption. Inspection-only — does not affect recall or behavior.
+    ///
+    /// Only surfaces Stable hints and strong Candidates (policy_strength >= 0.70,
+    /// confidence >= 0.55) with complete provenance. Bounded to 10 global,
+    /// 3 per domain.
+    pub fn get_surfaced_policy_hints(&self, limit: Option<usize>) -> Vec<crate::policy::SurfacedPolicyHint> {
+        let engine = self.policy_engine.read();
+        crate::policy::surface_policy_hints(&engine, limit)
+    }
+
+    /// Return surfaced hints for a specific namespace.
+    pub fn get_surfaced_policy_hints_for_namespace(
+        &self,
+        namespace: &str,
+        limit: Option<usize>,
+    ) -> Vec<crate::policy::SurfacedPolicyHint> {
+        let engine = self.policy_engine.read();
+        crate::policy::surface_policy_hints_filtered(&engine, limit, Some(namespace))
+    }
+
+    // ── Belief Reranking Config (Phase 4) ──
+
+    /// Set belief reranking mode.
+    ///
+    /// - `Off`: no belief influence on ranking (default)
+    /// - `Shadow`: compute shadow scores for logging, do not alter ranking
+    /// - `Limited`: apply bounded reranking (±5% score cap, ±2 position cap)
+    pub fn set_belief_rerank_mode(&self, mode: recall::BeliefRerankMode) {
+        self.belief_rerank_mode.store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Get current belief reranking mode.
+    pub fn get_belief_rerank_mode(&self) -> recall::BeliefRerankMode {
+        recall::BeliefRerankMode::from_u8(
+            self.belief_rerank_mode.load(std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    /// Convenience: enable limited belief reranking.
+    pub fn set_belief_rerank_enabled(&self, enabled: bool) {
+        let mode = if enabled {
+            recall::BeliefRerankMode::Limited
+        } else {
+            recall::BeliefRerankMode::Off
+        };
+        self.set_belief_rerank_mode(mode);
+    }
+
+    /// Convenience: check if belief reranking is actively influencing ranking.
+    pub fn is_belief_rerank_enabled(&self) -> bool {
+        self.get_belief_rerank_mode() == recall::BeliefRerankMode::Limited
+    }
+
+    /// Set the coarse key mode for belief grouping.
+    /// Takes effect on the next `run_maintenance()` call.
+    pub fn set_belief_coarse_key_mode(&self, mode: CoarseKeyMode) {
+        let mut engine = self.belief_engine.write();
+        engine.coarse_key_mode = mode;
+    }
+
+    /// Get current coarse key mode.
+    pub fn get_belief_coarse_key_mode(&self) -> CoarseKeyMode {
+        let engine = self.belief_engine.read();
+        engine.coarse_key_mode
+    }
+
+    /// Override the SDR subclustering similarity threshold.
+    /// Pass `None` to restore default (0.15).
+    pub fn set_belief_similarity_threshold(&self, threshold: Option<f32>) {
+        let mut engine = self.belief_engine.write();
+        engine.claim_similarity_override = threshold;
+    }
+
+    /// Set the concept seed selection mode (Standard or Relaxed).
+    /// Takes effect on the next `run_maintenance()` call.
+    pub fn set_concept_seed_mode(&self, mode: ConceptSeedMode) {
+        let mut engine = self.concept_engine.write();
+        engine.seed_mode = mode;
+    }
+
+    /// Get current concept seed mode.
+    pub fn get_concept_seed_mode(&self) -> ConceptSeedMode {
+        let engine = self.concept_engine.read();
+        engine.seed_mode
+    }
+
+    /// Set the concept similarity mode (SdrTanimoto or CanonicalFeature).
+    /// Takes effect on the next `run_maintenance()` call.
+    pub fn set_concept_similarity_mode(&self, mode: ConceptSimilarityMode) {
+        let mut engine = self.concept_engine.write();
+        engine.similarity_mode = mode;
+    }
+
+    /// Get current concept similarity mode.
+    pub fn get_concept_similarity_mode(&self) -> ConceptSimilarityMode {
+        let engine = self.concept_engine.read();
+        engine.similarity_mode
     }
 
     // ── SDK Wrapper: Research Orchestrator ──
@@ -3287,6 +3861,34 @@ impl Aura {
         py.allow_threads(|| self.run_maintenance())
     }
 
+    #[pyo3(name = "get_surfaced_concepts", signature = (limit=None))]
+    fn py_get_surfaced_concepts(&self, limit: Option<usize>) -> Vec<crate::concept::SurfacedConcept> {
+        self.get_surfaced_concepts(limit)
+    }
+
+    #[pyo3(name = "get_surfaced_concepts_for_namespace", signature = (namespace, limit=None))]
+    fn py_get_surfaced_concepts_for_namespace(
+        &self,
+        namespace: &str,
+        limit: Option<usize>,
+    ) -> Vec<crate::concept::SurfacedConcept> {
+        self.get_surfaced_concepts_for_namespace(namespace, limit)
+    }
+
+    #[pyo3(name = "get_surfaced_policy_hints", signature = (limit=None))]
+    fn py_get_surfaced_policy_hints(&self, limit: Option<usize>) -> Vec<crate::policy::SurfacedPolicyHint> {
+        self.get_surfaced_policy_hints(limit)
+    }
+
+    #[pyo3(name = "get_surfaced_policy_hints_for_namespace", signature = (namespace, limit=None))]
+    fn py_get_surfaced_policy_hints_for_namespace(
+        &self,
+        namespace: &str,
+        limit: Option<usize>,
+    ) -> Vec<crate::policy::SurfacedPolicyHint> {
+        self.get_surfaced_policy_hints_for_namespace(namespace, limit)
+    }
+
     #[pyo3(name = "start_background", signature = (interval_secs=None))]
     fn py_start_background(&self, interval_secs: Option<u64>) {
         self.start_background(interval_secs);
@@ -3848,6 +4450,62 @@ mod tests {
         assert!(report.total_records > 0);
         assert!(!report.timestamp.is_empty());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_maintenance_updates_epistemic_signals() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let id1 = aura.store(
+            "Deploy to staging before production deploys",
+            Some(Level::Domain),
+            Some(vec!["deploy".into(), "safety".into()]),
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("decision"),
+        )?.id;
+        let _id2 = aura.store(
+            "Always use staging for safe production deploys",
+            Some(Level::Domain),
+            Some(vec!["deploy".into(), "safety".into()]),
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("decision"),
+        )?.id;
+        let _id3 = aura.store(
+            "Skip staging when shipping directly to production",
+            Some(Level::Working),
+            Some(vec!["deploy".into(), "safety".into()]),
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("contradiction"),
+        )?.id;
+
+        let report = aura.run_maintenance();
+        let rec = aura.get(&id1).unwrap();
+
+        assert!(report.epistemic.updated_records > 0);
+        assert!(report.epistemic.total_support_links > 0);
+        assert!(report.epistemic.total_conflict_links > 0);
+        assert!(rec.support_mass > 0);
+        assert!(rec.conflict_mass > 0);
         Ok(())
     }
 
