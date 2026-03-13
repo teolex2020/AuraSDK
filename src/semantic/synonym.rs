@@ -49,7 +49,6 @@ impl SynonymExpander {
             &["bike", "bicycle", "cycle"],
             &["plane", "airplane", "aircraft", "jet"],
             &["boat", "ship", "vessel"],
-
             // People
             &["person", "human", "individual", "people"],
             &["child", "kid", "youngster"],
@@ -57,7 +56,6 @@ impl SynonymExpander {
             &["woman", "female", "lady"],
             &["doctor", "physician", "medic"],
             &["teacher", "instructor", "educator"],
-
             // Actions
             &["run", "sprint", "dash", "jog"],
             &["walk", "stroll", "amble"],
@@ -75,7 +73,6 @@ impl SynonymExpander {
             &["help", "assist", "aid", "support"],
             &["buy", "purchase", "acquire"],
             &["sell", "vend", "trade"],
-
             // Emotions
             &["happy", "joyful", "glad", "pleased", "delighted"],
             &["sad", "unhappy", "sorrowful", "melancholy"],
@@ -83,7 +80,6 @@ impl SynonymExpander {
             &["scared", "afraid", "frightened", "terrified"],
             &["love", "adore", "cherish"],
             &["hate", "despise", "loathe", "detest"],
-
             // Sizes
             &["big", "large", "huge", "enormous", "massive"],
             &["small", "little", "tiny", "miniature"],
@@ -91,7 +87,6 @@ impl SynonymExpander {
             &["short", "low", "brief"],
             &["wide", "broad", "expansive"],
             &["narrow", "thin", "slim"],
-
             // Qualities
             &["good", "great", "excellent", "fine", "superb"],
             &["bad", "poor", "terrible", "awful"],
@@ -113,7 +108,6 @@ impl SynonymExpander {
             &["weak", "feeble", "frail"],
             &["clean", "pure", "spotless"],
             &["dirty", "filthy", "grimy"],
-
             // Places
             &["house", "home", "residence", "dwelling"],
             &["store", "shop", "market"],
@@ -123,14 +117,12 @@ impl SynonymExpander {
             &["road", "street", "path", "way"],
             &["city", "town", "metropolis"],
             &["country", "nation", "land"],
-
             // Time
             &["now", "currently", "presently"],
             &["soon", "shortly", "promptly"],
             &["later", "afterward", "subsequently"],
             &["always", "forever", "eternally"],
             &["never", "not ever"],
-
             // Tech/Computing
             &["computer", "pc", "machine"],
             &["program", "software", "application", "app"],
@@ -145,7 +137,6 @@ impl SynonymExpander {
             &["client", "frontend", "user"],
             &["network", "net", "connection"],
             &["internet", "web", "online"],
-
             // Business
             &["money", "cash", "funds", "currency"],
             &["job", "work", "employment", "occupation"],
@@ -172,10 +163,7 @@ impl SynonymExpander {
                 .map(|w| w.to_lowercase())
                 .collect();
 
-            self.synonyms
-                .entry(key)
-                .or_default()
-                .extend(synonyms);
+            self.synonyms.entry(key).or_default().extend(synonyms);
         }
     }
 
@@ -184,16 +172,10 @@ impl SynonymExpander {
         let a = word_a.to_lowercase();
         let b = word_b.to_lowercase();
 
-        self.synonyms
-            .entry(a.clone())
-            .or_default()
-            .push(b.clone());
+        self.synonyms.entry(a.clone()).or_default().push(b.clone());
 
         if self.bidirectional {
-            self.synonyms
-                .entry(b)
-                .or_default()
-                .push(a);
+            self.synonyms.entry(b).or_default().push(a);
         }
     }
 

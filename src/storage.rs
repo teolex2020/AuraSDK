@@ -1,16 +1,16 @@
+use anyhow::{anyhow, Result};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write, BufWriter, BufReader};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use parking_lot::{RwLock, Mutex};
-use std::collections::HashMap;
-use anyhow::{Result, anyhow};
 use tracing::instrument;
 // use serde::{Serialize, Deserialize}; // Not needed if only using bincode functions
 
-use crate::types::{AuraSynapse, Pulse, Flux};
-use crate::crypto::{EncryptionKey, encrypt_data, decrypt_data};
+use crate::crypto::{decrypt_data, encrypt_data, EncryptionKey};
+use crate::types::{AuraSynapse, Flux, Pulse};
 
 const MAGIC_BYTES: &[u8; 4] = b"AURA";
 const FORMAT_VERSION: u32 = 3;
@@ -74,7 +74,11 @@ impl StoredRecord {
 
     /// Write record with optional encryption.
     /// If encryption_key is provided, text will be encrypted.
-    pub fn write_to_encrypted<W: Write>(&self, writer: &mut W, encryption_key: Option<&EncryptionKey>) -> Result<()> {
+    pub fn write_to_encrypted<W: Write>(
+        &self,
+        writer: &mut W,
+        encryption_key: Option<&EncryptionKey>,
+    ) -> Result<()> {
         // 1. Prepare fixed-size strings
         let mut id_bytes = [0u8; 32];
         let id_raw = self.id.as_bytes();
@@ -125,17 +129,25 @@ impl StoredRecord {
     }
 
     /// Read record with optional decryption.
-    pub fn read_from_encrypted<R: Read>(reader: &mut R, offset: u64, encryption_key: Option<&EncryptionKey>) -> Result<Self> {
+    pub fn read_from_encrypted<R: Read>(
+        reader: &mut R,
+        offset: u64,
+        encryption_key: Option<&EncryptionKey>,
+    ) -> Result<Self> {
         // 1. Read Header
         let mut id_bytes = [0u8; 32];
         if let Err(e) = reader.read_exact(&mut id_bytes) {
             return Err(anyhow!("Failed to read ID at offset {}: {}", offset, e));
         }
-        let id = String::from_utf8_lossy(&id_bytes).trim_matches('\0').to_string();
+        let id = String::from_utf8_lossy(&id_bytes)
+            .trim_matches('\0')
+            .to_string();
 
         let mut dna_bytes = [0u8; 16];
         reader.read_exact(&mut dna_bytes)?;
-        let dna = String::from_utf8_lossy(&dna_bytes).trim_matches('\0').to_string();
+        let dna = String::from_utf8_lossy(&dna_bytes)
+            .trim_matches('\0')
+            .to_string();
 
         let timestamp = reader.read_f64::<LittleEndian>()?;
         let intensity = reader.read_f32::<LittleEndian>()?;
@@ -153,14 +165,26 @@ impl StoredRecord {
         for i in 0..sdr_count {
             match reader.read_u16::<LittleEndian>() {
                 Ok(idx) => sdr_indices.push(idx),
-                Err(e) => return Err(anyhow!("Failed to read SDR bit {} at offset {}: {}", i, offset, e)),
+                Err(e) => {
+                    return Err(anyhow!(
+                        "Failed to read SDR bit {} at offset {}: {}",
+                        i,
+                        offset,
+                        e
+                    ))
+                }
             }
         }
 
         // 3. Read Text (possibly encrypted)
         let mut text_bytes = vec![0u8; text_len as usize];
         if let Err(e) = reader.read_exact(&mut text_bytes) {
-             return Err(anyhow!("Failed to read text of len {} at offset {}: {}", text_len, offset, e));
+            return Err(anyhow!(
+                "Failed to read text of len {} at offset {}: {}",
+                text_len,
+                offset,
+                e
+            ));
         }
 
         // 4. Decrypt if needed
@@ -216,7 +240,7 @@ impl StoredHeader {
     pub fn intensity(&self) -> f32 {
         f32::from_bits(self.intensity.load(Ordering::Relaxed))
     }
-    
+
     pub fn set_intensity(&self, val: f32) {
         self.intensity.store(val.to_bits(), Ordering::Relaxed);
     }
@@ -228,7 +252,7 @@ impl StoredHeader {
     pub fn set_stability(&self, val: f32) {
         self.stability.store(val.to_bits(), Ordering::Relaxed);
     }
-    
+
     pub fn timestamp(&self) -> f64 {
         f64::from_bits(self.timestamp.load(Ordering::Relaxed))
     }
@@ -300,7 +324,10 @@ impl AuraStorage {
     }
 
     /// Create storage with optional encryption key.
-    pub fn with_encryption<P: AsRef<Path>>(path: P, encryption_key: Option<EncryptionKey>) -> Result<Self> {
+    pub fn with_encryption<P: AsRef<Path>>(
+        path: P,
+        encryption_key: Option<EncryptionKey>,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&path)?;
         let file_path = path.join("brain.aura");
@@ -346,7 +373,10 @@ impl AuraStorage {
             if let Err(e) = storage.load_temporal_chain() {
                 // If this fails (e.g. first run after upgrade, or corruption),
                 // we log it but don't crash. The chains just start empty.
-                tracing::warn!("Failed to load temporal chains: {}. System assumes clean start.", e);
+                tracing::warn!(
+                    "Failed to load temporal chains: {}. System assumes clean start.",
+                    e
+                );
             }
         }
 
@@ -370,13 +400,13 @@ impl AuraStorage {
         writer.write_all(MAGIC_BYTES)?;
         writer.write_u32::<LittleEndian>(FORMAT_VERSION)?;
         writer.write_u64::<LittleEndian>(0)?; // Initial count
-        
+
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
         writer.write_f64::<LittleEndian>(now)?;
-        
+
         writer.write_all(&[0u8; 40])?; // Padding
         writer.flush()?;
-        
+
         Ok(())
     }
 
@@ -424,12 +454,16 @@ impl AuraStorage {
             if file.read_exact(&mut id_bytes).is_err() {
                 break; // EOF
             }
-            let id = String::from_utf8_lossy(&id_bytes).trim_matches('\0').to_string();
+            let id = String::from_utf8_lossy(&id_bytes)
+                .trim_matches('\0')
+                .to_string();
 
             // 2. Read DNA
             let mut dna_bytes = [0u8; 16];
             file.read_exact(&mut dna_bytes)?;
-            let dna = String::from_utf8_lossy(&dna_bytes).trim_matches('\0').to_string();
+            let dna = String::from_utf8_lossy(&dna_bytes)
+                .trim_matches('\0')
+                .to_string();
 
             if dna == "user_core" {
                 anchors.insert(id.clone());
@@ -457,7 +491,7 @@ impl AuraStorage {
             // 5. Read Text (possibly encrypted)
             let mut text_bytes = vec![0u8; text_len as usize];
             if file.read_exact(&mut text_bytes).is_err() {
-                 break;
+                break;
             }
 
             // 6. Decrypt if needed
@@ -475,18 +509,21 @@ impl AuraStorage {
             };
 
             // 7. Populate Cache
-            header_cache.insert(id.clone(), Arc::new(StoredHeader {
-                id: id.clone(),
-                dna: dna.clone(),
-                timestamp: AtomicU64::new(timestamp.to_bits()),
-                intensity: AtomicU32::new(intensity.to_bits()),
-                stability: AtomicU32::new(stability.to_bits()),
-                decay_velocity: AtomicU32::new(decay_velocity.to_bits()),
-                entropy: AtomicU32::new(entropy.to_bits()),
-                sdr_indices,
-                text,
-                next_id: RwLock::new(None),
-            }));
+            header_cache.insert(
+                id.clone(),
+                Arc::new(StoredHeader {
+                    id: id.clone(),
+                    dna: dna.clone(),
+                    timestamp: AtomicU64::new(timestamp.to_bits()),
+                    intensity: AtomicU32::new(intensity.to_bits()),
+                    stability: AtomicU32::new(stability.to_bits()),
+                    decay_velocity: AtomicU32::new(decay_velocity.to_bits()),
+                    entropy: AtomicU32::new(entropy.to_bits()),
+                    sdr_indices,
+                    text,
+                    next_id: RwLock::new(None),
+                }),
+            );
 
             // Store offset
             offsets.insert(id, offset);
@@ -500,7 +537,9 @@ impl AuraStorage {
     #[instrument(skip(self, record))]
     pub fn append(&self, record: &StoredRecord) -> Result<u64> {
         let mut writer = self.writer.lock();
-        let writer = writer.as_mut().ok_or_else(|| anyhow!("Storage is closed"))?;
+        let writer = writer
+            .as_mut()
+            .ok_or_else(|| anyhow!("Storage is closed"))?;
 
         // Seek to end to append
         let offset = writer.seek(SeekFrom::End(0))?;
@@ -515,7 +554,9 @@ impl AuraStorage {
 
         // Update in-memory index
         self.offsets.write().insert(record.id.clone(), offset);
-        self.header_cache.write().insert(record.id.clone(), StoredHeader::from_record(record));
+        self.header_cache
+            .write()
+            .insert(record.id.clone(), StoredHeader::from_record(record));
         if record.dna == "user_core" {
             self.anchor_ids.write().insert(record.id.clone());
         }
@@ -525,7 +566,12 @@ impl AuraStorage {
         *self.dirty_header.lock() = true;
         *self.needs_flush.lock() = true;
 
-        tracing::debug!("Appended record {} at offset {} (encrypted: {})", record.id, offset, self.is_encrypted());
+        tracing::debug!(
+            "Appended record {} at offset {} (encrypted: {})",
+            record.id,
+            offset,
+            self.is_encrypted()
+        );
 
         Ok(offset)
     }
@@ -541,7 +587,9 @@ impl AuraStorage {
 
         // Single lock acquisition for writer
         let mut writer = self.writer.lock();
-        let writer = writer.as_mut().ok_or_else(|| anyhow!("Storage is closed"))?;
+        let writer = writer
+            .as_mut()
+            .ok_or_else(|| anyhow!("Storage is closed"))?;
 
         // Single lock acquisition for offsets and anchors
         let mut offsets = self.offsets.write();
@@ -581,7 +629,11 @@ impl AuraStorage {
         writer.get_ref().sync_all()?;
         *self.needs_flush.lock() = false;
 
-        tracing::debug!("Appended {} records in batch (encrypted: {})", written, self.is_encrypted());
+        tracing::debug!(
+            "Appended {} records in batch (encrypted: {})",
+            written,
+            self.is_encrypted()
+        );
 
         Ok(written)
     }
@@ -632,7 +684,9 @@ impl AuraStorage {
             let mut needs = self.needs_flush.lock();
             if *needs {
                 let mut writer = self.writer.lock();
-                let writer = writer.as_mut().ok_or_else(|| anyhow!("Storage is closed"))?;
+                let writer = writer
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("Storage is closed"))?;
                 writer.flush()?;
                 *needs = false;
             }
@@ -645,7 +699,8 @@ impl AuraStorage {
         let mut reader = BufReader::new(&mut *file);
 
         // Read with decryption if encryption key is available
-        let record = StoredRecord::read_from_encrypted(&mut reader, offset, self.encryption_key.as_ref())?;
+        let record =
+            StoredRecord::read_from_encrypted(&mut reader, offset, self.encryption_key.as_ref())?;
         Ok(Some(record))
     }
 
@@ -661,20 +716,24 @@ impl AuraStorage {
 
     /// Count phantom records in the header cache (SDR Exchange imports).
     pub fn phantom_count(&self) -> usize {
-        self.header_cache.read().values().filter(|h| h.dna == "phantom").count()
+        self.header_cache
+            .read()
+            .values()
+            .filter(|h| h.dna == "phantom")
+            .count()
     }
 
     /// Iterate over all active records.
     pub fn iter_all(&self) -> Result<Vec<StoredRecord>> {
         let offsets = self.offsets.read();
         let mut records = Vec::with_capacity(offsets.len());
-        
+
         for (id, _) in offsets.iter() {
             if let Some(record) = self.read(id)? {
                 records.push(record);
             }
         }
-        
+
         Ok(records)
     }
 
@@ -718,9 +777,9 @@ impl AuraStorage {
     pub fn get_all_ids(&self) -> Vec<String> {
         self.offsets.read().keys().cloned().collect()
     }
-    
+
     /// Get anchor IDs for O(k) lookup.
-    /// 
+    ///
     /// Returns list of IDs where DNA is "user_core".
     /// Used for efficient goal resonance calculation via inverted index.
     pub fn get_anchor_ids(&self) -> Vec<String> {
@@ -756,7 +815,7 @@ impl AuraStorage {
     /// Save the RAM-only temporal chains (next_id links) to `temporal.bin`
     pub fn save_temporal_chain(&self) -> Result<()> {
         let headers = self.header_cache.read();
-        
+
         // Collect only active links to save space
         let mut links: HashMap<String, String> = HashMap::with_capacity(headers.len() / 2);
         for (id, header) in headers.iter() {
@@ -764,20 +823,24 @@ impl AuraStorage {
                 links.insert(id.clone(), next.clone());
             }
         }
-        
+
         // Serialize to temporary file then rename (atomic)
         let temp_path = self.temporal_path.with_extension("tmp");
         let file = File::create(&temp_path)?;
         let mut writer = BufWriter::new(file);
-        
+
         // Header: Magic "TPL1" + Version (u8)
         writer.write_all(b"TPL1")?;
         writer.write_u8(1)?;
 
         bincode::serialize_into(writer, &links)?;
         std::fs::rename(temp_path, &self.temporal_path)?;
-        
-        tracing::debug!("Saved {} temporal links to {:?}", links.len(), self.temporal_path);
+
+        tracing::debug!(
+            "Saved {} temporal links to {:?}",
+            links.len(),
+            self.temporal_path
+        );
         Ok(())
     }
 
@@ -789,7 +852,7 @@ impl AuraStorage {
 
         let file = File::open(&self.temporal_path)?;
         let mut reader = BufReader::new(file);
-        
+
         // Verify Header
         let mut magic = [0u8; 4];
         if reader.read_exact(&mut magic).is_err() {
@@ -815,7 +878,7 @@ impl AuraStorage {
 
         let links: HashMap<String, String> = bincode::deserialize_from(reader)?;
         let headers = self.header_cache.read();
-        
+
         let mut applied = 0;
         for (from, to) in links {
             if let Some(header) = headers.get(&from) {
@@ -823,8 +886,12 @@ impl AuraStorage {
                 applied += 1;
             }
         }
-        
-        tracing::info!("Loaded {} temporal links from {:?}", applied, self.temporal_path);
+
+        tracing::info!(
+            "Loaded {} temporal links from {:?}",
+            applied,
+            self.temporal_path
+        );
         Ok(())
     }
 
@@ -863,34 +930,46 @@ mod tests {
         // 1. Create Headers in RAM (simulated ingest)
         {
             let mut headers = storage.header_cache.write();
-            headers.insert("A".to_string(), StoredHeader::from_record(&mock_record("A")));
-            headers.insert("B".to_string(), StoredHeader::from_record(&mock_record("B")));
-            
+            headers.insert(
+                "A".to_string(),
+                StoredHeader::from_record(&mock_record("A")),
+            );
+            headers.insert(
+                "B".to_string(),
+                StoredHeader::from_record(&mock_record("B")),
+            );
+
             // Link A -> B
             *headers.get("A").unwrap().next_id.write() = Some("B".to_string());
         }
 
         // 2. Save
         storage.save_temporal_chain()?;
-        
+
         // Verify file exists and has magic bytes
         let path = dir.path().join("temporal.bin");
         assert!(path.exists());
         let content = std::fs::read(&path)?;
         assert_eq!(&content[0..4], b"TPL1"); // Magic
-        assert_eq!(content[4], 1);          // Version
+        assert_eq!(content[4], 1); // Version
 
         // 3. Load into FRESH storage
         let storage2 = AuraStorage::new(dir.path())?;
         // Need to simulate "rebuild_index" or manually populate headers for load to work
         {
             let mut headers = storage2.header_cache.write();
-            headers.insert("A".to_string(), StoredHeader::from_record(&mock_record("A")));
-            headers.insert("B".to_string(), StoredHeader::from_record(&mock_record("B")));
+            headers.insert(
+                "A".to_string(),
+                StoredHeader::from_record(&mock_record("A")),
+            );
+            headers.insert(
+                "B".to_string(),
+                StoredHeader::from_record(&mock_record("B")),
+            );
         }
-        
+
         storage2.load_temporal_chain()?;
-        
+
         // 4. Verify Link
         let headers = storage2.header_cache.read();
         let next_a = headers.get("A").unwrap().next_id.read();
@@ -950,7 +1029,7 @@ mod tests {
         storage.append(&record)?;
 
         let loaded = storage.read("test_id_1")?.expect("Should find record");
-        
+
         assert_eq!(loaded.id, record.id);
         assert_eq!(loaded.text, record.text);
         assert_eq!(loaded.sdr_indices, record.sdr_indices);

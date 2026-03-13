@@ -83,6 +83,9 @@ impl Default for ConceptSimilarityMode {
 pub enum ConceptSeedMode {
     /// Production gates: stability >= 2.0, confidence >= 0.55.
     Standard,
+    /// Experimental warmup gates: stability >= 1.0, confidence >= 0.55.
+    /// Narrows the relaxation to early stability only.
+    Warmup,
     /// Experimental relaxed gates: stability >= 1.0, confidence >= 0.40.
     Relaxed,
 }
@@ -90,6 +93,63 @@ pub enum ConceptSeedMode {
 impl Default for ConceptSeedMode {
     fn default() -> Self {
         ConceptSeedMode::Standard
+    }
+}
+
+// ── ConceptPartitionMode ──
+
+/// Controls how belief seeds are partitioned before concept clustering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConceptPartitionMode {
+    /// Production default: partition by `(namespace, semantic_type)`.
+    Standard,
+    /// Experimental mode: partition by `namespace` only.
+    NamespaceOnly,
+}
+
+impl Default for ConceptPartitionMode {
+    fn default() -> Self {
+        ConceptPartitionMode::Standard
+    }
+}
+
+// ── ConceptUnionMode ──
+
+/// Controls comparison-only union relaxations inside concept clustering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConceptUnionMode {
+    /// Production default: current family guard only.
+    Standard,
+    /// Experimental mode: allow a narrow single-tag cross-family bridge for
+    /// fact<->decision pairs with strong shared tag evidence.
+    SingleTagFactDecisionBridge,
+}
+
+impl Default for ConceptUnionMode {
+    fn default() -> Self {
+        ConceptUnionMode::Standard
+    }
+}
+
+// —— ConceptSurfaceMode ——
+
+/// Controls whether bounded surfaced concept output is exposed at runtime.
+///
+/// This is a runtime rollout control only. It does not affect concept
+/// discovery, recall ranking, compression, or behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConceptSurfaceMode {
+    /// Default-safe: no surfaced concept output.
+    Off,
+    /// Allow bounded inspection-only surfaced concepts.
+    Inspect,
+    /// Reserved for future controlled promotion work. Not active yet.
+    Limited,
+}
+
+impl Default for ConceptSurfaceMode {
+    fn default() -> Self {
+        ConceptSurfaceMode::Off
     }
 }
 
@@ -165,11 +225,18 @@ pub struct ConceptReport {
     pub avg_abstraction_score: f32,
 
     // ── Centroid diagnostics ──
-
     /// Number of non-empty centroids built.
     pub centroids_built: usize,
     /// Number of partitions with >= 2 seeds.
     pub partitions_with_multiple_seeds: usize,
+    /// Sizes of partitions that had >= 2 seeds.
+    pub multi_seed_partition_sizes: Vec<usize>,
+    /// Sizes of clusters produced after union-find clustering.
+    pub cluster_sizes: Vec<usize>,
+    /// Number of clusters with >= 2 beliefs.
+    pub clusters_with_multiple_beliefs: usize,
+    /// Largest cluster size observed in this cycle.
+    pub largest_cluster_size: usize,
     /// Total pairwise comparisons made during clustering.
     pub pairwise_comparisons: usize,
     /// Number of pairs that passed the similarity threshold.
@@ -206,6 +273,20 @@ pub struct ConceptEngine {
     /// Similarity mode for concept clustering.
     #[serde(default)]
     pub similarity_mode: ConceptSimilarityMode,
+    /// Partition mode for grouping seed beliefs before clustering.
+    #[serde(default)]
+    pub partition_mode: ConceptPartitionMode,
+    /// Comparison-only union relaxation mode.
+    #[serde(default)]
+    pub union_mode: ConceptUnionMode,
+}
+
+#[derive(Debug, Clone)]
+struct PartitionClusterInspection {
+    partition_key: String,
+    seed_count: usize,
+    cluster_sizes: Vec<usize>,
+    clusters: Vec<Vec<String>>,
 }
 
 impl ConceptEngine {
@@ -215,6 +296,8 @@ impl ConceptEngine {
             key_index: HashMap::new(),
             seed_mode: ConceptSeedMode::Standard,
             similarity_mode: ConceptSimilarityMode::SdrTanimoto,
+            partition_mode: ConceptPartitionMode::Standard,
+            union_mode: ConceptUnionMode::Standard,
         }
     }
 
@@ -225,6 +308,8 @@ impl ConceptEngine {
             key_index: HashMap::new(),
             seed_mode: mode,
             similarity_mode: ConceptSimilarityMode::SdrTanimoto,
+            partition_mode: ConceptPartitionMode::Standard,
+            union_mode: ConceptUnionMode::Standard,
         }
     }
 
@@ -261,24 +346,29 @@ impl ConceptEngine {
         let non_empty_centroids = centroids.values().filter(|c| !c.is_empty()).count();
         report.centroids_built = non_empty_centroids;
         if non_empty_centroids > 0 {
-            report.avg_centroid_size = centroids.values()
+            report.avg_centroid_size = centroids
+                .values()
                 .filter(|c| !c.is_empty())
                 .map(|c| c.len() as f32)
-                .sum::<f32>() / non_empty_centroids as f32;
+                .sum::<f32>()
+                / non_empty_centroids as f32;
         }
 
-        // Phase B: Partition seeds by (namespace, semantic_type), then cluster
-        // within each partition. This prevents cross-namespace or cross-semantic
-        // false abstractions.
+        // Phase B: Partition seeds, then cluster within each partition.
+        // Standard mode keeps `(namespace, semantic_type)` boundaries.
+        // NamespaceOnly is experimental and only widens the candidate pool;
+        // actual clustering still relies on similarity gates.
         let partitions = self.partition_seeds(&seeds, belief_engine);
         let mut clusters: Vec<Vec<String>> = Vec::new();
         let mut all_tanimotos: Vec<f32> = Vec::new();
         let mut pairwise_above = 0usize;
 
         // Build per-belief tag sets for cross-topic merge prevention
-        let belief_tags: HashMap<String, HashSet<String>> = belief_records.iter()
+        let belief_tags: HashMap<String, HashSet<String>> = belief_records
+            .iter()
             .map(|(bid, rids)| {
-                let tags: HashSet<String> = rids.iter()
+                let tags: HashSet<String> = rids
+                    .iter()
                     .filter_map(|rid| records.get(rid))
                     .flat_map(|r| r.tags.iter().cloned())
                     .collect();
@@ -286,10 +376,30 @@ impl ConceptEngine {
             })
             .collect();
 
+        let belief_families: HashMap<String, String> = seeds
+            .iter()
+            .filter_map(|bid| {
+                belief_engine
+                    .beliefs
+                    .get(bid)
+                    .map(|belief| (bid.clone(), parse_belief_key_family(&belief.key)))
+            })
+            .collect();
+        let belief_semantic_types: HashMap<String, String> = seeds
+            .iter()
+            .filter_map(|bid| {
+                belief_engine
+                    .beliefs
+                    .get(bid)
+                    .map(|belief| (bid.clone(), parse_belief_key_ns_st(&belief.key).1))
+            })
+            .collect();
+
         // Build canonical token sets per belief (for CanonicalFeature mode)
         let belief_tokens: HashMap<String, HashSet<String>> =
             if self.similarity_mode == ConceptSimilarityMode::CanonicalFeature {
-                let tokens: HashMap<String, HashSet<String>> = seeds.iter()
+                let tokens: HashMap<String, HashSet<String>> = seeds
+                    .iter()
                     .map(|bid| {
                         let rids = belief_records.get(bid);
                         let t = belief_canonical_tokens(bid, &belief_records, records);
@@ -311,12 +421,15 @@ impl ConceptEngine {
             ConceptSimilarityMode::CanonicalFeature => CANONICAL_SIMILARITY_THRESHOLD,
         };
 
-        for (_partition_key, partition_seeds) in &partitions {
+        for (partition_key, partition_seeds) in &partitions {
             if partition_seeds.len() < 2 {
                 // Single-belief partitions can't form concepts
                 continue;
             }
             report.partitions_with_multiple_seeds += 1;
+            report
+                .multi_seed_partition_sizes
+                .push(partition_seeds.len());
 
             // Collect pairwise similarity diagnostics for this partition
             for i in 0..partition_seeds.len() {
@@ -350,10 +463,28 @@ impl ConceptEngine {
                 }
             }
 
-            let partition_clusters = self.cluster_beliefs_dispatch(
-                partition_seeds, &centroids, &belief_tags, &belief_tokens,
+            let inspection = self.inspect_partition_clusters(
+                partition_key,
+                partition_seeds,
+                &centroids,
+                &belief_tags,
+                &belief_families,
+                &belief_semantic_types,
+                &belief_tokens,
             );
-            clusters.extend(partition_clusters);
+            report
+                .cluster_sizes
+                .extend(inspection.cluster_sizes.iter().copied());
+            report.clusters_with_multiple_beliefs += inspection
+                .cluster_sizes
+                .iter()
+                .filter(|size| **size >= 2)
+                .count();
+            report.largest_cluster_size = report
+                .largest_cluster_size
+                .max(inspection.cluster_sizes.iter().copied().max().unwrap_or(0));
+            let _ = (&inspection.partition_key, inspection.seed_count);
+            clusters.extend(inspection.clusters);
         }
 
         // Fill Tanimoto diagnostics
@@ -380,11 +511,14 @@ impl ConceptEngine {
             }
 
             // Gather belief metadata
-            let cluster_beliefs: Vec<_> = cluster_belief_ids.iter()
+            let cluster_beliefs: Vec<_> = cluster_belief_ids
+                .iter()
                 .filter_map(|bid| belief_engine.beliefs.get(bid))
                 .collect();
 
-            if cluster_beliefs.is_empty() { continue; }
+            if cluster_beliefs.is_empty() {
+                continue;
+            }
 
             // Gather all record IDs in this cluster
             let mut all_record_ids: Vec<String> = Vec::new();
@@ -397,55 +531,58 @@ impl ConceptEngine {
             all_record_ids.dedup();
 
             // Gather all record contents for term extraction
-            let cluster_records: Vec<&Record> = all_record_ids.iter()
+            let cluster_records: Vec<&Record> = all_record_ids
+                .iter()
                 .filter_map(|rid| records.get(rid))
                 .collect();
 
-            if cluster_records.is_empty() { continue; }
+            if cluster_records.is_empty() {
+                continue;
+            }
 
             // Extract core/shell terms (Phase C)
             let (core_terms, shell_terms) = extract_terms(&cluster_records);
 
             // Extract tags
-            let tags = extract_stable_tags(&cluster_beliefs
-                .iter()
-                .flat_map(|b| {
-                    // Parse tags from belief key: "namespace:tag1,tag2,tag3:semantic_type"
-                    let parts: Vec<&str> = b.key.split(':').collect();
-                    if parts.len() >= 2 {
-                        parts[1].split(',').map(|s| s.to_string()).collect::<Vec<_>>()
-                    } else {
-                        Vec::new()
-                    }
-                })
-                .collect::<Vec<_>>(),
+            let tags = extract_stable_tags(
+                &cluster_beliefs
+                    .iter()
+                    .flat_map(|b| {
+                        // Parse tags from belief key: "namespace:tag1,tag2,tag3:semantic_type"
+                        let parts: Vec<&str> = b.key.split(':').collect();
+                        if parts.len() >= 2 {
+                            parts[1]
+                                .split(',')
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .collect::<Vec<_>>(),
                 cluster_beliefs.len(),
             );
 
-            // Determine namespace and semantic_type from first belief's key
+            // Determine namespace and semantic_type from first belief's key.
+            // Normalize away belief subcluster suffixes like `decision#3` so
+            // concept identity does not drift with lower-layer subcluster slot
+            // numbering.
             let first_key = &cluster_beliefs[0].key;
-            let key_parts: Vec<&str> = first_key.split(':').collect();
-            let namespace = key_parts.first().copied().unwrap_or("default").to_string();
-            let semantic_type = key_parts.last().copied().unwrap_or("fact").to_string();
+            let (namespace, semantic_type) = parse_belief_key_ns_st(first_key);
 
             // Compute metrics (Phase D)
-            let support_mass = cluster_beliefs.iter()
-                .map(|b| b.support_mass)
-                .sum::<f32>();
+            let support_mass = cluster_beliefs.iter().map(|b| b.support_mass).sum::<f32>();
             let support_norm = (1.0 + support_mass).ln();
 
-            let confidence = cluster_beliefs.iter()
-                .map(|b| b.confidence)
-                .sum::<f32>() / cluster_beliefs.len() as f32;
+            let confidence = cluster_beliefs.iter().map(|b| b.confidence).sum::<f32>()
+                / cluster_beliefs.len() as f32;
 
-            let stability = cluster_beliefs.iter()
-                .map(|b| b.stability)
-                .sum::<f32>() / cluster_beliefs.len() as f32;
+            let stability = cluster_beliefs.iter().map(|b| b.stability).sum::<f32>()
+                / cluster_beliefs.len() as f32;
 
             let cohesion = compute_cohesion(cluster_belief_ids, &centroids);
 
-            let abstraction_score =
-                W_SUPPORT * support_norm.min(1.0)
+            let abstraction_score = W_SUPPORT * support_norm.min(1.0)
                 + W_CONFIDENCE * confidence
                 + W_STABILITY * (stability / (stability + 3.0)) // normalize: 3 cycles → 0.5
                 + W_COHESION * cohesion;
@@ -460,10 +597,17 @@ impl ConceptEngine {
             };
 
             // Build concept key from stable abstraction features (not belief_ids)
-            let cluster_centroids: Vec<&Vec<u16>> = cluster_belief_ids.iter()
+            let cluster_centroids: Vec<&Vec<u16>> = cluster_belief_ids
+                .iter()
                 .filter_map(|bid| centroids.get(bid))
                 .collect();
-            let concept_key = concept_key(&namespace, &semantic_type, &tags, &core_terms, &cluster_centroids);
+            let concept_key = concept_key(
+                &namespace,
+                &semantic_type,
+                &tags,
+                &core_terms,
+                &cluster_centroids,
+            );
 
             // Deterministic ID from key
             let concept_id = deterministic_id(&concept_key);
@@ -499,9 +643,11 @@ impl ConceptEngine {
 
         report.candidates_found = new_concepts.len();
         if !new_concepts.is_empty() {
-            report.avg_abstraction_score = new_concepts.values()
+            report.avg_abstraction_score = new_concepts
+                .values()
                 .map(|c| c.abstraction_score)
-                .sum::<f32>() / new_concepts.len() as f32;
+                .sum::<f32>()
+                / new_concepts.len() as f32;
         }
 
         // Full rebuild — replace state
@@ -513,8 +659,7 @@ impl ConceptEngine {
 
     // ── Phase A: Select belief seeds ──
 
-    /// Partition seeds into groups by (namespace, semantic_type).
-    /// Concepts can only form within a single namespace and semantic_type.
+    /// Partition seeds into groups before concept clustering.
     fn partition_seeds(
         &self,
         seed_ids: &[String],
@@ -524,8 +669,14 @@ impl ConceptEngine {
         for bid in seed_ids {
             if let Some(belief) = engine.beliefs.get(bid) {
                 let (ns, st) = parse_belief_key_ns_st(&belief.key);
-                let partition_key = format!("{}:{}", ns, st);
-                partitions.entry(partition_key).or_default().push(bid.clone());
+                let partition_key = match self.partition_mode {
+                    ConceptPartitionMode::Standard => format!("{}:{}", ns, st),
+                    ConceptPartitionMode::NamespaceOnly => ns,
+                };
+                partitions
+                    .entry(partition_key)
+                    .or_default()
+                    .push(bid.clone());
             }
         }
         partitions
@@ -534,9 +685,12 @@ impl ConceptEngine {
     fn select_seeds(&self, engine: &BeliefEngine) -> Vec<String> {
         let (min_stability, min_confidence) = match self.seed_mode {
             ConceptSeedMode::Standard => (MIN_BELIEF_STABILITY, MIN_BELIEF_CONFIDENCE),
+            ConceptSeedMode::Warmup => (1.0, MIN_BELIEF_CONFIDENCE),
             ConceptSeedMode::Relaxed => (1.0, 0.40),
         };
-        engine.beliefs.values()
+        engine
+            .beliefs
+            .values()
             .filter(|b| {
                 // Only Resolved and Singleton beliefs (not Unresolved/Empty)
                 matches!(b.state, BeliefState::Resolved | BeliefState::Singleton)
@@ -610,15 +764,52 @@ impl ConceptEngine {
         seed_ids: &[String],
         centroids: &HashMap<String, Vec<u16>>,
         belief_tags: &HashMap<String, HashSet<String>>,
+        belief_families: &HashMap<String, String>,
+        belief_semantic_types: &HashMap<String, String>,
         belief_tokens: &HashMap<String, HashSet<String>>,
     ) -> Vec<Vec<String>> {
         match self.similarity_mode {
-            ConceptSimilarityMode::SdrTanimoto => {
-                self.cluster_beliefs(seed_ids, centroids, belief_tags)
-            }
-            ConceptSimilarityMode::CanonicalFeature => {
-                self.cluster_beliefs_canonical(seed_ids, belief_tags, belief_tokens)
-            }
+            ConceptSimilarityMode::SdrTanimoto => self.cluster_beliefs(
+                seed_ids,
+                centroids,
+                belief_tags,
+                belief_families,
+                belief_semantic_types,
+            ),
+            ConceptSimilarityMode::CanonicalFeature => self.cluster_beliefs_canonical(
+                seed_ids,
+                belief_tags,
+                belief_families,
+                belief_semantic_types,
+                belief_tokens,
+            ),
+        }
+    }
+
+    fn inspect_partition_clusters(
+        &self,
+        partition_key: &str,
+        seed_ids: &[String],
+        centroids: &HashMap<String, Vec<u16>>,
+        belief_tags: &HashMap<String, HashSet<String>>,
+        belief_families: &HashMap<String, String>,
+        belief_semantic_types: &HashMap<String, String>,
+        belief_tokens: &HashMap<String, HashSet<String>>,
+    ) -> PartitionClusterInspection {
+        let clusters = self.cluster_beliefs_dispatch(
+            seed_ids,
+            centroids,
+            belief_tags,
+            belief_families,
+            belief_semantic_types,
+            belief_tokens,
+        );
+        let cluster_sizes = clusters.iter().map(Vec::len).collect();
+        PartitionClusterInspection {
+            partition_key: partition_key.to_string(),
+            seed_count: seed_ids.len(),
+            cluster_sizes,
+            clusters,
         }
     }
 
@@ -627,6 +818,8 @@ impl ConceptEngine {
         &self,
         seed_ids: &[String],
         belief_tags: &HashMap<String, HashSet<String>>,
+        belief_families: &HashMap<String, String>,
+        belief_semantic_types: &HashMap<String, String>,
         belief_tokens: &HashMap<String, HashSet<String>>,
     ) -> Vec<Vec<String>> {
         let n = seed_ids.len();
@@ -646,27 +839,79 @@ impl ConceptEngine {
         fn union(parent: &mut [usize], a: usize, b: usize) {
             let ra = find(parent, a);
             let rb = find(parent, b);
-            if ra != rb { parent[ra] = rb; }
+            if ra != rb {
+                parent[ra] = rb;
+            }
         }
 
         let empty_tags: HashSet<String> = HashSet::new();
         let empty_tokens: HashSet<String> = HashSet::new();
+        let require_same_family = self.partition_mode == ConceptPartitionMode::NamespaceOnly;
 
         for i in 0..n {
             let tok_i = belief_tokens.get(&seed_ids[i]).unwrap_or(&empty_tokens);
-            if tok_i.is_empty() { continue; }
+            if tok_i.is_empty() {
+                continue;
+            }
 
             let tags_i = belief_tags.get(&seed_ids[i]).unwrap_or(&empty_tags);
+            let family_i = belief_families
+                .get(&seed_ids[i])
+                .map(String::as_str)
+                .unwrap_or("");
 
             for j in (i + 1)..n {
                 let tok_j = belief_tokens.get(&seed_ids[j]).unwrap_or(&empty_tokens);
-                if tok_j.is_empty() { continue; }
+                if tok_j.is_empty() {
+                    continue;
+                }
 
                 // Tag barrier: beliefs must share at least 1 tag to merge
                 let tags_j = belief_tags.get(&seed_ids[j]).unwrap_or(&empty_tags);
                 let shared = tags_i.intersection(tags_j).count();
                 if shared == 0 && !tags_i.is_empty() && !tags_j.is_empty() {
                     continue;
+                }
+
+                if require_same_family {
+                    let family_j = belief_families
+                        .get(&seed_ids[j])
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    if !family_i.is_empty() && !family_j.is_empty() && family_i != family_j {
+                        let fam_i = family_token_set(family_i);
+                        let fam_j = family_token_set(family_j);
+                        let family_overlap = fam_i.intersection(&fam_j).count();
+                        let allow_overlap_bridge = fam_i.len() >= 2
+                            && fam_j.len() >= 2
+                            && family_overlap >= 1
+                            && shared >= 1
+                            && !is_generic_family(family_i)
+                            && !is_generic_family(family_j);
+                        let st_i = belief_semantic_types
+                            .get(&seed_ids[i])
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        let st_j = belief_semantic_types
+                            .get(&seed_ids[j])
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        let allow_single_tag_bridge = self.union_mode
+                            == ConceptUnionMode::SingleTagFactDecisionBridge
+                            && fam_i.len() == 1
+                            && fam_j.len() == 1
+                            && shared >= 2
+                            && !is_generic_family(family_i)
+                            && !is_generic_family(family_j)
+                            && ((st_i == "fact" && st_j == "decision")
+                                || (st_i == "decision" && st_j == "fact"));
+                        if !allow_overlap_bridge && !allow_single_tag_bridge {
+                            continue;
+                        }
+                    }
+                    if is_generic_family(family_i) && shared < 2 {
+                        continue;
+                    }
                 }
 
                 if jaccard(tok_i, tok_j) >= CANONICAL_SIMILARITY_THRESHOLD {
@@ -689,6 +934,8 @@ impl ConceptEngine {
         seed_ids: &[String],
         centroids: &HashMap<String, Vec<u16>>,
         belief_tags: &HashMap<String, HashSet<String>>,
+        belief_families: &HashMap<String, String>,
+        belief_semantic_types: &HashMap<String, String>,
     ) -> Vec<Vec<String>> {
         let n = seed_ids.len();
         if n <= 1 {
@@ -708,21 +955,32 @@ impl ConceptEngine {
         fn union(parent: &mut [usize], a: usize, b: usize) {
             let ra = find(parent, a);
             let rb = find(parent, b);
-            if ra != rb { parent[ra] = rb; }
+            if ra != rb {
+                parent[ra] = rb;
+            }
         }
 
         let empty_tags: HashSet<String> = HashSet::new();
+        let require_same_family = self.partition_mode == ConceptPartitionMode::NamespaceOnly;
 
         for i in 0..n {
             let sdr_i = centroids.get(&seed_ids[i]);
-            if sdr_i.map_or(true, |s| s.is_empty()) { continue; }
+            if sdr_i.map_or(true, |s| s.is_empty()) {
+                continue;
+            }
             let sdr_i = sdr_i.unwrap();
 
             let tags_i = belief_tags.get(&seed_ids[i]).unwrap_or(&empty_tags);
+            let family_i = belief_families
+                .get(&seed_ids[i])
+                .map(String::as_str)
+                .unwrap_or("");
 
             for j in (i + 1)..n {
                 let sdr_j = centroids.get(&seed_ids[j]);
-                if sdr_j.map_or(true, |s| s.is_empty()) { continue; }
+                if sdr_j.map_or(true, |s| s.is_empty()) {
+                    continue;
+                }
                 let sdr_j = sdr_j.unwrap();
 
                 // Tag barrier: beliefs must share at least 1 tag to merge.
@@ -732,6 +990,47 @@ impl ConceptEngine {
                 let shared = tags_i.intersection(tags_j).count();
                 if shared == 0 && !tags_i.is_empty() && !tags_j.is_empty() {
                     continue;
+                }
+
+                if require_same_family {
+                    let family_j = belief_families
+                        .get(&seed_ids[j])
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    if !family_i.is_empty() && !family_j.is_empty() && family_i != family_j {
+                        let fam_i = family_token_set(family_i);
+                        let fam_j = family_token_set(family_j);
+                        let family_overlap = fam_i.intersection(&fam_j).count();
+                        let allow_overlap_bridge = fam_i.len() >= 2
+                            && fam_j.len() >= 2
+                            && family_overlap >= 1
+                            && shared >= 1
+                            && !is_generic_family(family_i)
+                            && !is_generic_family(family_j);
+                        let st_i = belief_semantic_types
+                            .get(&seed_ids[i])
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        let st_j = belief_semantic_types
+                            .get(&seed_ids[j])
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        let allow_single_tag_bridge = self.union_mode
+                            == ConceptUnionMode::SingleTagFactDecisionBridge
+                            && fam_i.len() == 1
+                            && fam_j.len() == 1
+                            && shared >= 2
+                            && !is_generic_family(family_i)
+                            && !is_generic_family(family_j)
+                            && ((st_i == "fact" && st_j == "decision")
+                                || (st_i == "decision" && st_j == "fact"));
+                        if !allow_overlap_bridge && !allow_single_tag_bridge {
+                            continue;
+                        }
+                    }
+                    if is_generic_family(family_i) && shared < 2 {
+                        continue;
+                    }
                 }
 
                 if tanimoto(sdr_i, sdr_j) >= CONCEPT_SIMILARITY_THRESHOLD {
@@ -750,27 +1049,44 @@ impl ConceptEngine {
 
     /// Get all stable concepts.
     pub fn stable_concepts(&self) -> Vec<&ConceptCandidate> {
-        self.concepts.values()
+        self.concepts
+            .values()
             .filter(|c| c.state == ConceptState::Stable)
             .collect()
     }
 
     /// Get all candidates (Stable + Candidate, excluding Rejected).
     pub fn active_candidates(&self) -> Vec<&ConceptCandidate> {
-        self.concepts.values()
+        self.concepts
+            .values()
             .filter(|c| c.state != ConceptState::Rejected)
             .collect()
     }
 
     /// Get summary statistics.
     pub fn stats(&self) -> ConceptStats {
-        let stable = self.concepts.values().filter(|c| c.state == ConceptState::Stable).count();
-        let candidate = self.concepts.values().filter(|c| c.state == ConceptState::Candidate).count();
-        let rejected = self.concepts.values().filter(|c| c.state == ConceptState::Rejected).count();
+        let stable = self
+            .concepts
+            .values()
+            .filter(|c| c.state == ConceptState::Stable)
+            .count();
+        let candidate = self
+            .concepts
+            .values()
+            .filter(|c| c.state == ConceptState::Candidate)
+            .count();
+        let rejected = self
+            .concepts
+            .values()
+            .filter(|c| c.state == ConceptState::Rejected)
+            .count();
         let avg_abstraction = if self.concepts.is_empty() {
             0.0
         } else {
-            self.concepts.values().map(|c| c.abstraction_score).sum::<f32>()
+            self.concepts
+                .values()
+                .map(|c| c.abstraction_score)
+                .sum::<f32>()
                 / self.concepts.len() as f32
         };
         ConceptStats {
@@ -815,7 +1131,9 @@ pub struct ConceptStore {
 
 impl ConceptStore {
     pub fn new<P: AsRef<std::path::Path>>(path: P) -> Self {
-        Self { path: path.as_ref().to_path_buf() }
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
     }
 
     /// Load concept engine state from disk (inspection/debugging only).
@@ -857,21 +1175,30 @@ fn tanimoto(a: &[u16], b: &[u16]) -> f32 {
     let mut intersection = 0usize;
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        if a[i] < b[j] { i += 1; }
-        else if a[i] > b[j] { j += 1; }
-        else { intersection += 1; i += 1; j += 1; }
+        if a[i] < b[j] {
+            i += 1;
+        } else if a[i] > b[j] {
+            j += 1;
+        } else {
+            intersection += 1;
+            i += 1;
+            j += 1;
+        }
     }
     let union_size = a.len() + b.len() - intersection;
-    if union_size == 0 { 0.0 } else { intersection as f32 / union_size as f32 }
+    if union_size == 0 {
+        0.0
+    } else {
+        intersection as f32 / union_size as f32
+    }
 }
 
 /// Average pairwise Tanimoto within a cluster of beliefs.
-fn compute_cohesion(
-    belief_ids: &[String],
-    centroids: &HashMap<String, Vec<u16>>,
-) -> f32 {
+fn compute_cohesion(belief_ids: &[String], centroids: &HashMap<String, Vec<u16>>) -> f32 {
     let n = belief_ids.len();
-    if n < 2 { return 1.0; }
+    if n < 2 {
+        return 1.0;
+    }
 
     let mut sum = 0.0_f32;
     let mut pairs = 0usize;
@@ -890,7 +1217,11 @@ fn compute_cohesion(
         }
     }
 
-    if pairs == 0 { 0.0 } else { sum / pairs as f32 }
+    if pairs == 0 {
+        0.0
+    } else {
+        sum / pairs as f32
+    }
 }
 
 /// Extract core and shell terms from a set of records.
@@ -899,13 +1230,16 @@ fn compute_cohesion(
 /// Shell: terms appearing in [SHELL_TERM_LOWER, CORE_TERM_THRESHOLD).
 fn extract_terms(records: &[&Record]) -> (Vec<String>, Vec<String>) {
     let n = records.len();
-    if n == 0 { return (Vec::new(), Vec::new()); }
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
 
     // Count term frequency across records (which records contain each term)
     let mut term_doc_freq: HashMap<String, usize> = HashMap::new();
     for rec in records {
         // Unique terms per record
-        let terms: std::collections::HashSet<String> = rec.content
+        let terms: std::collections::HashSet<String> = rec
+            .content
             .to_lowercase()
             .split_whitespace()
             .filter(|w| w.len() >= 3) // skip short words
@@ -937,7 +1271,9 @@ fn extract_terms(records: &[&Record]) -> (Vec<String>, Vec<String>) {
 
 /// Extract tags that appear in a majority of beliefs in a cluster.
 fn extract_stable_tags(all_tags: &[String], belief_count: usize) -> Vec<String> {
-    if belief_count == 0 { return Vec::new(); }
+    if belief_count == 0 {
+        return Vec::new();
+    }
 
     let mut tag_freq: HashMap<&str, usize> = HashMap::new();
     for tag in all_tags {
@@ -945,7 +1281,8 @@ fn extract_stable_tags(all_tags: &[String], belief_count: usize) -> Vec<String> 
     }
 
     let threshold = (belief_count as f64 * 0.5).ceil() as usize;
-    let mut tags: Vec<String> = tag_freq.into_iter()
+    let mut tags: Vec<String> = tag_freq
+        .into_iter()
         .filter(|(_, count)| *count >= threshold)
         .map(|(tag, _)| tag.to_string())
         .collect();
@@ -964,6 +1301,30 @@ fn parse_belief_key_ns_st(key: &str) -> (String, String) {
     // Strip subcluster suffix: "decision#3" → "decision"
     let st = raw_st.split('#').next().unwrap_or(raw_st).to_string();
     (ns, st)
+}
+
+/// Parse the dominant tag family from a belief key when present.
+/// For keys like `namespace:family:semantic_type[#N]`, returns `family`.
+/// For keys like `namespace:semantic_type[#N]`, returns empty string.
+fn parse_belief_key_family(key: &str) -> String {
+    let parts: Vec<&str> = key.split(':').collect();
+    if parts.len() >= 3 {
+        parts[1].to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn family_token_set(family: &str) -> HashSet<String> {
+    family
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn is_generic_family(family: &str) -> bool {
+    matches!(family, "alerts")
 }
 
 /// Build a deterministic concept key from stable abstraction features.
@@ -985,16 +1346,15 @@ fn concept_key(
     }
     all_bits.sort();
     all_bits.dedup();
-    let centroid_bytes: Vec<u8> = all_bits.iter()
-        .flat_map(|b| b.to_le_bytes())
-        .collect();
+    let centroid_bytes: Vec<u8> = all_bits.iter().flat_map(|b| b.to_le_bytes()).collect();
     let centroid_hash = xxhash_rust::xxh3::xxh3_64(&centroid_bytes);
 
     // Take top-5 core terms for key stability
     let mut key_terms = core_terms.to_vec();
     key_terms.truncate(5);
 
-    format!("{}:{}:{}:{}:{:08x}",
+    format!(
+        "{}:{}:{}:{}:{:08x}",
         namespace,
         tags.join(","),
         semantic_type,
@@ -1011,17 +1371,81 @@ fn deterministic_id(key: &str) -> String {
 
 /// Simple English stopword filter.
 fn is_stopword(word: &str) -> bool {
-    matches!(word,
-        "the" | "and" | "for" | "are" | "but" | "not" | "you" | "all"
-        | "can" | "had" | "her" | "was" | "one" | "our" | "out" | "has"
-        | "his" | "how" | "its" | "may" | "new" | "now" | "old" | "see"
-        | "way" | "who" | "did" | "get" | "let" | "say" | "she" | "too"
-        | "use" | "with" | "this" | "that" | "have" | "from" | "they"
-        | "been" | "will" | "into" | "when" | "what" | "which" | "their"
-        | "than" | "each" | "make" | "like" | "just" | "over" | "such"
-        | "take" | "also" | "some" | "could" | "them" | "only" | "other"
-        | "very" | "after" | "most" | "then" | "more" | "should" | "would"
-        | "there" | "about" | "these" | "where" | "being" | "does"
+    matches!(
+        word,
+        "the"
+            | "and"
+            | "for"
+            | "are"
+            | "but"
+            | "not"
+            | "you"
+            | "all"
+            | "can"
+            | "had"
+            | "her"
+            | "was"
+            | "one"
+            | "our"
+            | "out"
+            | "has"
+            | "his"
+            | "how"
+            | "its"
+            | "may"
+            | "new"
+            | "now"
+            | "old"
+            | "see"
+            | "way"
+            | "who"
+            | "did"
+            | "get"
+            | "let"
+            | "say"
+            | "she"
+            | "too"
+            | "use"
+            | "with"
+            | "this"
+            | "that"
+            | "have"
+            | "from"
+            | "they"
+            | "been"
+            | "will"
+            | "into"
+            | "when"
+            | "what"
+            | "which"
+            | "their"
+            | "than"
+            | "each"
+            | "make"
+            | "like"
+            | "just"
+            | "over"
+            | "such"
+            | "take"
+            | "also"
+            | "some"
+            | "could"
+            | "them"
+            | "only"
+            | "other"
+            | "very"
+            | "after"
+            | "most"
+            | "then"
+            | "more"
+            | "should"
+            | "would"
+            | "there"
+            | "about"
+            | "these"
+            | "where"
+            | "being"
+            | "does"
     )
 }
 
@@ -1041,19 +1465,45 @@ fn stem_word(word: &str) -> String {
     }
 
     // Order matters: try longest suffixes first, require base >= 4 chars
-    if w.ends_with("ations") && len > 7 { return w[..len - 6].to_string(); }
-    if w.ends_with("ation") && len > 6 { return w[..len - 5].to_string(); }
-    if w.ends_with("ments") && len > 6 { return w[..len - 5].to_string(); }
-    if w.ends_with("ment") && len > 5 && (len - 4) >= 4 { return w[..len - 4].to_string(); }
-    if w.ends_with("ness") && len > 5 && (len - 4) >= 4 { return w[..len - 4].to_string(); }
-    if w.ends_with("ting") && len > 5 && (len - 3) >= 4 { return w[..len - 3].to_string(); }
-    if w.ends_with("ing") && len > 5 && (len - 3) >= 4 { return w[..len - 3].to_string(); }
-    if w.ends_with("ied") && len > 5 { return w[..len - 3].to_string() + "y"; }
-    if w.ends_with("ies") && len > 5 { return w[..len - 3].to_string() + "y"; }
-    if w.ends_with("ed") && len > 5 && (len - 2) >= 4 { return w[..len - 2].to_string(); }
-    if w.ends_with("ly") && len > 5 && (len - 2) >= 4 { return w[..len - 2].to_string(); }
-    if w.ends_with("es") && len > 5 && (len - 2) >= 4 { return w[..len - 2].to_string(); }
-    if w.ends_with("er") && len > 5 && (len - 2) >= 4 { return w[..len - 2].to_string(); }
+    if w.ends_with("ations") && len > 7 {
+        return w[..len - 6].to_string();
+    }
+    if w.ends_with("ation") && len > 6 {
+        return w[..len - 5].to_string();
+    }
+    if w.ends_with("ments") && len > 6 {
+        return w[..len - 5].to_string();
+    }
+    if w.ends_with("ment") && len > 5 && (len - 4) >= 4 {
+        return w[..len - 4].to_string();
+    }
+    if w.ends_with("ness") && len > 5 && (len - 4) >= 4 {
+        return w[..len - 4].to_string();
+    }
+    if w.ends_with("ting") && len > 5 && (len - 3) >= 4 {
+        return w[..len - 3].to_string();
+    }
+    if w.ends_with("ing") && len > 5 && (len - 3) >= 4 {
+        return w[..len - 3].to_string();
+    }
+    if w.ends_with("ied") && len > 5 {
+        return w[..len - 3].to_string() + "y";
+    }
+    if w.ends_with("ies") && len > 5 {
+        return w[..len - 3].to_string() + "y";
+    }
+    if w.ends_with("ed") && len > 5 && (len - 2) >= 4 {
+        return w[..len - 2].to_string();
+    }
+    if w.ends_with("ly") && len > 5 && (len - 2) >= 4 {
+        return w[..len - 2].to_string();
+    }
+    if w.ends_with("es") && len > 5 && (len - 2) >= 4 {
+        return w[..len - 2].to_string();
+    }
+    if w.ends_with("er") && len > 5 && (len - 2) >= 4 {
+        return w[..len - 2].to_string();
+    }
     if w.ends_with('s') && !w.ends_with("ss") && len > 4 && (len - 1) >= 4 {
         return w[..len - 1].to_string();
     }
@@ -1068,7 +1518,7 @@ fn try_canonical(word: &str) -> Option<&'static str> {
     match word {
         // deployment family
         "deploy" | "deploys" | "deployed" | "deploying" | "deployment" | "deployments"
-            | "post-deploy" => Some("deploy"),
+        | "post-deploy" => Some("deploy"),
         "rollout" | "rollouts" | "roll-out" | "rolling" => Some("rollout"),
         "rollback" | "rollbacks" => Some("rollback"),
         "release" | "releases" | "released" | "releasing" => Some("release"),
@@ -1106,8 +1556,8 @@ fn try_canonical(word: &str) -> Option<&'static str> {
         // process/workflow
         "test" | "tests" | "testing" | "tested" => Some("test"),
         "monitor" | "monitors" | "monitoring" | "monitored" => Some("monitor"),
-        "config" | "configuration" | "configurations" | "configure"
-            | "configured" | "configuring" => Some("config"),
+        "config" | "configuration" | "configurations" | "configure" | "configured"
+        | "configuring" => Some("config"),
         "review" | "reviews" | "reviewing" | "reviewed" | "reviewer" => Some("review"),
         "approval" | "approve" | "approved" | "approving" => Some("approval"),
         "pipeline" | "pipelines" => Some("pipeline"),
@@ -1137,20 +1587,99 @@ fn try_canonical(word: &str) -> Option<&'static str> {
 /// Extended stopword list for canonical tokenization.
 /// Broader than the term extraction stopwords — includes more function words.
 fn is_canonical_stopword(word: &str) -> bool {
-    matches!(word,
-        "the" | "and" | "for" | "are" | "but" | "not" | "you" | "all"
-        | "can" | "had" | "her" | "was" | "one" | "our" | "out" | "has"
-        | "his" | "how" | "its" | "may" | "new" | "now" | "old" | "see"
-        | "way" | "who" | "did" | "get" | "let" | "say" | "she" | "too"
-        | "use" | "with" | "this" | "that" | "have" | "from" | "they"
-        | "been" | "will" | "into" | "when" | "what" | "which" | "their"
-        | "than" | "each" | "make" | "like" | "just" | "over" | "such"
-        | "take" | "also" | "some" | "could" | "them" | "only" | "other"
-        | "very" | "after" | "most" | "then" | "more" | "should" | "would"
-        | "there" | "about" | "these" | "where" | "being" | "does"
-        | "much" | "every" | "always" | "using" | "during" | "before"
-        | "between" | "through" | "while" | "since" | "both" | "still"
-        | "need" | "set" | "via" | "per" | "least" | "already"
+    matches!(
+        word,
+        "the"
+            | "and"
+            | "for"
+            | "are"
+            | "but"
+            | "not"
+            | "you"
+            | "all"
+            | "can"
+            | "had"
+            | "her"
+            | "was"
+            | "one"
+            | "our"
+            | "out"
+            | "has"
+            | "his"
+            | "how"
+            | "its"
+            | "may"
+            | "new"
+            | "now"
+            | "old"
+            | "see"
+            | "way"
+            | "who"
+            | "did"
+            | "get"
+            | "let"
+            | "say"
+            | "she"
+            | "too"
+            | "use"
+            | "with"
+            | "this"
+            | "that"
+            | "have"
+            | "from"
+            | "they"
+            | "been"
+            | "will"
+            | "into"
+            | "when"
+            | "what"
+            | "which"
+            | "their"
+            | "than"
+            | "each"
+            | "make"
+            | "like"
+            | "just"
+            | "over"
+            | "such"
+            | "take"
+            | "also"
+            | "some"
+            | "could"
+            | "them"
+            | "only"
+            | "other"
+            | "very"
+            | "after"
+            | "most"
+            | "then"
+            | "more"
+            | "should"
+            | "would"
+            | "there"
+            | "about"
+            | "these"
+            | "where"
+            | "being"
+            | "does"
+            | "much"
+            | "every"
+            | "always"
+            | "using"
+            | "during"
+            | "before"
+            | "between"
+            | "through"
+            | "while"
+            | "since"
+            | "both"
+            | "still"
+            | "need"
+            | "set"
+            | "via"
+            | "per"
+            | "least"
+            | "already"
     )
 }
 
@@ -1208,7 +1737,11 @@ pub fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
     }
     let intersection = a.intersection(b).count();
     let union = a.union(b).count();
-    if union == 0 { 0.0 } else { intersection as f32 / union as f32 }
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f32 / union as f32
+    }
 }
 
 fn now_secs() -> f64 {
@@ -1280,14 +1813,20 @@ pub fn surface_concepts_filtered(
     limit: Option<usize>,
     namespace: Option<&str>,
 ) -> Vec<SurfacedConcept> {
-    let max = limit.unwrap_or(MAX_SURFACED_CONCEPTS).min(MAX_SURFACED_CONCEPTS);
+    let max = limit
+        .unwrap_or(MAX_SURFACED_CONCEPTS)
+        .min(MAX_SURFACED_CONCEPTS);
 
     // Phase A: filter eligible concepts
-    let mut eligible: Vec<&ConceptCandidate> = engine.concepts.values()
+    let mut eligible: Vec<&ConceptCandidate> = engine
+        .concepts
+        .values()
         .filter(|c| {
             // Namespace filter
             if let Some(ns) = namespace {
-                if c.namespace != ns { return false; }
+                if c.namespace != ns {
+                    return false;
+                }
             }
 
             // Must have provenance
@@ -1303,9 +1842,7 @@ pub fn surface_concepts_filtered(
             // State gate
             match c.state {
                 ConceptState::Stable => true,
-                ConceptState::Candidate => {
-                    c.abstraction_score >= SURFACE_CANDIDATE_THRESHOLD
-                }
+                ConceptState::Candidate => c.abstraction_score >= SURFACE_CANDIDATE_THRESHOLD,
                 ConceptState::Rejected => false,
             }
         })
@@ -1314,8 +1851,14 @@ pub fn surface_concepts_filtered(
     // Phase B: sort deterministically
     // Higher abstraction_score > higher confidence > larger cluster > stable over candidate > key tiebreak
     eligible.sort_by(|a, b| {
-        b.abstraction_score.partial_cmp(&a.abstraction_score).unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal))
+        b.abstraction_score
+            .partial_cmp(&a.abstraction_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
             .then(b.belief_ids.len().cmp(&a.belief_ids.len()))
             .then_with(|| {
                 let a_stable = matches!(a.state, ConceptState::Stable);
@@ -1378,7 +1921,7 @@ pub fn surface_concepts_filtered(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::belief::BeliefEngine;
+    use crate::belief::{Belief, BeliefEngine};
     use crate::levels::Level;
 
     fn make_record(content: &str, tags: &[&str], semantic_type: &str) -> Record {
@@ -1391,7 +1934,8 @@ mod tests {
 
     fn build_sdr_lookup(records: &HashMap<String, Record>) -> SdrLookup {
         let sdr = crate::sdr::SDRInterpreter::default();
-        records.iter()
+        records
+            .iter()
             .map(|(id, rec)| (id.clone(), sdr.text_to_sdr(&rec.content, false)))
             .collect()
     }
@@ -1401,20 +1945,60 @@ mod tests {
         let mut records = HashMap::new();
 
         // Cluster 1: dark mode preferences (4 records → should form 1 belief → need more beliefs for concept)
-        let r1 = make_record("I prefer dark mode for my editor and terminal", &["ui", "preferences"], "preference");
-        let r2 = make_record("Dark theme is better for my eyes in the editor", &["ui", "preferences"], "preference");
-        let r3 = make_record("Always use dark mode in all my development tools", &["ui", "preferences"], "preference");
-        let r4 = make_record("Dark background reduces eye strain during coding", &["ui", "preferences"], "preference");
+        let r1 = make_record(
+            "I prefer dark mode for my editor and terminal",
+            &["ui", "preferences"],
+            "preference",
+        );
+        let r2 = make_record(
+            "Dark theme is better for my eyes in the editor",
+            &["ui", "preferences"],
+            "preference",
+        );
+        let r3 = make_record(
+            "Always use dark mode in all my development tools",
+            &["ui", "preferences"],
+            "preference",
+        );
+        let r4 = make_record(
+            "Dark background reduces eye strain during coding",
+            &["ui", "preferences"],
+            "preference",
+        );
 
         // Cluster 2: keyboard shortcuts preferences
-        let r5 = make_record("Vim keybindings are essential for fast editing workflow", &["ui", "shortcuts"], "preference");
-        let r6 = make_record("I use vim keyboard shortcuts in every editor I configure", &["ui", "shortcuts"], "preference");
-        let r7 = make_record("Vim-style key bindings make me productive in coding", &["ui", "shortcuts"], "preference");
+        let r5 = make_record(
+            "Vim keybindings are essential for fast editing workflow",
+            &["ui", "shortcuts"],
+            "preference",
+        );
+        let r6 = make_record(
+            "I use vim keyboard shortcuts in every editor I configure",
+            &["ui", "shortcuts"],
+            "preference",
+        );
+        let r7 = make_record(
+            "Vim-style key bindings make me productive in coding",
+            &["ui", "shortcuts"],
+            "preference",
+        );
 
         // Cluster 3: testing practices (different semantic_type)
-        let r8 = make_record("Always write unit tests before merging pull requests", &["testing", "workflow"], "decision");
-        let r9 = make_record("Every pull request must have unit test coverage", &["testing", "workflow"], "decision");
-        let r10 = make_record("Test-driven development is my standard workflow approach", &["testing", "workflow"], "decision");
+        let r8 = make_record(
+            "Always write unit tests before merging pull requests",
+            &["testing", "workflow"],
+            "decision",
+        );
+        let r9 = make_record(
+            "Every pull request must have unit test coverage",
+            &["testing", "workflow"],
+            "decision",
+        );
+        let r10 = make_record(
+            "Test-driven development is my standard workflow approach",
+            &["testing", "workflow"],
+            "decision",
+        );
 
         for r in [&r1, &r2, &r3, &r4, &r5, &r6, &r7, &r8, &r9, &r10] {
             records.insert(r.id.clone(), r.clone());
@@ -1454,19 +2038,36 @@ mod tests {
     #[test]
     fn test_extract_terms_core_and_shell() {
         let r1 = make_record("dark mode is great for coding at night", &["ui"], "fact");
-        let r2 = make_record("dark mode helps reduce eye strain while coding", &["ui"], "fact");
-        let r3 = make_record("dark mode is my preference for development work", &["ui"], "fact");
+        let r2 = make_record(
+            "dark mode helps reduce eye strain while coding",
+            &["ui"],
+            "fact",
+        );
+        let r3 = make_record(
+            "dark mode is my preference for development work",
+            &["ui"],
+            "fact",
+        );
 
         let records_vec: Vec<&Record> = vec![&r1, &r2, &r3];
         let (core, shell) = extract_terms(&records_vec);
 
         // "dark" and "mode" should appear in all 3 → core
-        assert!(core.contains(&"dark".to_string()), "core should contain 'dark': {:?}", core);
-        assert!(core.contains(&"mode".to_string()), "core should contain 'mode': {:?}", core);
+        assert!(
+            core.contains(&"dark".to_string()),
+            "core should contain 'dark': {:?}",
+            core
+        );
+        assert!(
+            core.contains(&"mode".to_string()),
+            "core should contain 'mode': {:?}",
+            core
+        );
 
         // "coding" appears in 2/3 → shell (0.67, below 0.70 core threshold)
         // or could be core if threshold is met; either way it shouldn't be missing
-        let in_core_or_shell = core.contains(&"coding".to_string()) || shell.contains(&"coding".to_string());
+        let in_core_or_shell =
+            core.contains(&"coding".to_string()) || shell.contains(&"coding".to_string());
         assert!(in_core_or_shell, "coding should be in core or shell");
     }
 
@@ -1482,7 +2083,9 @@ mod tests {
         let (belief_engine, records, sdr_lookup) = setup_test_scenario();
 
         // Verify we have some resolved beliefs
-        let resolved: Vec<_> = belief_engine.beliefs.values()
+        let resolved: Vec<_> = belief_engine
+            .beliefs
+            .values()
             .filter(|b| matches!(b.state, BeliefState::Resolved | BeliefState::Singleton))
             .collect();
         assert!(!resolved.is_empty(), "should have resolved beliefs");
@@ -1499,8 +2102,16 @@ mod tests {
         // Create records that will produce unresolved beliefs (conflicting)
         let mut records = HashMap::new();
 
-        let r1 = make_record("tabs are better than spaces for indentation in code", &["coding", "style"], "preference");
-        let mut r2 = make_record("spaces are better than tabs for indentation in code", &["coding", "style"], "contradiction");
+        let r1 = make_record(
+            "tabs are better than spaces for indentation in code",
+            &["coding", "style"],
+            "preference",
+        );
+        let mut r2 = make_record(
+            "spaces are better than tabs for indentation in code",
+            &["coding", "style"],
+            "contradiction",
+        );
         r2.conflict_mass = 3;
         r2.support_mass = 0;
 
@@ -1521,7 +2132,10 @@ mod tests {
         let report = concept_engine.discover(&belief_engine, &records, &sdr_lookup);
 
         // No seeds from unresolved beliefs
-        assert_eq!(report.seeds_found, 0, "unresolved beliefs should not seed concepts");
+        assert_eq!(
+            report.seeds_found, 0,
+            "unresolved beliefs should not seed concepts"
+        );
         assert_eq!(report.candidates_found, 0);
     }
 
@@ -1534,20 +2148,32 @@ mod tests {
 
         for concept in concept_engine.concepts.values() {
             // Every concept must have belief_ids
-            assert!(!concept.belief_ids.is_empty(),
-                "concept {} must have belief provenance", concept.id);
+            assert!(
+                !concept.belief_ids.is_empty(),
+                "concept {} must have belief provenance",
+                concept.id
+            );
             // Every concept must have record_ids
-            assert!(!concept.record_ids.is_empty(),
-                "concept {} must have record provenance", concept.id);
+            assert!(
+                !concept.record_ids.is_empty(),
+                "concept {} must have record provenance",
+                concept.id
+            );
             // All belief_ids must exist in the belief engine
             for bid in &concept.belief_ids {
-                assert!(belief_engine.beliefs.contains_key(bid),
-                    "concept references non-existent belief {}", bid);
+                assert!(
+                    belief_engine.beliefs.contains_key(bid),
+                    "concept references non-existent belief {}",
+                    bid
+                );
             }
             // All record_ids must exist in records
             for rid in &concept.record_ids {
-                assert!(records.contains_key(rid),
-                    "concept references non-existent record {}", rid);
+                assert!(
+                    records.contains_key(rid),
+                    "concept references non-existent record {}",
+                    rid
+                );
             }
         }
     }
@@ -1563,8 +2189,10 @@ mod tests {
         let report2 = engine2.discover(&belief_engine, &records, &sdr_lookup);
 
         // Same inputs → same outputs
-        assert_eq!(report1.candidates_found, report2.candidates_found,
-            "concept count should be stable across replays");
+        assert_eq!(
+            report1.candidates_found, report2.candidates_found,
+            "concept count should be stable across replays"
+        );
         assert_eq!(report1.stable_count, report2.stable_count);
         assert_eq!(report1.rejected_count, report2.rejected_count);
         assert!((report1.avg_abstraction_score - report2.avg_abstraction_score).abs() < 0.001);
@@ -1610,7 +2238,9 @@ mod tests {
             last_updated: now_secs(),
         };
         engine.concepts.insert(candidate.id.clone(), candidate);
-        engine.key_index.insert("test-key".to_string(), "c-test123".to_string());
+        engine
+            .key_index
+            .insert("test-key".to_string(), "c-test123".to_string());
 
         // Save works
         store.save(&engine).unwrap();
@@ -1633,8 +2263,10 @@ mod tests {
         // ConceptEngine should be empty (not loaded).
         // This verifies the design contract.
         let engine = ConceptEngine::new();
-        assert!(engine.concepts.is_empty(),
-            "fresh ConceptEngine must be empty — startup must not load stale concepts");
+        assert!(
+            engine.concepts.is_empty(),
+            "fresh ConceptEngine must be empty — startup must not load stale concepts"
+        );
         assert!(engine.key_index.is_empty());
     }
 
@@ -1643,14 +2275,38 @@ mod tests {
         let mut records = HashMap::new();
 
         // Topic A: database optimization
-        let r1 = make_record("Use database indexes for faster query performance optimization", &["database", "performance"], "decision");
-        let r2 = make_record("Database query optimization requires proper index configuration", &["database", "performance"], "decision");
-        let r3 = make_record("Add composite indexes to speed up database read operations", &["database", "performance"], "decision");
+        let r1 = make_record(
+            "Use database indexes for faster query performance optimization",
+            &["database", "performance"],
+            "decision",
+        );
+        let r2 = make_record(
+            "Database query optimization requires proper index configuration",
+            &["database", "performance"],
+            "decision",
+        );
+        let r3 = make_record(
+            "Add composite indexes to speed up database read operations",
+            &["database", "performance"],
+            "decision",
+        );
 
         // Topic B: UI accessibility (same tags won't match — different namespace-like tags)
-        let r4 = make_record("Ensure all buttons have accessible aria labels for screen readers", &["accessibility", "frontend"], "decision");
-        let r5 = make_record("Every interactive element needs aria labels for accessibility", &["accessibility", "frontend"], "decision");
-        let r6 = make_record("Screen reader compatibility requires proper aria label markup", &["accessibility", "frontend"], "decision");
+        let r4 = make_record(
+            "Ensure all buttons have accessible aria labels for screen readers",
+            &["accessibility", "frontend"],
+            "decision",
+        );
+        let r5 = make_record(
+            "Every interactive element needs aria labels for accessibility",
+            &["accessibility", "frontend"],
+            "decision",
+        );
+        let r6 = make_record(
+            "Screen reader compatibility requires proper aria label markup",
+            &["accessibility", "frontend"],
+            "decision",
+        );
 
         for r in [&r1, &r2, &r3, &r4, &r5, &r6] {
             records.insert(r.id.clone(), r.clone());
@@ -1668,28 +2324,49 @@ mod tests {
         // If any concepts formed, database and accessibility should NOT be in the same concept
         for concept in concept_engine.concepts.values() {
             let has_db = concept.record_ids.iter().any(|rid| {
-                records.get(rid).map_or(false, |r| r.tags.contains(&"database".to_string()))
+                records
+                    .get(rid)
+                    .map_or(false, |r| r.tags.contains(&"database".to_string()))
             });
             let has_a11y = concept.record_ids.iter().any(|rid| {
-                records.get(rid).map_or(false, |r| r.tags.contains(&"accessibility".to_string()))
+                records
+                    .get(rid)
+                    .map_or(false, |r| r.tags.contains(&"accessibility".to_string()))
             });
-            assert!(!(has_db && has_a11y),
-                "database and accessibility records should NOT merge into one concept");
+            assert!(
+                !(has_db && has_a11y),
+                "database and accessibility records should NOT merge into one concept"
+            );
         }
     }
 
     #[test]
     fn test_concept_core_extracts_shared_terms() {
-        let r1 = make_record("always run tests before deploying to production environment", &["ci"], "decision");
-        let r2 = make_record("run tests before every production deploy for safety", &["ci"], "decision");
-        let r3 = make_record("before deploying run all tests to verify production readiness", &["ci"], "decision");
+        let r1 = make_record(
+            "always run tests before deploying to production environment",
+            &["ci"],
+            "decision",
+        );
+        let r2 = make_record(
+            "run tests before every production deploy for safety",
+            &["ci"],
+            "decision",
+        );
+        let r3 = make_record(
+            "before deploying run all tests to verify production readiness",
+            &["ci"],
+            "decision",
+        );
 
         let refs: Vec<&Record> = vec![&r1, &r2, &r3];
         let (core, _shell) = extract_terms(&refs);
 
         // "tests", "production", "run", "before", "deploying"/"deploy" should be frequent
-        assert!(core.contains(&"tests".to_string()) || core.contains(&"run".to_string()),
-            "core should contain common terms: {:?}", core);
+        assert!(
+            core.contains(&"tests".to_string()) || core.contains(&"run".to_string()),
+            "core should contain common terms: {:?}",
+            core
+        );
     }
 
     #[test]
@@ -1708,19 +2385,43 @@ mod tests {
         let mut records = HashMap::new();
 
         // Namespace "prod" records
-        let mut r1 = make_record("Always deploy with canary release strategy", &["deploy", "safety"], "decision");
+        let mut r1 = make_record(
+            "Always deploy with canary release strategy",
+            &["deploy", "safety"],
+            "decision",
+        );
         r1.namespace = "prod".to_string();
-        let mut r2 = make_record("Canary deploys protect against production failures", &["deploy", "safety"], "decision");
+        let mut r2 = make_record(
+            "Canary deploys protect against production failures",
+            &["deploy", "safety"],
+            "decision",
+        );
         r2.namespace = "prod".to_string();
-        let mut r3 = make_record("Use canary release for safe production deployment", &["deploy", "safety"], "decision");
+        let mut r3 = make_record(
+            "Use canary release for safe production deployment",
+            &["deploy", "safety"],
+            "decision",
+        );
         r3.namespace = "prod".to_string();
 
         // Namespace "staging" records — same tags and semantic_type
-        let mut r4 = make_record("Deploy to staging with canary release strategy", &["deploy", "safety"], "decision");
+        let mut r4 = make_record(
+            "Deploy to staging with canary release strategy",
+            &["deploy", "safety"],
+            "decision",
+        );
         r4.namespace = "staging".to_string();
-        let mut r5 = make_record("Canary deploys in staging catch issues early", &["deploy", "safety"], "decision");
+        let mut r5 = make_record(
+            "Canary deploys in staging catch issues early",
+            &["deploy", "safety"],
+            "decision",
+        );
         r5.namespace = "staging".to_string();
-        let mut r6 = make_record("Use canary release for safe staging deployment", &["deploy", "safety"], "decision");
+        let mut r6 = make_record(
+            "Use canary release for safe staging deployment",
+            &["deploy", "safety"],
+            "decision",
+        );
         r6.namespace = "staging".to_string();
 
         for r in [&r1, &r2, &r3, &r4, &r5, &r6] {
@@ -1738,12 +2439,18 @@ mod tests {
 
         // No concept should contain records from both namespaces
         for concept in concept_engine.concepts.values() {
-            let namespaces: std::collections::HashSet<&str> = concept.record_ids.iter()
+            let namespaces: std::collections::HashSet<&str> = concept
+                .record_ids
+                .iter()
                 .filter_map(|rid| records.get(rid))
                 .map(|r| r.namespace.as_str())
                 .collect();
-            assert!(namespaces.len() <= 1,
-                "concept {} spans namespaces {:?} — cross-namespace merge!", concept.id, namespaces);
+            assert!(
+                namespaces.len() <= 1,
+                "concept {} spans namespaces {:?} — cross-namespace merge!",
+                concept.id,
+                namespaces
+            );
         }
     }
 
@@ -1752,14 +2459,38 @@ mod tests {
         let mut records = HashMap::new();
 
         // semantic_type "preference"
-        let r1 = make_record("Dark mode is my preferred editor theme for coding", &["ui", "editor"], "preference");
-        let r2 = make_record("I always use dark mode theme in my editor", &["ui", "editor"], "preference");
-        let r3 = make_record("Dark editor theme is best for my coding workflow", &["ui", "editor"], "preference");
+        let r1 = make_record(
+            "Dark mode is my preferred editor theme for coding",
+            &["ui", "editor"],
+            "preference",
+        );
+        let r2 = make_record(
+            "I always use dark mode theme in my editor",
+            &["ui", "editor"],
+            "preference",
+        );
+        let r3 = make_record(
+            "Dark editor theme is best for my coding workflow",
+            &["ui", "editor"],
+            "preference",
+        );
 
         // semantic_type "fact" — same tags
-        let r4 = make_record("Dark mode reduces eye strain according to research", &["ui", "editor"], "fact");
-        let r5 = make_record("Editor dark themes are popular among developers", &["ui", "editor"], "fact");
-        let r6 = make_record("Dark mode in code editors is a common configuration", &["ui", "editor"], "fact");
+        let r4 = make_record(
+            "Dark mode reduces eye strain according to research",
+            &["ui", "editor"],
+            "fact",
+        );
+        let r5 = make_record(
+            "Editor dark themes are popular among developers",
+            &["ui", "editor"],
+            "fact",
+        );
+        let r6 = make_record(
+            "Dark mode in code editors is a common configuration",
+            &["ui", "editor"],
+            "fact",
+        );
 
         for r in [&r1, &r2, &r3, &r4, &r5, &r6] {
             records.insert(r.id.clone(), r.clone());
@@ -1776,12 +2507,18 @@ mod tests {
 
         // No concept should contain records from both semantic types
         for concept in concept_engine.concepts.values() {
-            let types: std::collections::HashSet<&str> = concept.record_ids.iter()
+            let types: std::collections::HashSet<&str> = concept
+                .record_ids
+                .iter()
                 .filter_map(|rid| records.get(rid))
                 .map(|r| r.semantic_type.as_str())
                 .collect();
-            assert!(types.len() <= 1,
-                "concept {} spans semantic types {:?} — cross-type merge!", concept.id, types);
+            assert!(
+                types.len() <= 1,
+                "concept {} spans semantic types {:?} — cross-type merge!",
+                concept.id,
+                types
+            );
         }
     }
 
@@ -1789,12 +2526,36 @@ mod tests {
     fn test_concept_identity_stable_under_belief_growth() {
         // Setup: start with 3 beliefs worth of records
         let mut records = HashMap::new();
-        let r1 = make_record("Configure logging level to debug for troubleshooting", &["logging", "config"], "decision");
-        let r2 = make_record("Set debug log level when troubleshooting production issues", &["logging", "config"], "decision");
-        let r3 = make_record("Debug logging configuration helps diagnose issues faster", &["logging", "config"], "decision");
-        let r4 = make_record("Enable debug log level for production troubleshooting", &["logging", "config"], "decision");
-        let r5 = make_record("Logging at debug level reveals root cause of problems", &["logging", "config"], "decision");
-        let r6 = make_record("Always configure debug logging for production diagnostics", &["logging", "config"], "decision");
+        let r1 = make_record(
+            "Configure logging level to debug for troubleshooting",
+            &["logging", "config"],
+            "decision",
+        );
+        let r2 = make_record(
+            "Set debug log level when troubleshooting production issues",
+            &["logging", "config"],
+            "decision",
+        );
+        let r3 = make_record(
+            "Debug logging configuration helps diagnose issues faster",
+            &["logging", "config"],
+            "decision",
+        );
+        let r4 = make_record(
+            "Enable debug log level for production troubleshooting",
+            &["logging", "config"],
+            "decision",
+        );
+        let r5 = make_record(
+            "Logging at debug level reveals root cause of problems",
+            &["logging", "config"],
+            "decision",
+        );
+        let r6 = make_record(
+            "Always configure debug logging for production diagnostics",
+            &["logging", "config"],
+            "decision",
+        );
 
         for r in [&r1, &r2, &r3, &r4, &r5, &r6] {
             records.insert(r.id.clone(), r.clone());
@@ -1808,12 +2569,15 @@ mod tests {
 
         let mut engine1 = ConceptEngine::new();
         engine1.discover(&belief_engine, &records, &sdr_lookup);
-        let keys1: std::collections::HashSet<String> = engine1.concepts.values()
-            .map(|c| c.key.clone())
-            .collect();
+        let keys1: std::collections::HashSet<String> =
+            engine1.concepts.values().map(|c| c.key.clone()).collect();
 
         // Now add one more supporting record (minor belief growth)
-        let r7 = make_record("Use debug log level when diagnosing production failures", &["logging", "config"], "decision");
+        let r7 = make_record(
+            "Use debug log level when diagnosing production failures",
+            &["logging", "config"],
+            "decision",
+        );
         records.insert(r7.id.clone(), r7.clone());
         let mut sdr_lookup2 = build_sdr_lookup(&records);
         // Merge old SDR entries to keep consistency
@@ -1828,9 +2592,8 @@ mod tests {
 
         let mut engine2 = ConceptEngine::new();
         engine2.discover(&belief_engine2, &records, &sdr_lookup2);
-        let keys2: std::collections::HashSet<String> = engine2.concepts.values()
-            .map(|c| c.key.clone())
-            .collect();
+        let keys2: std::collections::HashSet<String> =
+            engine2.concepts.values().map(|c| c.key.clone()).collect();
 
         // Concept keys should be stable — adding one more record to an existing
         // cluster should not create a completely different concept
@@ -1839,9 +2602,14 @@ mod tests {
             // At least some keys should overlap
             let overlap = keys1.intersection(&keys2).count();
             // If keys changed, the concept count should still be similar
-            let count_diff = (engine1.concepts.len() as i32 - engine2.concepts.len() as i32).unsigned_abs();
-            assert!(overlap > 0 || count_diff <= 1,
-                "concept identity unstable: keys1={:?}, keys2={:?}", keys1, keys2);
+            let count_diff =
+                (engine1.concepts.len() as i32 - engine2.concepts.len() as i32).unsigned_abs();
+            assert!(
+                overlap > 0 || count_diff <= 1,
+                "concept identity unstable: keys1={:?}, keys2={:?}",
+                keys1,
+                keys2
+            );
         }
     }
 
@@ -1862,6 +2630,61 @@ mod tests {
     }
 
     #[test]
+    fn test_partition_seeds_standard_keeps_semantic_types_separate() {
+        let mut concept_engine = ConceptEngine::new();
+        concept_engine.partition_mode = ConceptPartitionMode::Standard;
+
+        let b1 = Belief::new("default:deploy:decision".into());
+        let b2 = Belief::new("default:deploy:fact".into());
+
+        let mut belief_engine = BeliefEngine::new();
+        belief_engine
+            .key_index
+            .insert(b1.key.clone(), b1.id.clone());
+        belief_engine
+            .key_index
+            .insert(b2.key.clone(), b2.id.clone());
+        belief_engine.beliefs.insert(b1.id.clone(), b1.clone());
+        belief_engine.beliefs.insert(b2.id.clone(), b2.clone());
+
+        let partitions =
+            concept_engine.partition_seeds(&[b1.id.clone(), b2.id.clone()], &belief_engine);
+        assert_eq!(
+            partitions.len(),
+            2,
+            "Standard partitioning should keep decision and fact apart"
+        );
+    }
+
+    #[test]
+    fn test_partition_seeds_namespace_only_merges_semantic_types_within_namespace() {
+        let mut concept_engine = ConceptEngine::new();
+        concept_engine.partition_mode = ConceptPartitionMode::NamespaceOnly;
+
+        let b1 = Belief::new("default:deploy:decision".into());
+        let b2 = Belief::new("default:deploy:fact".into());
+
+        let mut belief_engine = BeliefEngine::new();
+        belief_engine
+            .key_index
+            .insert(b1.key.clone(), b1.id.clone());
+        belief_engine
+            .key_index
+            .insert(b2.key.clone(), b2.id.clone());
+        belief_engine.beliefs.insert(b1.id.clone(), b1.clone());
+        belief_engine.beliefs.insert(b2.id.clone(), b2.clone());
+
+        let partitions =
+            concept_engine.partition_seeds(&[b1.id.clone(), b2.id.clone()], &belief_engine);
+        assert_eq!(
+            partitions.len(),
+            1,
+            "NamespaceOnly should merge same-namespace semantic variants"
+        );
+        assert_eq!(partitions.get("default").map(|v| v.len()), Some(2));
+    }
+
+    #[test]
     fn test_concept_key_does_not_use_belief_ids() {
         // Same abstraction features should produce same key regardless of belief_ids
         let tags = vec!["ui".to_string()];
@@ -1874,10 +2697,35 @@ mod tests {
 
         // Different namespace → different key
         let key3 = concept_key("staging", "preference", &tags, &core_terms, &[&centroid]);
-        assert_ne!(key1, key3, "different namespace should produce different key");
+        assert_ne!(
+            key1, key3,
+            "different namespace should produce different key"
+        );
 
         // Different semantic_type → different key
         let key4 = concept_key("default", "fact", &tags, &core_terms, &[&centroid]);
-        assert_ne!(key1, key4, "different semantic_type should produce different key");
+        assert_ne!(
+            key1, key4,
+            "different semantic_type should produce different key"
+        );
+    }
+
+    #[test]
+    fn test_concept_identity_strips_belief_subcluster_suffix() {
+        let (ns, st) = parse_belief_key_ns_st("default:editor,theme:preference#6");
+        let tags = vec!["editor".to_string(), "theme".to_string()];
+        let core_terms = vec!["dark".to_string(), "theme".to_string()];
+        let centroid = vec![10u16, 20, 30];
+
+        let key = concept_key(&ns, &st, &tags, &core_terms, &[&centroid]);
+
+        assert!(
+            !key.contains("preference#6"),
+            "concept key should not preserve belief subcluster suffixes"
+        );
+        assert!(
+            key.contains(":preference:"),
+            "concept key should keep only the base semantic type"
+        );
     }
 }

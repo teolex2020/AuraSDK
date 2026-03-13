@@ -15,10 +15,10 @@
 //! 2. **Testing** — fast in-memory backends without disk I/O
 //! 3. **Custom backends** — e.g. S3, IndexedDB, or SQLite-based storage
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use anyhow::Result;
 use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Metadata about a stored file.
 #[derive(Debug, Clone)]
@@ -111,7 +111,8 @@ impl StorageBackend for FsBackend {
     }
 
     fn read_to_string(&self, path: &str) -> Result<String> {
-        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read_to_string '{}': {}", path, e))
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("read_to_string '{}': {}", path, e))
     }
 
     fn write(&self, path: &str, data: &[u8]) -> Result<()> {
@@ -125,7 +126,8 @@ impl StorageBackend for FsBackend {
             .append(true)
             .open(path)
             .map_err(|e| anyhow::anyhow!("append open '{}': {}", path, e))?;
-        file.write_all(data).map_err(|e| anyhow::anyhow!("append write '{}': {}", path, e))
+        file.write_all(data)
+            .map_err(|e| anyhow::anyhow!("append write '{}': {}", path, e))
     }
 
     fn exists(&self, path: &str) -> bool {
@@ -137,7 +139,8 @@ impl StorageBackend for FsBackend {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<()> {
-        std::fs::rename(from, to).map_err(|e| anyhow::anyhow!("rename '{}' -> '{}': {}", from, to, e))
+        std::fs::rename(from, to)
+            .map_err(|e| anyhow::anyhow!("rename '{}' -> '{}': {}", from, to, e))
     }
 
     fn metadata(&self, path: &str) -> Result<FileMetadata> {
@@ -155,12 +158,16 @@ impl StorageBackend for FsBackend {
     }
 
     fn create_dir_all(&self, path: &str) -> Result<()> {
-        std::fs::create_dir_all(path).map_err(|e| anyhow::anyhow!("create_dir_all '{}': {}", path, e))
+        std::fs::create_dir_all(path)
+            .map_err(|e| anyhow::anyhow!("create_dir_all '{}': {}", path, e))
     }
 
     fn list_dir(&self, path: &str) -> Result<Vec<String>> {
         let mut entries = Vec::new();
-        for entry in std::fs::read_dir(path).map_err(|e| anyhow::anyhow!("list_dir '{}': {}", path, e))?.flatten() {
+        for entry in std::fs::read_dir(path)
+            .map_err(|e| anyhow::anyhow!("list_dir '{}': {}", path, e))?
+            .flatten()
+        {
             if let Some(name) = entry.file_name().to_str() {
                 entries.push(name.to_string());
             }
@@ -171,7 +178,8 @@ impl StorageBackend for FsBackend {
     fn sync(&self, path: &str) -> Result<()> {
         // Open the file just to call sync_all
         if let Ok(file) = std::fs::File::open(path) {
-            file.sync_all().map_err(|e| anyhow::anyhow!("sync '{}': {}", path, e))?;
+            file.sync_all()
+                .map_err(|e| anyhow::anyhow!("sync '{}': {}", path, e))?;
         }
         Ok(())
     }

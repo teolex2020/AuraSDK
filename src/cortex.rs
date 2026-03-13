@@ -1,11 +1,11 @@
 //! # Active Cortex — Hot-Path Reflex Layer
-//! 
+//!
 //! This module implements a lock-free, O(1) cache for high-priority "Anchor" memories.
 //! It sits above the main SDR index and provides sub-millisecond access to critical
 //! motor reflexes, regardless of how many records exist in the cold storage.
-//! 
+//!
 //! ## Architecture
-//! 
+//!
 //! ```text
 //! ┌─────────────────────────────────────────────────┐
 //! │                 User Query                       │
@@ -25,9 +25,9 @@
 //! │          Full semantic search                   │
 //! └─────────────────────────────────────────────────┘
 //! ```
-//! 
+//!
 //! ## Patent Alignment
-//! 
+//!
 //! This implements the "hierarchical cognitive memory" concept:
 //! - L1 (Active Cortex): Crystallized reflexes for motor control
 //! - L2 (Cold Storage): Full semantic memory with SDR matching
@@ -70,7 +70,7 @@ impl ReflexPayload {
 }
 
 /// Lock-free hot-path cache for critical anchor memories.
-/// 
+///
 /// Uses DashMap for fully concurrent reads/writes without blocking.
 /// Provides O(1) lookup via SDR signature hashing.
 pub struct ActiveCortex {
@@ -104,7 +104,7 @@ impl ActiveCortex {
     }
 
     /// Insert an anchor into the Active Cortex.
-    /// 
+    ///
     /// Only call this for high-priority anchors (SFT, motor reflexes, identity).
     /// Automatic LRU eviction occurs if capacity is exceeded.
     pub fn insert(&self, sdr_indices: &[u32], payload: ReflexPayload) {
@@ -118,12 +118,12 @@ impl ActiveCortex {
     }
 
     /// Fast reflex lookup — O(1), lock-free.
-    /// 
+    ///
     /// Returns Some(payload) if the anchor is in the cortex, None otherwise.
     /// On miss, caller should fall back to the cold SDR index.
     pub fn get_reflex(&self, sdr_indices: &[u32]) -> Option<ReflexPayload> {
         let signature = Self::sdr_to_signature(sdr_indices);
-        
+
         if let Some(mut entry) = self.hot_path.get_mut(&signature) {
             // Update access count for LRU
             entry.access_count = self.global_access.fetch_add(1, Ordering::Relaxed);
@@ -153,16 +153,17 @@ impl ActiveCortex {
     /// Removes 10% of entries with lowest access counts.
     fn evict_lru(&self) {
         let evict_count = MAX_CORTEX_ENTRIES / 10;
-        
+
         // Collect all entries with their access counts
-        let mut entries: Vec<(u64, u64)> = self.hot_path
+        let mut entries: Vec<(u64, u64)> = self
+            .hot_path
             .iter()
             .map(|e| (*e.key(), e.value().access_count))
             .collect();
-        
+
         // Sort by access count (ascending)
         entries.sort_by_key(|(_, count)| *count);
-        
+
         // Evict the oldest entries
         for (key, _) in entries.into_iter().take(evict_count) {
             self.hot_path.remove(&key);
@@ -234,9 +235,9 @@ mod tests {
             Some((10.0, 20.0, 30.0)),
             42,
         );
-        
+
         cortex.insert(&sdr, payload.clone());
-        
+
         let result = cortex.get_reflex(&sdr).unwrap();
         assert_eq!(result.text, "Motor reflex: grip");
         assert_eq!(result.intensity, 0.95);
@@ -247,7 +248,7 @@ mod tests {
     fn test_miss_returns_none() {
         let cortex = ActiveCortex::new();
         let sdr = vec![1, 2, 3];
-        
+
         assert!(cortex.get_reflex(&sdr).is_none());
     }
 
@@ -256,14 +257,14 @@ mod tests {
         let cortex = ActiveCortex::new();
         let sdr = vec![1, 2, 3];
         let payload = ReflexPayload::new("test".to_string(), 0.5, None, 1);
-        
+
         cortex.insert(&sdr, payload);
-        
+
         // 1 hit
         cortex.get_reflex(&sdr);
         // 1 miss
         cortex.get_reflex(&vec![4, 5, 6]);
-        
+
         assert_eq!(cortex.hit_rate(), 0.5);
     }
 }

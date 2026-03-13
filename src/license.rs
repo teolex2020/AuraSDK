@@ -1,8 +1,8 @@
 //! Universal Shield License Enforcement
-//! 
+//!
 //! Verifies distinct license files signed by the Administrator's Private Key.
 //! This allows a single binary to serve multiple clients with different restrictions.
-//! 
+//!
 //! Mechanism:
 //! 1. Load `license.lic` (JSON: payload + signature)
 //! 2. Verify signature using embedded PRODUCT_PUBLIC_KEY
@@ -10,14 +10,14 @@
 //! 4. Check HWID against local hardware
 //! 5. Check Expiry against current date
 
-use sha2::{Sha256, Digest};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{NaiveDate, Utc};
-use std::fs;
-use std::env;
-use std::path::Path;
-use ed25519_dalek::{Verifier, VerifyingKey, Signature};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::env;
+use std::fs;
+use std::path::Path;
 
 // =============================================================================
 // CRYPTO CONFIGURATION (Injected at build time by build_shark.ps1)
@@ -54,11 +54,14 @@ struct LicensePayload {
 
 pub fn get_system_id() -> String {
     let mut components: Vec<String> = Vec::new();
-    
+
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
-        if let Ok(output) = Command::new("wmic").args(["cpu", "get", "processorid"]).output() {
+        if let Ok(output) = Command::new("wmic")
+            .args(["cpu", "get", "processorid"])
+            .output()
+        {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 let trimmed = line.trim();
@@ -68,7 +71,10 @@ pub fn get_system_id() -> String {
                 }
             }
         }
-        if let Ok(output) = Command::new("wmic").args(["baseboard", "get", "serialnumber"]).output() {
+        if let Ok(output) = Command::new("wmic")
+            .args(["baseboard", "get", "serialnumber"])
+            .output()
+        {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 let trimmed = line.trim();
@@ -78,7 +84,15 @@ pub fn get_system_id() -> String {
                 }
             }
         }
-        if let Ok(output) = Command::new("reg").args(["query", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"]).output() {
+        if let Ok(output) = Command::new("reg")
+            .args([
+                "query",
+                r"HKLM\SOFTWARE\Microsoft\Cryptography",
+                "/v",
+                "MachineGuid",
+            ])
+            .output()
+        {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 if line.contains("MachineGuid") {
@@ -89,20 +103,20 @@ pub fn get_system_id() -> String {
             }
         }
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         if let Ok(machine_id) = fs::read_to_string("/etc/machine-id") {
             components.push(format!("MID:{}", machine_id.trim()));
         }
     }
-    
+
     if components.is_empty() {
         if let Ok(hostname) = env::var("COMPUTERNAME").or_else(|_| env::var("HOSTNAME")) {
             components.push(format!("HOST:{}", hostname));
         }
     }
-    
+
     let combined = components.join("|");
     let mut hasher = Sha256::new();
     hasher.update(combined.as_bytes());
@@ -122,7 +136,10 @@ pub fn enforce_license() {
     // 2. Load License File
     let license_path = env::var("AURA_LICENSE_PATH").unwrap_or_else(|_| "license.lic".to_string());
     if !Path::new(&license_path).exists() {
-        die("LICENSE FILE MISSING", &format!("Could not find '{}'.", license_path));
+        die(
+            "LICENSE FILE MISSING",
+            &format!("Could not find '{}'.", license_path),
+        );
     }
 
     let license_content = match fs::read_to_string(&license_path) {
@@ -140,7 +157,7 @@ pub fn enforce_license() {
         Ok(b) => b,
         Err(_) => die("INTERNAL ERROR", "Embedded public key is invalid."),
     };
-    
+
     let pub_key_arr: [u8; 32] = match pub_key_bytes.as_slice().try_into() {
         Ok(arr) => arr,
         Err(_) => die("INTERNAL ERROR", "Embedded public key must be 32 bytes."),
@@ -154,10 +171,13 @@ pub fn enforce_license() {
         Ok(b) => b,
         Err(_) => die("INVALID SIGNATURE", "Signature encoding error."),
     };
-    
+
     let sig_arr: [u8; 64] = match sig_bytes.as_slice().try_into() {
         Ok(arr) => arr,
-        Err(_) => die("INVALID SIGNATURE", "Signature length invalid (must be 64 bytes)."),
+        Err(_) => die(
+            "INVALID SIGNATURE",
+            "Signature length invalid (must be 64 bytes).",
+        ),
     };
     let signature = Signature::from_bytes(&sig_arr);
 
@@ -166,9 +186,12 @@ pub fn enforce_license() {
         Ok(b) => b,
         Err(_) => die("PAYLOAD ERROR", "Could not decode license payload."),
     };
-    
+
     if verifying_key.verify(&json_bytes, &signature).is_err() {
-        die("SECURITY ALERT", "License signature verification failed!\nThis file has been tampered with.");
+        die(
+            "SECURITY ALERT",
+            "License signature verification failed!\nThis file has been tampered with.",
+        );
     }
 
     let payload: LicensePayload = match serde_json::from_slice(&json_bytes) {
@@ -179,10 +202,15 @@ pub fn enforce_license() {
     // 5. Check Requirements
     let current_hwid = get_system_id();
     if payload.hwid != current_hwid {
-        die("UNAUTHORIZED HARDWARE", &format!(
-            "License Host: {}...\nSystem Host:  {}...\nClient: {}",
-            &payload.hwid[..12], &current_hwid[..12], payload.client
-        ));
+        die(
+            "UNAUTHORIZED HARDWARE",
+            &format!(
+                "License Host: {}...\nSystem Host:  {}...\nClient: {}",
+                &payload.hwid[..12],
+                &current_hwid[..12],
+                payload.client
+            ),
+        );
     }
 
     if payload.expiry != "PERMANENT" {
@@ -191,27 +219,29 @@ pub fn enforce_license() {
             Err(_) => match datetime_iso(&payload.expiry) {
                 Some(d) => d,
                 None => die("DATE ERROR", "Invalid expiry date format."),
-            }
+            },
         };
 
         let today = Utc::now().date_naive();
         if today > expiry_date {
-            die("LICENSE EXPIRED", &format!(
-                "Expired on: {}\nClient: {}",
-                payload.expiry, payload.client
-            ));
+            die(
+                "LICENSE EXPIRED",
+                &format!("Expired on: {}\nClient: {}", payload.expiry, payload.client),
+            );
         }
-        
+
         let days = (expiry_date - today).num_days();
         if days <= 7 {
-             eprintln!("[WARNING] License expires in {} days.", days);
+            eprintln!("[WARNING] License expires in {} days.", days);
         }
     }
 }
 
 fn datetime_iso(s: &str) -> Option<NaiveDate> {
     // Handle ISO format if full datetime provided
-    s.split('T').next().and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+    s.split('T')
+        .next()
+        .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
 }
 
 fn die(title: &str, msg: &str) -> ! {
@@ -227,7 +257,7 @@ fn die(title: &str, msg: &str) -> ! {
 
 // Helper for other modules
 pub fn get_license_info() -> LicenseInfo {
-     LicenseInfo {
+    LicenseInfo {
         hardware_bound: !PRODUCT_PUBLIC_KEY_HEX.starts_with("{{"),
         is_development: PRODUCT_PUBLIC_KEY_HEX.starts_with("{{"),
     }

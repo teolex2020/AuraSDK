@@ -55,10 +55,7 @@ fn level_from_u8(v: u8) -> Option<Level> {
 ///
 /// Returns an opaque handle, or NULL on error (check `out_error`).
 #[no_mangle]
-pub extern "C" fn aura_open(
-    path: *const c_char,
-    out_error: *mut *mut c_char,
-) -> AuraHandle {
+pub extern "C" fn aura_open(path: *const c_char, out_error: *mut *mut c_char) -> AuraHandle {
     let path_str = match cstr_to_str(path) {
         Some(s) => s,
         None => {
@@ -168,16 +165,31 @@ pub extern "C" fn aura_store(
         }
     };
 
-    let lv = if level == 0 { None } else { level_from_u8(level) };
+    let lv = if level == 0 {
+        None
+    } else {
+        level_from_u8(level)
+    };
 
-    let tags: Option<Vec<String>> = cstr_to_str(tags_json).and_then(|s| {
-        serde_json::from_str(s).ok()
-    });
+    let tags: Option<Vec<String>> =
+        cstr_to_str(tags_json).and_then(|s| serde_json::from_str(s).ok());
 
     let ns = cstr_to_str(namespace);
 
     match aura.store_with_channel(
-        content_str, lv, tags, None, None, None, None, None, None, None, None, ns, None,
+        content_str,
+        lv,
+        tags,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ns,
+        None,
     ) {
         Ok(rec) => match CString::new(rec.id.as_str()) {
             Ok(c) => c.into_raw(),
@@ -220,7 +232,11 @@ pub extern "C" fn aura_recall(
         }
     };
 
-    let budget = if token_budget > 0 { Some(token_budget as usize) } else { None };
+    let budget = if token_budget > 0 {
+        Some(token_budget as usize)
+    } else {
+        None
+    };
 
     match aura.recall(query_str, budget, None, None, None, None) {
         Ok(text) => match CString::new(text) {
@@ -262,7 +278,11 @@ pub extern "C" fn aura_recall_structured(
         }
     };
 
-    let k = if top_k > 0 { Some(top_k as usize) } else { None };
+    let k = if top_k > 0 {
+        Some(top_k as usize)
+    } else {
+        None
+    };
 
     match aura.recall_structured(query_str, k, None, None, None, None) {
         Ok(results) => {
@@ -307,10 +327,7 @@ pub extern "C" fn aura_recall_structured(
 
 /// Run a full maintenance cycle. Returns 0 on success, -1 on error.
 #[no_mangle]
-pub extern "C" fn aura_run_maintenance(
-    handle: AuraHandle,
-    out_error: *mut *mut c_char,
-) -> i32 {
+pub extern "C" fn aura_run_maintenance(handle: AuraHandle, out_error: *mut *mut c_char) -> i32 {
     if handle.is_null() {
         set_error(out_error, "handle is null");
         return -1;

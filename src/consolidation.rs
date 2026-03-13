@@ -2,11 +2,11 @@
 //!
 //! Rewritten from aura-cognitive memory.py consolidate().
 
-use std::collections::{HashMap, HashSet};
-use crate::record::Record;
-use crate::ngram::NGramIndex;
 use crate::cognitive_store::CognitiveStore;
 use crate::graph;
+use crate::ngram::NGramIndex;
+use crate::record::Record;
+use std::collections::{HashMap, HashSet};
 
 /// Hard merge threshold — no LLM needed.
 pub const CONSOLIDATION_THRESHOLD: f32 = 0.85;
@@ -34,13 +34,15 @@ pub fn consolidate(
     let mut result = ConsolidationResult::default();
 
     // Build namespace lookup for O(1) filtering
-    let ns_map: HashMap<&str, &str> = records.iter()
+    let ns_map: HashMap<&str, &str> = records
+        .iter()
         .map(|(id, r)| (id.as_str(), r.namespace.as_str()))
         .collect();
 
     // Find similar pairs (global MinHash) and pre-filter to same-namespace only
     let all_pairs = ngram_index.find_similar_pairs(CONSOLIDATION_THRESHOLD);
-    let pairs: Vec<_> = all_pairs.into_iter()
+    let pairs: Vec<_> = all_pairs
+        .into_iter()
         .filter(|(id_a, id_b, _)| ns_map.get(id_a.as_str()) == ns_map.get(id_b.as_str()))
         .collect();
     result.checked = pairs.len();

@@ -6,16 +6,16 @@
 //! - Per-namespace permissions
 //! - Token validation with expiry
 
+use anyhow::{anyhow, Result};
+use hmac::{Hmac, Mac};
+use parking_lot::RwLock;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use anyhow::{anyhow, Result};
-use parking_lot::RwLock;
-use serde::{Serialize, Deserialize};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use rand::RngCore;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -35,15 +35,12 @@ impl Role {
     /// Check if role can perform an action
     pub fn can_perform(&self, action: &Action) -> bool {
         match self {
-            Role::Admin => true,  // Admin can do everything
+            Role::Admin => true, // Admin can do everything
             Role::Writer => matches!(
                 action,
                 Action::Read | Action::Write | Action::Delete | Action::Search
             ),
-            Role::Reader => matches!(
-                action,
-                Action::Read | Action::Search
-            ),
+            Role::Reader => matches!(action, Action::Read | Action::Search),
         }
     }
 
@@ -268,7 +265,7 @@ impl AccessControl {
         let expires_at = if let Some(days) = expires_in_days {
             now + (days as u64 * 24 * 60 * 60 * 1000)
         } else {
-            0  // Never expires
+            0 // Never expires
         };
 
         let api_key = ApiKey {
@@ -322,8 +319,8 @@ impl AccessControl {
 
     /// Hash a key using HMAC-SHA256
     fn hash_key(&self, key: &str) -> String {
-        let mut mac: HmacSha256 = Mac::new_from_slice(&self.secret)
-            .expect("HMAC can take key of any size");
+        let mut mac: HmacSha256 =
+            Mac::new_from_slice(&self.secret).expect("HMAC can take key of any size");
         mac.update(key.as_bytes());
         let result = mac.finalize();
         hex::encode(result.into_bytes())
@@ -340,7 +337,11 @@ impl AccessControl {
             return AuthResult::failure("Invalid key format");
         }
 
-        let key_id = format!("{}_{}", parts[0], parts[1].chars().take(16).collect::<String>());
+        let key_id = format!(
+            "{}_{}",
+            parts[0],
+            parts[1].chars().take(16).collect::<String>()
+        );
 
         // Lookup key
         let guard = self.keys.read();
@@ -557,12 +558,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let ac = AccessControl::new(dir.path()).unwrap();
 
-        let (_key_id, full_key) = ac.create_key_for_tenant(
-            "Tenant User",
-            Role::Writer,
-            "acme",
-            None
-        ).unwrap();
+        let (_key_id, full_key) = ac
+            .create_key_for_tenant("Tenant User", Role::Writer, "acme", None)
+            .unwrap();
 
         let result = ac.authenticate(&full_key);
         assert!(result.success);
@@ -584,7 +582,7 @@ mod tests {
         {
             let mut guard = ac.keys.write();
             if let Some(key) = guard.get_mut(&key_id) {
-                key.expires_at = 1;  // Expired in 1970
+                key.expires_at = 1; // Expired in 1970
             }
         }
 
@@ -618,24 +616,26 @@ mod tests {
         let dir = tempdir().unwrap();
         let ac = AccessControl::new(dir.path()).unwrap();
 
-        let (_, full_key) = ac.create_key_for_tenant(
-            "Limited",
-            Role::Reader,
-            "allowed_tenant",
-            None
-        ).unwrap();
+        let (_, full_key) = ac
+            .create_key_for_tenant("Limited", Role::Reader, "allowed_tenant", None)
+            .unwrap();
 
         let result = ac.authenticate(&full_key);
         let key = result.key.unwrap();
 
         // Should succeed
-        ac.authorize(&key, Action::Read, Some("allowed_tenant")).unwrap();
+        ac.authorize(&key, Action::Read, Some("allowed_tenant"))
+            .unwrap();
 
         // Should fail - wrong action
-        assert!(ac.authorize(&key, Action::Write, Some("allowed_tenant")).is_err());
+        assert!(ac
+            .authorize(&key, Action::Write, Some("allowed_tenant"))
+            .is_err());
 
         // Should fail - wrong tenant
-        assert!(ac.authorize(&key, Action::Read, Some("other_tenant")).is_err());
+        assert!(ac
+            .authorize(&key, Action::Read, Some("other_tenant"))
+            .is_err());
     }
 
     #[test]

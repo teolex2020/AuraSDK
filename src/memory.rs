@@ -1,25 +1,25 @@
+use anyhow::Result;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use anyhow::Result;
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use crate::storage::{AuraStorage, StoredRecord};
-use crate::index::InvertedIndex;
-use crate::sdr::SDRInterpreter;
-use crate::salience::SalienceScorer;
 use crate::anchors::AnchorManager;
-use crate::cortex::{ActiveCortex, ReflexPayload};
-use crate::types::{AuraSynapse, Pulse, Flux};
-use crate::crypto::EncryptionKey;
 use crate::canonical::CanonicalProjector;
-use crate::learner::{SemanticLearner, LearnerConfig, LearningReport};
+use crate::cortex::{ActiveCortex, ReflexPayload};
+use crate::crypto::EncryptionKey;
+use crate::index::InvertedIndex;
+use crate::learner::{LearnerConfig, LearningReport, SemanticLearner};
+use crate::salience::SalienceScorer;
+use crate::sdr::SDRInterpreter;
+use crate::storage::{AuraStorage, StoredRecord};
 #[cfg(feature = "sync")]
 use crate::sync::{SdrFingerprint, SdrPrivacyConfig};
+use crate::types::{AuraSynapse, Flux, Pulse};
 
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
-use crossbeam_channel::{Sender, Receiver, bounded};
+use crossbeam_channel::{bounded, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // ═══════════════════════════════════════════════════════════════════════
 // RRF — Reciprocal Rank Fusion (Cormack, Clarke & Büttcher, SIGIR 2009)
@@ -54,12 +54,15 @@ fn rrf_rank(candidates: &[(f32, f64)]) -> Vec<(usize, f32)> {
 
     // Rank by recency (descending timestamp = most recent first)
     let mut by_recency: Vec<usize> = (0..n).collect();
-    by_recency.sort_unstable_by(|&a, &b| candidates[b].1.partial_cmp(&candidates[a].1).unwrap_or(std::cmp::Ordering::Equal));
+    by_recency.sort_unstable_by(|&a, &b| {
+        candidates[b]
+            .1
+            .partial_cmp(&candidates[a].1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Final score = relevance + α * RRF_recency
-    let mut scores: Vec<(usize, f32)> = (0..n)
-        .map(|i| (i, candidates[i].0))
-        .collect();
+    let mut scores: Vec<(usize, f32)> = (0..n).map(|i| (i, candidates[i].0)).collect();
 
     for (rank_0, &idx) in by_recency.iter().enumerate() {
         scores[idx].1 += RECENCY_WEIGHT / (RRF_K + (rank_0 + 1) as f32);
@@ -133,7 +136,7 @@ impl EncryptionConfig {
 pub struct AuraMemory {
     storage: Arc<AuraStorage>,
     index: Arc<InvertedIndex>,
-    cortex: ActiveCortex,  // Hot-path reflex cache
+    cortex: ActiveCortex, // Hot-path reflex cache
     sdr: SDRInterpreter,
     salience: SalienceScorer,
     anchors: AnchorManager,
@@ -173,7 +176,7 @@ impl AuraMemory {
     pub fn index(&self) -> Arc<InvertedIndex> {
         self.index.clone()
     }
-    
+
     pub fn sdr(&self) -> &SDRInterpreter {
         &self.sdr
     }
@@ -259,7 +262,15 @@ impl AuraMemory {
         let handle = std::thread::Builder::new()
             .name("aura-consolidation".into())
             .spawn(move || {
-                Self::consolidation_loop(rx, bg_storage, bg_sdr, bg_active, bg_pending, bg_p_decays, bg_p_immune);
+                Self::consolidation_loop(
+                    rx,
+                    bg_storage,
+                    bg_sdr,
+                    bg_active,
+                    bg_pending,
+                    bg_p_decays,
+                    bg_p_immune,
+                );
             })
             .expect("Failed to spawn consolidation thread");
 
@@ -312,7 +323,11 @@ impl AuraMemory {
     pub fn load_synonyms(&mut self, path: &Path) -> Result<usize> {
         let p = CanonicalProjector::load(path)?;
         let count = p.len();
-        tracing::info!("Loaded canonical projection ({} entries) from {:?}", count, path);
+        tracing::info!(
+            "Loaded canonical projection ({} entries) from {:?}",
+            count,
+            path
+        );
         self.projector = Some(Arc::new(p));
         Ok(count)
     }
@@ -348,7 +363,9 @@ impl AuraMemory {
     /// Run one learning cycle. Returns a report of what was discovered.
     /// Call this periodically (e.g., daily) or when the system is idle.
     pub fn run_learning_cycle(&self) -> Result<LearningReport> {
-        let learner = self.learner.as_ref()
+        let learner = self
+            .learner
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Learner not enabled. Call enable_learner() first."))?;
         learner.run_cycle(&self.storage)
     }
@@ -356,7 +373,9 @@ impl AuraMemory {
     /// Seed the learner with manual synonym pairs.
     /// Returns the number of new pairs added.
     pub fn seed_learner(&self, pairs: &[(&str, &str)]) -> Result<usize> {
-        let learner = self.learner.as_ref()
+        let learner = self
+            .learner
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Learner not enabled. Call enable_learner() first."))?;
         Ok(learner.seed(pairs))
     }
@@ -364,7 +383,11 @@ impl AuraMemory {
     /// Get learner statistics: (active_pairs, total_pairs, total_cycles)
     pub fn learner_stats(&self) -> (usize, usize, u64) {
         match &self.learner {
-            Some(l) => (l.active_pair_count(), l.total_pair_count(), l.total_cycles()),
+            Some(l) => (
+                l.active_pair_count(),
+                l.total_pair_count(),
+                l.total_cycles(),
+            ),
             None => (0, 0, 0),
         }
     }
@@ -387,7 +410,10 @@ impl AuraMemory {
         // SMART INGEST: Auto-Chunking for Large Documents
         // If text is > 1000 chars and hasn't been explicitly pinned, we treat it as a document.
         if text.len() > 1000 && !pin {
-            tracing::info!("🐘 Large input detected ({} chars). activating Smart Ingest...", text.len());
+            tracing::info!(
+                "🐘 Large input detected ({} chars). activating Smart Ingest...",
+                text.len()
+            );
 
             let mut chunks = Vec::new();
             let mut current_chunk = String::new();
@@ -419,7 +445,10 @@ impl AuraMemory {
 
             if chunks.len() > 1 {
                 let count = self.ingest_batch(chunks)?;
-                return Ok(format!("📚 Smart Ingest: Processed {} segments from document.", count));
+                return Ok(format!(
+                    "📚 Smart Ingest: Processed {} segments from document.",
+                    count
+                ));
             }
         }
 
@@ -445,13 +474,20 @@ impl AuraMemory {
         let dna: String;
 
         if let Some(anchor_data) = self.anchors.evaluate_and_pin(text, boosted_importance, pin) {
-            tracing::info!("⚓ Anchor detected ({}): {:.30}...", anchor_data.crystallization_trigger, text);
-            let new_id = format!("anchor_{}", SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis());
+            tracing::info!(
+                "⚓ Anchor detected ({}): {:.30}...",
+                anchor_data.crystallization_trigger,
+                text
+            );
+            let new_id = format!(
+                "anchor_{}",
+                SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
+            );
 
             // Identity Conflict Detection
             let entropy = if anchor_data.crystallization_trigger == "identity" {
                 if self.check_identity_conflict(text, &sdr_indices)? {
-                    0.5  // Temporal identity - uncertainty marker
+                    0.5 // Temporal identity - uncertainty marker
                 } else {
                     0.0
                 }
@@ -464,7 +500,9 @@ impl AuraMemory {
             let identity_markers = ["my name", "i am ", "our goal", "our mission", "my primary"];
 
             let is_explicit_sft = pin || sft_markers.iter().any(|m| text.contains(m));
-            let is_identity = identity_markers.iter().any(|m| text.to_lowercase().contains(m));
+            let is_identity = identity_markers
+                .iter()
+                .any(|m| text.to_lowercase().contains(m));
 
             let (stability, intensity, decay) = if is_explicit_sft || is_identity {
                 (100.0, 10.0, 0.0) // True SFT Anchor: Immortal
@@ -494,20 +532,17 @@ impl AuraMemory {
 
             // Add to Active Cortex for O(1) hot-path access
             let sdr_u32: Vec<u32> = syn.sdr_indices.iter().map(|&x| x as u32).collect();
-            let payload = ReflexPayload::new(
-                syn.text.clone(),
-                intensity,
-                None,
-                0,
-            );
+            let payload = ReflexPayload::new(syn.text.clone(), intensity, None, 0);
             self.cortex.insert(&sdr_u32, payload);
             tracing::debug!("Anchor added to Active Cortex: {}", syn.id);
 
             let conflict_note = if entropy > 0.0 { " [⚡conflict]" } else { "" };
-            Ok(format!("⚓ Anchor created ({}){}: {}...",
+            Ok(format!(
+                "⚓ Anchor created ({}){}: {}...",
                 anchor_data.crystallization_trigger,
                 conflict_note,
-                &text.chars().take(30).collect::<String>()))
+                &text.chars().take(30).collect::<String>()
+            ))
         } else {
             // Not an anchor — store as general synapse
 
@@ -521,9 +556,16 @@ impl AuraMemory {
                 (1.0, 0.01)
             };
 
-            dna = if is_hard_anchor { "user_core".to_string() } else { "general".to_string() };
+            dna = if is_hard_anchor {
+                "user_core".to_string()
+            } else {
+                "general".to_string()
+            };
 
-            let new_id = format!("syn_{}", SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis());
+            let new_id = format!(
+                "syn_{}",
+                SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
+            );
             let syn = AuraSynapse {
                 id: new_id.clone(),
                 text: text.to_string(),
@@ -559,7 +601,10 @@ impl AuraMemory {
             // Non-blocking send: if channel is full, consolidation is skipped (acceptable)
             if self.consolidation_tx.try_send(task).is_err() {
                 self.pending_consolidations.fetch_sub(1, Ordering::Relaxed);
-                tracing::warn!("Consolidation queue full — skipping resonance check for {}", new_id);
+                tracing::warn!(
+                    "Consolidation queue full — skipping resonance check for {}",
+                    new_id
+                );
             }
 
             Ok(format!("New synapse (Intensity: {:.1})", importance))
@@ -572,43 +617,57 @@ impl AuraMemory {
         // Split by whitespace and rejoin with single spaces.
         // This kills newlines in weird places, but preserves paragraph structure if we split by lines first?
         // Actually, user wants to PRESERVE double newlines.
-        
+
         let mut clean = String::with_capacity(text.len());
-        
+
         // Strategy: Line-based cleanup
         for line in text.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 // Determine if we should add a paragraph break
                 if !clean.ends_with("\n\n") && !clean.is_empty() {
-                    clean.push('\n'); 
+                    clean.push('\n');
                     clean.push('\n');
                 }
                 continue;
             }
-            
+
             // Normalize internal spaces in the line
             let words: Vec<&str> = trimmed.split_whitespace().collect();
             let clean_line = words.join(" ");
-            
+
             if !clean.is_empty() && !clean.ends_with("\n\n") {
-                 clean.push('\n'); 
+                clean.push('\n');
             }
             clean.push_str(&clean_line);
         }
-        
+
         clean
     }
 
     /// Query Sharpener: Strips common prefixes to improve SDR focus.
     fn sharpen_query(&self, query: &str) -> String {
         let stop_phrases = [
-            "що таке", "що це", "який", "яка", "яке", "які", 
-            "як", "де", "коли", "хто", "чому", 
-            "what is", "what are", "how to", "where is", "who is",
-            "tell me about", "розкажи про"
+            "що таке",
+            "що це",
+            "який",
+            "яка",
+            "яке",
+            "які",
+            "як",
+            "де",
+            "коли",
+            "хто",
+            "чому",
+            "what is",
+            "what are",
+            "how to",
+            "where is",
+            "who is",
+            "tell me about",
+            "розкажи про",
         ];
-        
+
         let mut sharpened = query.to_lowercase();
         for phrase in stop_phrases {
             if sharpened.starts_with(phrase) {
@@ -684,11 +743,11 @@ impl AuraMemory {
                 text,
                 offset: 0, // Will be set by storage
             };
-            
+
             records.push(record);
             index_data.push((new_id, sdr_indices));
         }
-        
+
         // Phase 2: Bulk storage write (single lock)
         self.storage.append_batch(&records)?;
 
@@ -697,7 +756,8 @@ impl AuraMemory {
 
         // Phase 4: Temporal chaining — link record[i] -> record[i+1]
         for i in 0..(index_data.len().saturating_sub(1)) {
-            self.storage.set_next_id(&index_data[i].0, &index_data[i + 1].0);
+            self.storage
+                .set_next_id(&index_data[i].0, &index_data[i + 1].0);
         }
 
         // Phase 5: Persist temporal chains immediately (Robotic Safety)
@@ -705,7 +765,8 @@ impl AuraMemory {
         self.storage.save_temporal_chain()?;
 
         // Update write counter
-        self.write_counter.fetch_add(count as u64, Ordering::Relaxed);
+        self.write_counter
+            .fetch_add(count as u64, Ordering::Relaxed);
 
         Ok(count)
     }
@@ -714,7 +775,7 @@ impl AuraMemory {
         let record = StoredRecord::from_synapse(syn);
         self.storage.append(&record)?;
         self.index.add(&syn.id, &syn.sdr_indices);
-        
+
         // Periodic save (every 100 writes for durability)
         let count = self.write_counter.fetch_add(1, Ordering::Relaxed);
         if count > 0 && count.is_multiple_of(100) {
@@ -734,21 +795,21 @@ impl AuraMemory {
     }
 
     /// Fast reflex retrieval — checks Active Cortex first (O(1), ~200µs).
-    /// 
+    ///
     /// If the anchor is in the hot-path cache, returns immediately.
     /// Otherwise, falls back to the cold SDR index.
-    /// 
+    ///
     /// Use this method for robotics/motor control loops where latency is critical.
     pub fn retrieve_reflex(&self, query: &str) -> Result<Option<String>> {
         let projected = self.project_text(query);
         let sdr_indices = self.sdr.text_to_sdr(&projected, false);
         let sdr_u32: Vec<u32> = sdr_indices.iter().map(|&x| x as u32).collect();
-        
+
         // Check Active Cortex first (O(1), lock-free)
         if let Some(payload) = self.cortex.get_reflex(&sdr_u32) {
             return Ok(Some(payload.text));
         }
-        
+
         // Fallback to cold index (slower but complete)
         let results = self.retrieve(query, 1)?;
         Ok(results.into_iter().next())
@@ -774,8 +835,16 @@ impl AuraMemory {
                 timestamp: next_header.timestamp(),
                 intensity: next_header.intensity(),
                 stability: next_header.stability(),
-                decay_velocity: f32::from_bits(next_header.decay_velocity.load(std::sync::atomic::Ordering::Relaxed)),
-                entropy: f32::from_bits(next_header.entropy.load(std::sync::atomic::Ordering::Relaxed)),
+                decay_velocity: f32::from_bits(
+                    next_header
+                        .decay_velocity
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ),
+                entropy: f32::from_bits(
+                    next_header
+                        .entropy
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ),
                 sdr_indices: next_header.sdr_indices.clone(),
                 text: next_header.text.clone(),
                 offset: 0,
@@ -797,7 +866,9 @@ impl AuraMemory {
         let projected = self.project_text(actual_text);
         let actual_sdr = self.sdr.text_to_sdr(&projected, false);
         if let Some(predicted_header) = self.storage.get_header(predicted_id) {
-            let similarity = self.sdr.tanimoto_sparse(&predicted_header.sdr_indices, &actual_sdr);
+            let similarity = self
+                .sdr
+                .tanimoto_sparse(&predicted_header.sdr_indices, &actual_sdr);
             Ok(1.0 - similarity)
         } else {
             Ok(1.0) // No prediction available = maximum surprise
@@ -813,16 +884,16 @@ impl AuraMemory {
         // 1. Search Index - tight buffer for speed
         let search_buffer = (top_k * 10).max(30);
         let candidates = self.index.search(&sdr_indices, search_buffer, 1);
-        
+
         // 2. RAM Filtering & Ranking
         // Pre-allocate vector for valid candidates
         let mut pre_ranked = Vec::with_capacity(candidates.len());
         let mut total_resonance = 0.0;
         let mut valid_count = 0;
-        
+
         // Acquire READ lock once for the entire loop
         let header_cache = self.storage.header_cache.read();
-        
+
         // === ADAPTIVE THRESHOLD (Same logic as retrieve_full) ===
         let query_len = query.len(); // byte length is close enough, avoids chars().count()
         let adaptive_threshold = if query_len < 15 {
@@ -853,9 +924,9 @@ impl AuraMemory {
         }
 
         drop(header_cache);
-        
+
         if pre_ranked.is_empty() {
-             return Ok(vec![]);
+            return Ok(vec![]);
         }
 
         // Sort by initial RAM score
@@ -866,7 +937,11 @@ impl AuraMemory {
 
         // 3. Apply GRPO logic in RAM, collect RRF signals
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
-        let mean_resonance = if valid_count > 0 { total_resonance / valid_count as f32 } else { 0.0 };
+        let mean_resonance = if valid_count > 0 {
+            total_resonance / valid_count as f32
+        } else {
+            0.0
+        };
 
         let op_count = self.write_counter.fetch_add(1, Ordering::Relaxed);
         let should_persist = op_count.is_multiple_of(50);
@@ -875,7 +950,7 @@ impl AuraMemory {
         struct RrfCandidate {
             text: String,
             is_phantom: bool,
-            relevance: f32,  // tanimoto * intensity (preserves cognitive hierarchy)
+            relevance: f32, // tanimoto * intensity (preserves cognitive hierarchy)
             timestamp: f64,
         }
         let mut rrf_candidates: Vec<RrfCandidate> = Vec::with_capacity(processing_limit);
@@ -935,23 +1010,29 @@ impl AuraMemory {
         }
 
         // 4. RRF Fusion: rank by relevance (tanimoto*intensity) + recency
-        let signals: Vec<(f32, f64)> = rrf_candidates.iter()
+        let signals: Vec<(f32, f64)> = rrf_candidates
+            .iter()
             .map(|c| (c.relevance, c.timestamp))
             .collect();
         let ranked = rrf_rank(&signals);
 
         // 5. Emit top-k non-phantom results
-        let results: Vec<String> = ranked.into_iter()
+        let results: Vec<String> = ranked
+            .into_iter()
             .filter_map(|(idx, _score)| {
                 let c = &rrf_candidates[idx];
-                if c.is_phantom { None } else { Some(c.text.clone()) }
+                if c.is_phantom {
+                    None
+                } else {
+                    Some(c.text.clone())
+                }
             })
             .take(top_k)
             .collect();
 
         Ok(results)
     }
-    
+
     /// Retrieve full records (text, id, metadata) with Tanimoto score
     /// Uses Adaptive Thresholding to filter noise based on query characteristics.
     /// Lazy construction: scores first with Arc refs, converts to StoredRecord only for top-k.
@@ -978,14 +1059,17 @@ impl AuraMemory {
         let header_cache = self.storage.header_cache.read();
 
         let target_count = (top_k * 5).max(20);
-        let mut scored: Vec<(Arc<crate::storage::StoredHeader>, f32)> = Vec::with_capacity(target_count);
+        let mut scored: Vec<(Arc<crate::storage::StoredHeader>, f32)> =
+            Vec::with_capacity(target_count);
 
         for (id, _) in candidates {
             if let Some(header) = header_cache.get(&id) {
                 let tanimoto = self.sdr.tanimoto_sparse(&sdr_indices, &header.sdr_indices);
                 if tanimoto >= adaptive_threshold {
                     scored.push((Arc::clone(header), tanimoto));
-                    if scored.len() >= target_count { break; }
+                    if scored.len() >= target_count {
+                        break;
+                    }
                 }
             }
         }
@@ -994,7 +1078,9 @@ impl AuraMemory {
 
         // Phase 2: Homeostatic Plasticity — GRPO reinforcement on retrieve_full()
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
-        let mean_tanimoto = if scored.is_empty() { 0.0_f32 } else {
+        let mean_tanimoto = if scored.is_empty() {
+            0.0_f32
+        } else {
             scored.iter().map(|(_, t)| *t).sum::<f32>() / scored.len() as f32
         };
         let op_count = self.write_counter.fetch_add(1, Ordering::Relaxed);
@@ -1048,15 +1134,15 @@ impl AuraMemory {
         }
 
         // Phase 3: RRF Fusion — rank by relevance (tanimoto*intensity) + recency
-        let signals: Vec<(f32, f64)> = scored.iter()
-            .map(|(header, tanimoto)| {
-                (*tanimoto * header.intensity(), header.timestamp())
-            })
+        let signals: Vec<(f32, f64)> = scored
+            .iter()
+            .map(|(header, tanimoto)| (*tanimoto * header.intensity(), header.timestamp()))
             .collect();
         let ranked = rrf_rank(&signals);
 
         // Phase 4: Convert ONLY top-k to StoredRecord (lazy construction)
-        let results: Vec<(StoredRecord, f32)> = ranked.into_iter()
+        let results: Vec<(StoredRecord, f32)> = ranked
+            .into_iter()
             .take(top_k)
             .map(|(idx, rrf_score)| {
                 let (header, _tanimoto) = &scored[idx];
@@ -1087,66 +1173,66 @@ impl AuraMemory {
     /// Optimized retrieval returning raw components for matrix conversion.
     /// Filters by min_score in Rust to reduce cross-boundary traffic.
     pub fn retrieve_matrix_raw(
-        &self, 
-        raw_query: &str, 
-        top_k: usize, 
-        min_score: f32
+        &self,
+        raw_query: &str,
+        top_k: usize,
+        min_score: f32,
     ) -> Result<(Vec<f32>, Vec<Vec<u16>>, Vec<StoredRecord>)> {
         let query = self.sharpen_query(raw_query);
         let projected = self.project_text(&query);
         let sdr_indices = self.sdr.text_to_sdr(&projected, false);
         let candidates = self.index.search(&sdr_indices, top_k * 5, 1);
-        
+
         let mut ranked = Vec::new();
         for (id, _) in candidates {
             if let Some(record) = self.storage.read(&id)? {
                 let relevance = self.sdr.tanimoto_sparse(&sdr_indices, &record.sdr_indices);
                 let score = relevance * record.intensity;
-                
+
                 if score >= min_score {
                     ranked.push((record, score));
                 }
             }
         }
-        
+
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let results = ranked.into_iter().take(top_k);
-        
+
         let mut scores = Vec::new();
         let mut sdrs = Vec::new();
         let mut metadata = Vec::new();
-        
+
         for (rec, score) in results {
             scores.push(score);
             sdrs.push(rec.sdr_indices.clone());
             metadata.push(rec);
         }
-        
+
         Ok((scores, sdrs, metadata))
     }
 
     /// Find maximum Tanimoto resonance with user_core anchors.
-    /// 
+    ///
     /// O(k) complexity via inverted index, where k = number of active bits.
     /// Enables Dynamic Goals feature.
     fn find_goal_resonance(&self, query_indices: &[u16]) -> Result<f32> {
         if query_indices.is_empty() {
             return Ok(0.0);
         }
-        
+
         if self.storage.anchor_count() == 0 {
             return Ok(0.0);
         }
-        
+
         // O(k) lookup via inverted index
         let candidates = self.index.search(query_indices, 50, 1);
-        
+
         let mut max_resonance = 0.0f32;
-        
+
         // anchor_ids is now a Vec from a cached HashSet, so contains() is fast if we convert back or use it directly
         // But let's use the anchor_ids vector directly if it's small, or use the set logic.
         // Actually, we can just check if syn_id is in the set.
-        
+
         for (syn_id, _) in candidates {
             if self.is_anchor(&syn_id) {
                 if let Some(record) = self.storage.read(&syn_id)? {
@@ -1157,45 +1243,45 @@ impl AuraMemory {
                 }
             }
         }
-        
+
         Ok(max_resonance)
     }
 
     fn is_anchor(&self, id: &str) -> bool {
         self.storage.has_anchor(id)
     }
-    
+
     /// Check if new identity statement conflicts with existing identity anchors.
-    /// 
+    ///
     /// Conflict = same structural pattern but different content (low Tanimoto).
     fn check_identity_conflict(&self, text: &str, query_indices: &[u16]) -> Result<bool> {
         let anchor_ids = self.storage.get_anchor_ids();
         if anchor_ids.is_empty() {
             return Ok(false);
         }
-        
+
         let text_lower = text.to_lowercase();
         let identity_markers = ["my name", "i am ", "our goal", "our mission", "my primary"];
-        
+
         let new_is_identity = identity_markers.iter().any(|m| text_lower.contains(m));
         if !new_is_identity {
             return Ok(false);
         }
-        
+
         for anchor_id in anchor_ids {
             if let Some(record) = self.storage.read(&anchor_id)? {
                 let anchor_lower = record.text.to_lowercase();
                 let anchor_is_identity = identity_markers.iter().any(|m| anchor_lower.contains(m));
-                
+
                 if anchor_is_identity {
                     let t = self.sdr.tanimoto_sparse(query_indices, &record.sdr_indices);
                     if t < 0.5 {
-                        return Ok(true);  // Conflict detected
+                        return Ok(true); // Conflict detected
                     }
                 }
             }
         }
-        
+
         Ok(false)
     }
 
@@ -1220,7 +1306,9 @@ impl AuraMemory {
         let min_age_seconds = min_age_hours * 3600.0;
 
         // Get all user_core anchors that are old enough
-        let anchors: Vec<_> = self.storage.get_anchors()?
+        let anchors: Vec<_> = self
+            .storage
+            .get_anchors()?
             .into_iter()
             .filter(|r| (now - r.timestamp) >= min_age_seconds)
             .collect();
@@ -1233,16 +1321,11 @@ impl AuraMemory {
         let mut candidates = Vec::new();
         for i in 0..anchors.len() {
             for j in (i + 1)..anchors.len() {
-                let resonance = self.sdr.tanimoto_sparse(
-                    &anchors[i].sdr_indices,
-                    &anchors[j].sdr_indices,
-                );
+                let resonance = self
+                    .sdr
+                    .tanimoto_sparse(&anchors[i].sdr_indices, &anchors[j].sdr_indices);
                 if resonance >= min_resonance {
-                    candidates.push((
-                        anchors[i].id.clone(),
-                        anchors[j].id.clone(),
-                        resonance,
-                    ));
+                    candidates.push((anchors[i].id.clone(), anchors[j].id.clone(), resonance));
                 }
             }
         }
@@ -1263,12 +1346,7 @@ impl AuraMemory {
     ///
     /// Intensity Formula (Saturation):
     ///     I_super = I_max + (I_min / 2) * (1 - I_max / 10)
-    pub fn synthesize(
-        &self,
-        id_a: &str,
-        id_b: &str,
-        new_text: String,
-    ) -> Result<Option<String>> {
+    pub fn synthesize(&self, id_a: &str, id_b: &str, new_text: String) -> Result<Option<String>> {
         // 1. Get records
         let rec_a = match self.storage.read(id_a)? {
             Some(r) => r,
@@ -1286,7 +1364,9 @@ impl AuraMemory {
         }
 
         // 2. SDR Union (merge semantic coverage)
-        let mut sdr_union: Vec<u16> = rec_a.sdr_indices.iter()
+        let mut sdr_union: Vec<u16> = rec_a
+            .sdr_indices
+            .iter()
             .chain(rec_b.sdr_indices.iter())
             .cloned()
             .collect();
@@ -1299,14 +1379,17 @@ impl AuraMemory {
         let new_intensity = (i_max + (i_min / 2.0) * (1.0 - i_max / 10.0)).min(10.0);
 
         // 4. Create Super-Core record
-        let super_id = format!("super_{}", SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis());
+        let super_id = format!(
+            "super_{}",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
+        );
         let syn = AuraSynapse {
             id: super_id.clone(),
             text: new_text,
             sdr_indices: sdr_union,
             pulse: Pulse {
                 intensity: new_intensity,
-                stability: 100.0, // Super-core is stable
+                stability: 100.0,    // Super-core is stable
                 decay_velocity: 0.0, // Never decay
                 last_resonance: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64(),
             },
@@ -1318,7 +1401,13 @@ impl AuraMemory {
         };
 
         self.save_synapse(&syn)?;
-        tracing::info!("✨ Synthesized {} + {} -> {} (Intensity: {:.1})", id_a, id_b, super_id, new_intensity);
+        tracing::info!(
+            "✨ Synthesized {} + {} -> {} (Intensity: {:.1})",
+            id_a,
+            id_b,
+            super_id,
+            new_intensity
+        );
 
         // 5. Delete originals (plasticity)
         self.delete_synapse(id_a);
@@ -1347,10 +1436,16 @@ impl AuraMemory {
     /// List memories with pagination and optional DNA filter.
     /// Returns (records, total_matching_count).
     /// Phantoms are excluded by default; pass filter_dna=Some("phantom") to see them.
-    pub fn list_memories(&self, offset: usize, limit: usize, filter_dna: Option<&str>) -> (Vec<StoredRecord>, usize) {
+    pub fn list_memories(
+        &self,
+        offset: usize,
+        limit: usize,
+        filter_dna: Option<&str>,
+    ) -> (Vec<StoredRecord>, usize) {
         let cache = self.storage.header_cache.read();
 
-        let mut entries: Vec<_> = cache.values()
+        let mut entries: Vec<_> = cache
+            .values()
             .filter(|h| {
                 match filter_dna {
                     Some(dna) if dna == "phantom" => h.dna == "phantom",
@@ -1364,10 +1459,13 @@ impl AuraMemory {
 
         // Sort by timestamp descending (newest first)
         entries.sort_by(|a, b| {
-            b.timestamp().partial_cmp(&a.timestamp()).unwrap_or(std::cmp::Ordering::Equal)
+            b.timestamp()
+                .partial_cmp(&a.timestamp())
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let records: Vec<StoredRecord> = entries.into_iter()
+        let records: Vec<StoredRecord> = entries
+            .into_iter()
             .skip(offset)
             .take(limit)
             .map(|h| StoredRecord {
@@ -1397,8 +1495,12 @@ impl AuraMemory {
         for header in cache.values() {
             *by_dna.entry(header.dna.clone()).or_insert(0) += 1;
             let ts = header.timestamp();
-            if ts < oldest { oldest = ts; }
-            if ts > newest { newest = ts; }
+            if ts < oldest {
+                oldest = ts;
+            }
+            if ts > newest {
+                newest = ts;
+            }
         }
 
         let total = cache.len();
@@ -1438,8 +1540,21 @@ impl AuraMemory {
                     // Drain remaining tasks before exiting
                     while let Ok(task) = rx.try_recv() {
                         match task {
-                            ConsolidationTask::Consolidate { id, text, sdr_indices, importance, .. } => {
-                                Self::consolidate_record(&storage, &sdr, &id, &text, &sdr_indices, importance);
+                            ConsolidationTask::Consolidate {
+                                id,
+                                text,
+                                sdr_indices,
+                                importance,
+                                ..
+                            } => {
+                                Self::consolidate_record(
+                                    &storage,
+                                    &sdr,
+                                    &id,
+                                    &text,
+                                    &sdr_indices,
+                                    importance,
+                                );
                                 pending.fetch_sub(1, Ordering::Relaxed);
                             }
                             ConsolidationTask::Shutdown | ConsolidationTask::DecaySweep => break,
@@ -1447,7 +1562,13 @@ impl AuraMemory {
                     }
                     break;
                 }
-                Ok(ConsolidationTask::Consolidate { id, text, sdr_indices, importance, .. }) => {
+                Ok(ConsolidationTask::Consolidate {
+                    id,
+                    text,
+                    sdr_indices,
+                    importance,
+                    ..
+                }) => {
                     Self::consolidate_record(&storage, &sdr, &id, &text, &sdr_indices, importance);
                     pending.fetch_sub(1, Ordering::Relaxed);
                 }
@@ -1510,11 +1631,14 @@ impl AuraMemory {
                         SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
-                            .as_secs_f64()
+                            .as_secs_f64(),
                     );
                     tracing::debug!(
                         "🔄 Consolidation: merged {} into {} (score: {:.2}, new intensity: {:.1})",
-                        new_id, match_id, best_score, new_intensity
+                        new_id,
+                        match_id,
+                        best_score,
+                        new_intensity
                     );
                 }
                 drop(header_cache);
@@ -1541,7 +1665,11 @@ impl AuraMemory {
 
         for header in header_cache.values() {
             // Anchor immunity: user_core, super_core, phantom, or high stability
-            if header.dna == "user_core" || header.dna == "super_core" || header.dna == "phantom" || header.stability() >= 100.0 {
+            if header.dna == "user_core"
+                || header.dna == "super_core"
+                || header.dna == "phantom"
+                || header.stability() >= 100.0
+            {
                 immune += 1;
                 continue;
             }
@@ -1565,7 +1693,8 @@ impl AuraMemory {
         if decayed > 0 || immune > 0 {
             tracing::debug!(
                 "🧠 Decay sweep: {} records decayed, {} immune",
-                decayed, immune
+                decayed,
+                immune
             );
         }
     }
@@ -1579,8 +1708,10 @@ impl AuraMemory {
             std::thread::yield_now();
             // Safety timeout: 5 seconds max
             if start.elapsed() > std::time::Duration::from_secs(5) {
-                tracing::warn!("flush_consolidation timed out after 5s, {} tasks remaining",
-                    self.pending_consolidations.load(Ordering::Relaxed));
+                tracing::warn!(
+                    "flush_consolidation timed out after 5s, {} tasks remaining",
+                    self.pending_consolidations.load(Ordering::Relaxed)
+                );
                 break;
             }
         }
@@ -1605,7 +1736,11 @@ impl AuraMemory {
     /// Increments pending counter so flush_consolidation() can wait for completion.
     pub fn trigger_decay_sweep(&self) {
         self.pending_consolidations.fetch_add(1, Ordering::Relaxed);
-        if self.consolidation_tx.try_send(ConsolidationTask::DecaySweep).is_err() {
+        if self
+            .consolidation_tx
+            .try_send(ConsolidationTask::DecaySweep)
+            .is_err()
+        {
             self.pending_consolidations.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -1627,7 +1762,8 @@ impl AuraMemory {
         let cache = self.storage.header_cache.read();
         let node_id = format!("{:08X}", std::process::id());
 
-        cache.values()
+        cache
+            .values()
             .filter(|h| {
                 // Never re-export phantoms
                 if h.dna == "phantom" {
@@ -1782,8 +1918,14 @@ impl Drop for AuraMemory {
         if ops > 0 {
             if let Err(e) = self.flush() {
                 let msg = e.to_string();
-                if msg.contains("system cannot find the path") || msg.contains("os error 3") || msg.contains("No such file") {
-                    tracing::warn!("Failed to auto-flush on drop (directory likely deleted): {}", e);
+                if msg.contains("system cannot find the path")
+                    || msg.contains("os error 3")
+                    || msg.contains("No such file")
+                {
+                    tracing::warn!(
+                        "Failed to auto-flush on drop (directory likely deleted): {}",
+                        e
+                    );
                 } else {
                     tracing::error!("Failed to flush on drop: {}", e);
                 }
@@ -1806,7 +1948,10 @@ mod tests {
 
         // 1. Add Anchor using SFT marker (Identity: prefix)
         let res1 = memory.process("Identity: My name is Teo and I am building Aura.", false)?;
-        assert!(res1.contains("Anchor"), "Should detect anchor via SFT marker");
+        assert!(
+            res1.contains("Anchor"),
+            "Should detect anchor via SFT marker"
+        );
 
         // 2. Add Normal Memory
         let res2 = memory.process("The weather is nice today.", false)?;
@@ -1827,7 +1972,10 @@ mod tests {
 
         // Force anchor creation with pin=true
         let res = memory.process("This is explicitly pinned content", true)?;
-        assert!(res.contains("Anchor"), "Should create anchor with explicit pin");
+        assert!(
+            res.contains("Anchor"),
+            "Should create anchor with explicit pin"
+        );
         assert!(res.contains("explicit"), "Should show explicit trigger");
 
         Ok(())
@@ -1841,7 +1989,10 @@ mod tests {
         // Long text with metrics should trigger structural anchor (>150 chars + metrics)
         let long_text = "This is a very detailed system report with performance metrics: latency is 0.5ms, throughput is 1000 req/s, memory usage at 45%, CPU at 80%. The system has been running stable for 24 hours.";
         let res = memory.process(long_text, false)?;
-        assert!(res.contains("Anchor"), "Should create structural anchor for long text with metrics");
+        assert!(
+            res.contains("Anchor"),
+            "Should create structural anchor for long text with metrics"
+        );
 
         Ok(())
     }
@@ -1862,7 +2013,11 @@ mod tests {
 
         assert!(res.contains("New synapse"), "Should create new synapse");
         // Fast path should be well under 50ms (typically <1ms)
-        assert!(elapsed.as_millis() < 50, "process() took {}ms, expected <50ms", elapsed.as_millis());
+        assert!(
+            elapsed.as_millis() < 50,
+            "process() took {}ms, expected <50ms",
+            elapsed.as_millis()
+        );
 
         Ok(())
     }
@@ -1876,9 +2031,16 @@ mod tests {
         memory.process("Unique async cortex test record alpha bravo charlie", false)?;
 
         // Record should be queryable RIGHT AWAY (no need to wait for consolidation)
-        let results = memory.retrieve_full("Unique async cortex test record alpha bravo charlie", 5)?;
-        assert!(!results.is_empty(), "Record should be queryable immediately after process()");
-        assert!(results[0].0.text.contains("async cortex"), "Should find the correct record");
+        let results =
+            memory.retrieve_full("Unique async cortex test record alpha bravo charlie", 5)?;
+        assert!(
+            !results.is_empty(),
+            "Record should be queryable immediately after process()"
+        );
+        assert!(
+            results[0].0.text.contains("async cortex"),
+            "Should find the correct record"
+        );
 
         Ok(())
     }
@@ -1889,20 +2051,32 @@ mod tests {
         let memory = AuraMemory::new(dir.path())?;
 
         // Store a record
-        memory.process("Async cortex duplicate test record with specific content", false)?;
+        memory.process(
+            "Async cortex duplicate test record with specific content",
+            false,
+        )?;
         // Wait for consolidation of first record
         memory.flush_consolidation();
 
         // Store a near-duplicate (should trigger resonance merge in background)
-        memory.process("Async cortex duplicate test record with specific content", false)?;
+        memory.process(
+            "Async cortex duplicate test record with specific content",
+            false,
+        )?;
         // Wait for background consolidation to finish
         memory.flush_consolidation();
 
         // After consolidation, the duplicate should have boosted intensity
         // Both records exist in storage (append-only), but the background
         // thread should have boosted the intensity of the matched record
-        let results = memory.retrieve_full("Async cortex duplicate test record with specific content", 5)?;
-        assert!(!results.is_empty(), "Should find records after consolidation");
+        let results = memory.retrieve_full(
+            "Async cortex duplicate test record with specific content",
+            5,
+        )?;
+        assert!(
+            !results.is_empty(),
+            "Should find records after consolidation"
+        );
 
         Ok(())
     }
@@ -1914,12 +2088,19 @@ mod tests {
 
         // Queue several records
         for i in 0..10 {
-            memory.process(&format!("Flush consolidation test record number {}", i), false)?;
+            memory.process(
+                &format!("Flush consolidation test record number {}", i),
+                false,
+            )?;
         }
 
         // flush_consolidation should drain all pending tasks
         memory.flush_consolidation();
-        assert_eq!(memory.pending_consolidations(), 0, "All tasks should be drained");
+        assert_eq!(
+            memory.pending_consolidations(),
+            0,
+            "All tasks should be drained"
+        );
 
         Ok(())
     }
@@ -1942,7 +2123,10 @@ mod tests {
         let memory2 = AuraMemory::new(dir.path())?;
         let results = memory2.retrieve_full("Drop drain test record", 25)?;
         // Should find most/all records (some may have been merged by consolidation)
-        assert!(results.len() >= 1, "Records should persist after drop-drain");
+        assert!(
+            results.len() >= 1,
+            "Records should persist after drop-drain"
+        );
 
         Ok(())
     }
@@ -1981,21 +2165,27 @@ mod tests {
             "A fox was seen jumping over fences in the countryside meadow yesterday".to_string(),
             "The capital of France is Paris which is known for the Eiffel Tower".to_string(),
             "Cooking pasta requires boiling water and adding salt for better taste".to_string(),
-            "Molecular biology studies DNA replication and protein synthesis mechanisms".to_string(),
+            "Molecular biology studies DNA replication and protein synthesis mechanisms"
+                .to_string(),
             "The stock market crashed due to inflation fears and rising interest rates".to_string(),
-            "Ancient Roman architecture features arches columns and concrete construction".to_string(),
+            "Ancient Roman architecture features arches columns and concrete construction"
+                .to_string(),
             "Machine learning algorithms optimize parameters through gradient descent".to_string(),
             "The Amazon rainforest contains millions of species of plants and animals".to_string(),
-            "Photography techniques include exposure triangle aperture shutter speed ISO".to_string(),
-            "Basketball players practice dribbling shooting and defensive strategies daily".to_string(),
-            "Quantum computers use qubits for superposition and entanglement operations".to_string(),
+            "Photography techniques include exposure triangle aperture shutter speed ISO"
+                .to_string(),
+            "Basketball players practice dribbling shooting and defensive strategies daily"
+                .to_string(),
+            "Quantum computers use qubits for superposition and entanglement operations"
+                .to_string(),
         ])?;
         memory.flush_consolidation();
 
         // Get baseline intensity of the fox record
         let baseline = {
             let cache = memory.storage.header_cache.read();
-            cache.values()
+            cache
+                .values()
                 .find(|h| h.text.contains("quick brown fox"))
                 .map(|h| h.intensity())
                 .unwrap()
@@ -2003,7 +2193,10 @@ mod tests {
 
         // retrieve() with large top_k to trigger GRPO on many candidates
         // Query matches the fox record best; fox/fences record has partial overlap → variance
-        let results = memory.retrieve("The quick brown fox jumps over the lazy dog near the riverbank", 12)?;
+        let results = memory.retrieve(
+            "The quick brown fox jumps over the lazy dog near the riverbank",
+            12,
+        )?;
         assert!(!results.is_empty());
 
         // Check if boosts counter was incremented (any boosts at all mean GRPO is working)
@@ -2012,7 +2205,8 @@ mod tests {
         // Also check the fox record's intensity changed
         let after = {
             let cache = memory.storage.header_cache.read();
-            cache.values()
+            cache
+                .values()
                 .find(|h| h.text.contains("quick brown fox"))
                 .map(|h| h.intensity())
                 .unwrap()
@@ -2035,21 +2229,30 @@ mod tests {
 
         // Store diverse records to create score variance in retrieve_full()
         memory.ingest_batch(vec![
-            "Database optimization uses query plan caching and index partitioning for fast lookups".to_string(),
-            "Database optimization reduces disk IO through buffer pool management and page caching".to_string(),
-            "Cooking recipes for Italian pasta dishes include carbonara and bolognese sauce".to_string(),
-            "Gardening tips for growing tomatoes include proper soil pH and watering schedule".to_string(),
-            "The history of ancient Egypt spans over three thousand years of civilization".to_string(),
-            "Software testing methodologies include unit testing integration testing regression".to_string(),
-            "Climate change affects global weather patterns causing droughts and flooding events".to_string(),
-            "Digital photography sensors convert light photons into electronic signals for images".to_string(),
+            "Database optimization uses query plan caching and index partitioning for fast lookups"
+                .to_string(),
+            "Database optimization reduces disk IO through buffer pool management and page caching"
+                .to_string(),
+            "Cooking recipes for Italian pasta dishes include carbonara and bolognese sauce"
+                .to_string(),
+            "Gardening tips for growing tomatoes include proper soil pH and watering schedule"
+                .to_string(),
+            "The history of ancient Egypt spans over three thousand years of civilization"
+                .to_string(),
+            "Software testing methodologies include unit testing integration testing regression"
+                .to_string(),
+            "Climate change affects global weather patterns causing droughts and flooding events"
+                .to_string(),
+            "Digital photography sensors convert light photons into electronic signals for images"
+                .to_string(),
         ])?;
         memory.flush_consolidation();
 
         // Get baseline intensity from header_cache
         let baseline = {
             let cache = memory.storage.header_cache.read();
-            cache.values()
+            cache
+                .values()
                 .find(|h| h.text.contains("query plan caching"))
                 .map(|h| h.intensity())
                 .unwrap()
@@ -2057,13 +2260,16 @@ mod tests {
 
         // retrieve_full: query matches first record best → triggers GRPO with variance
         let results = memory.retrieve_full(
-            "Database optimization uses query plan caching and index partitioning for fast lookups", 8)?;
+            "Database optimization uses query plan caching and index partitioning for fast lookups",
+            8,
+        )?;
         assert!(!results.is_empty());
 
         // Check boosted intensity from header_cache
         let boosted = {
             let cache = memory.storage.header_cache.read();
-            cache.values()
+            cache
+                .values()
                 .find(|h| h.text.contains("query plan caching"))
                 .map(|h| h.intensity())
                 .unwrap()
@@ -2071,9 +2277,13 @@ mod tests {
 
         // Verify boosts counter incremented
         let (boosts, _, _) = memory.plasticity_stats();
-        assert!(boosted >= baseline || boosts > 0,
+        assert!(
+            boosted >= baseline || boosts > 0,
             "retrieve_full() should boost or register boosts: {:.4} -> {:.4}, boosts={}",
-            baseline, boosted, boosts);
+            baseline,
+            boosted,
+            boosts
+        );
 
         Ok(())
     }
@@ -2102,7 +2312,8 @@ mod tests {
         // Get intensity before sweep (read directly from header_cache, no GRPO side-effect)
         let intensity_before = {
             let cache = memory.storage.header_cache.read();
-            cache.values()
+            cache
+                .values()
                 .find(|h| h.text.contains("golf hotel india"))
                 .map(|h| h.intensity())
                 .unwrap()
@@ -2115,15 +2326,19 @@ mod tests {
         // Get intensity after sweep (read directly from header_cache)
         let intensity_after = {
             let cache = memory.storage.header_cache.read();
-            cache.values()
+            cache
+                .values()
                 .find(|h| h.text.contains("golf hotel india"))
                 .map(|h| h.intensity())
                 .unwrap()
         };
 
-        assert!(intensity_after < intensity_before,
+        assert!(
+            intensity_after < intensity_before,
             "Intensity should decrease after decay sweep: {:.4} -> {:.4}",
-            intensity_before, intensity_after);
+            intensity_before,
+            intensity_after
+        );
 
         let (_, decays, _) = memory.plasticity_stats();
         assert!(decays > 0, "plasticity_decays should be > 0");
@@ -2137,7 +2352,10 @@ mod tests {
         let memory = AuraMemory::new(dir.path())?;
 
         // Create an anchor (pin=true creates user_core)
-        memory.process("Identity: I am an anchor that should never decay juliet kilo lima", true)?;
+        memory.process(
+            "Identity: I am an anchor that should never decay juliet kilo lima",
+            true,
+        )?;
         memory.flush_consolidation();
 
         // Backdate the anchor (30 days ago)
@@ -2154,7 +2372,8 @@ mod tests {
         // Get anchor intensity before sweep (direct header_cache read, no GRPO)
         let intensity_before = {
             let cache = memory.storage.header_cache.read();
-            cache.values()
+            cache
+                .values()
                 .find(|h| h.dna == "user_core" && h.text.contains("juliet kilo lima"))
                 .map(|h| h.intensity())
                 .unwrap()
@@ -2167,18 +2386,25 @@ mod tests {
         // Anchor intensity should be unchanged (immune to decay)
         let intensity_after = {
             let cache = memory.storage.header_cache.read();
-            cache.values()
+            cache
+                .values()
                 .find(|h| h.dna == "user_core" && h.text.contains("juliet kilo lima"))
                 .map(|h| h.intensity())
                 .unwrap()
         };
 
-        assert!((intensity_after - intensity_before).abs() < f32::EPSILON,
+        assert!(
+            (intensity_after - intensity_before).abs() < f32::EPSILON,
             "Anchor intensity should be unchanged: before={:.4}, after={:.4}",
-            intensity_before, intensity_after);
+            intensity_before,
+            intensity_after
+        );
 
         let (_, _, immune) = memory.plasticity_stats();
-        assert!(immune > 0, "plasticity_immune should be > 0 (anchor was skipped)");
+        assert!(
+            immune > 0,
+            "plasticity_immune should be > 0 (anchor was skipped)"
+        );
 
         Ok(())
     }
@@ -2209,7 +2435,9 @@ mod tests {
 
         // Use retrieve() with large top_k (known to work with GRPO from other tests)
         let _ = memory.retrieve(
-            "Network security implements certificate pinning and mutual TLS verification always", 8)?;
+            "Network security implements certificate pinning and mutual TLS verification always",
+            8,
+        )?;
 
         let (b1, _, _) = memory.plasticity_stats();
         // GRPO should have produced at least some boosts with diverse records
@@ -2233,7 +2461,10 @@ mod tests {
 
         let (b2, d2, i2) = memory.plasticity_stats();
         assert!(b2 >= b1, "Boosts should not decrease");
-        assert!(d2 > 0 || i2 > 0, "Sweep should produce decays or immune counts");
+        assert!(
+            d2 > 0 || i2 > 0,
+            "Sweep should produce decays or immune counts"
+        );
 
         Ok(())
     }
@@ -2261,8 +2492,14 @@ mod tests {
 
         assert_eq!(fps.len(), 2, "Should export 2 fingerprints");
         for fp in &fps {
-            assert!(!fp.sdr_indices.is_empty(), "Fingerprint must have SDR indices");
-            assert!(fp.id.starts_with("phantom_"), "ID should have phantom prefix");
+            assert!(
+                !fp.sdr_indices.is_empty(),
+                "Fingerprint must have SDR indices"
+            );
+            assert!(
+                fp.id.starts_with("phantom_"),
+                "ID should have phantom prefix"
+            );
             assert!(!fp.origin_node.is_empty(), "Should have origin node");
             assert!(fp.intensity > 0.0, "Intensity should be positive");
         }
@@ -2287,9 +2524,15 @@ mod tests {
 
         // Export only user_core
         let fps = memory.export_sdr_fingerprints(Some("user_core"), &config);
-        assert!(!fps.is_empty(), "Should export at least 1 anchor fingerprint");
+        assert!(
+            !fps.is_empty(),
+            "Should export at least 1 anchor fingerprint"
+        );
         for fp in &fps {
-            assert_eq!(fp.source_dna, "user_core", "Should only export user_core records");
+            assert_eq!(
+                fp.source_dna, "user_core",
+                "Should only export user_core records"
+            );
         }
 
         Ok(())
@@ -2298,13 +2541,13 @@ mod tests {
     #[cfg(feature = "sync")]
     #[test]
     fn test_export_skips_phantoms() -> Result<()> {
-        use crate::sync::{SdrPrivacyConfig, SdrFingerprint};
+        use crate::sync::{SdrFingerprint, SdrPrivacyConfig};
 
         let dir = tempdir()?;
         let memory = AuraMemory::new(dir.path())?;
 
         memory.ingest_batch(vec![
-            "Whiskey xray yankee zulu alfa bravo charlie".to_string(),
+            "Whiskey xray yankee zulu alfa bravo charlie".to_string()
         ])?;
         memory.flush_consolidation();
 
@@ -2323,8 +2566,14 @@ mod tests {
         let config = SdrPrivacyConfig::default();
         let fps = memory.export_sdr_fingerprints(None, &config);
         for fp in &fps {
-            assert_ne!(fp.source_dna, "phantom", "Phantoms should never be re-exported");
-            assert!(!fp.id.contains("phantom_remote"), "Should not re-export imported phantoms");
+            assert_ne!(
+                fp.source_dna, "phantom",
+                "Phantoms should never be re-exported"
+            );
+            assert!(
+                !fp.id.contains("phantom_remote"),
+                "Should not re-export imported phantoms"
+            );
         }
 
         Ok(())
@@ -2380,7 +2629,7 @@ mod tests {
         let memory = AuraMemory::new(dir.path())?;
 
         memory.ingest_batch(vec![
-            "Real record delta echo foxtrot golf hotel india".to_string(),
+            "Real record delta echo foxtrot golf hotel india".to_string()
         ])?;
         memory.flush_consolidation();
 
@@ -2414,12 +2663,14 @@ mod tests {
 
         // Store a record about foxes
         memory.ingest_batch(vec![
-            "The quick brown fox jumps over lazy dogs in forest".to_string(),
+            "The quick brown fox jumps over lazy dogs in forest".to_string()
         ])?;
         memory.flush_consolidation();
 
         // Generate SDR for a similar text and import as phantom
-        let similar_sdr = memory.sdr().text_to_sdr("The fast brown fox leaps over lazy dogs in woodland", false);
+        let similar_sdr = memory
+            .sdr()
+            .text_to_sdr("The fast brown fox leaps over lazy dogs in woodland", false);
         memory.import_sdr_fingerprints(vec![SdrFingerprint {
             id: "phantom_resonance_test".to_string(),
             sdr_indices: similar_sdr,
@@ -2439,11 +2690,16 @@ mod tests {
         // retrieve_full() should show phantom as "[phantom]" if it matches
         let full_results = memory.retrieve_full("quick brown fox jumps over lazy dogs", 10)?;
         let has_phantom = full_results.iter().any(|(r, _)| r.text == "[phantom]");
-        let has_real = full_results.iter().any(|(r, _)| r.text.contains("quick brown fox"));
+        let has_real = full_results
+            .iter()
+            .any(|(r, _)| r.text.contains("quick brown fox"));
         assert!(has_real, "Should find the real record");
         // Phantom may or may not appear in top results depending on score; just verify no crash
         if has_phantom {
-            let phantom_rec = full_results.iter().find(|(r, _)| r.text == "[phantom]").unwrap();
+            let phantom_rec = full_results
+                .iter()
+                .find(|(r, _)| r.text == "[phantom]")
+                .unwrap();
             assert_eq!(phantom_rec.0.dna, "phantom");
         }
 
@@ -2482,9 +2738,12 @@ mod tests {
             h.intensity()
         };
 
-        assert!((intensity_after - intensity_before).abs() < f32::EPSILON,
+        assert!(
+            (intensity_after - intensity_before).abs() < f32::EPSILON,
             "Phantom should be immune to decay: {:.4} -> {:.4}",
-            intensity_before, intensity_after);
+            intensity_before,
+            intensity_after
+        );
 
         Ok(())
     }
@@ -2518,8 +2777,10 @@ mod tests {
         assert_eq!(fps_clean.len(), 1);
 
         // With noise applied, SDR indices should differ
-        assert_ne!(fps_noisy[0].sdr_indices, fps_clean[0].sdr_indices,
-            "Noise should modify SDR indices");
+        assert_ne!(
+            fps_noisy[0].sdr_indices, fps_clean[0].sdr_indices,
+            "Noise should modify SDR indices"
+        );
 
         Ok(())
     }
@@ -2549,7 +2810,11 @@ mod tests {
         let second = memory.import_sdr_fingerprints(vec![fp]);
         assert_eq!(second, 0, "Duplicate should be rejected");
 
-        assert_eq!(memory.phantom_count(), 1, "Should still have only 1 phantom");
+        assert_eq!(
+            memory.phantom_count(),
+            1,
+            "Should still have only 1 phantom"
+        );
 
         Ok(())
     }
@@ -2592,8 +2857,8 @@ mod tests {
     fn test_rrf_recency_tiebreaker() {
         // Two records with identical relevance — recency should break the tie
         let candidates = vec![
-            (1.0, 1000.0),  // same relevance, older
-            (1.0, 2000.0),  // same relevance, newer
+            (1.0, 1000.0), // same relevance, older
+            (1.0, 2000.0), // same relevance, newer
         ];
         let result = rrf_rank(&candidates);
         assert_eq!(result[0].0, 1, "Newer record should win the tiebreak");
@@ -2606,8 +2871,8 @@ mod tests {
         // general (intensity=1.0):  relevance = 0.7 * 1.0 = 0.7
         // Recency bonus max diff: 0.1*(1/61 - 1/62) = 0.0000265 — negligible
         let candidates = vec![
-            (7.0, 1000.0),  // high relevance (user_core), older
-            (0.7, 2000.0),  // low relevance (general), newer
+            (7.0, 1000.0), // high relevance (user_core), older
+            (0.7, 2000.0), // low relevance (general), newer
         ];
         let result = rrf_rank(&candidates);
         assert_eq!(result[0].0, 0, "High relevance must beat recency");
@@ -2621,14 +2886,23 @@ mod tests {
         let memory = AuraMemory::new(dir.path())?;
 
         // Store several distinct memories
-        memory.process("The Rust programming language is great for systems programming", false)?;
-        memory.process("Python is excellent for data science and machine learning", false)?;
+        memory.process(
+            "The Rust programming language is great for systems programming",
+            false,
+        )?;
+        memory.process(
+            "Python is excellent for data science and machine learning",
+            false,
+        )?;
         memory.process("JavaScript runs in web browsers and Node.js servers", false)?;
 
         // Retrieve should still return relevant results
         let results = memory.retrieve("Rust systems programming language", 3)?;
         assert!(!results.is_empty(), "Should find at least one result");
-        assert!(results[0].contains("Rust"), "Top result should be about Rust");
+        assert!(
+            results[0].contains("Rust"),
+            "Top result should be about Rust"
+        );
 
         Ok(())
     }
@@ -2638,8 +2912,14 @@ mod tests {
         let dir = tempdir()?;
         let memory = AuraMemory::new(dir.path())?;
 
-        memory.process("Aura Memory is a cognitive memory system built in Rust", false)?;
-        memory.process("The weather forecast predicts rain tomorrow afternoon", false)?;
+        memory.process(
+            "Aura Memory is a cognitive memory system built in Rust",
+            false,
+        )?;
+        memory.process(
+            "The weather forecast predicts rain tomorrow afternoon",
+            false,
+        )?;
 
         let results = memory.retrieve_full("cognitive memory system Aura Rust", 5)?;
         assert!(!results.is_empty(), "Should find results");
@@ -2651,10 +2931,12 @@ mod tests {
 
         // Scores should be in descending order
         for w in results.windows(2) {
-            assert!(w[0].1 >= w[1].1, "Results should be sorted by RRF score descending");
+            assert!(
+                w[0].1 >= w[1].1,
+                "Results should be sorted by RRF score descending"
+            );
         }
 
         Ok(())
     }
 }
-

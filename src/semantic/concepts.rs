@@ -149,10 +149,13 @@ impl ConceptGraph {
         let parent_key = parent.to_lowercase();
 
         // Update child node
-        let child_node = self.nodes.entry(child_key.clone()).or_insert_with(|| ConceptNode {
-            parents: Vec::new(),
-            children: Vec::new(),
-        });
+        let child_node = self
+            .nodes
+            .entry(child_key.clone())
+            .or_insert_with(|| ConceptNode {
+                parents: Vec::new(),
+                children: Vec::new(),
+            });
         if !child_node.parents.contains(&parent_key) {
             child_node.parents.push(parent_key.clone());
         }
@@ -187,7 +190,13 @@ impl ConceptGraph {
     pub fn get_ancestors(&self, concept: &str, max_depth: usize) -> Vec<String> {
         let mut ancestors = Vec::new();
         let mut visited = HashSet::new();
-        self.collect_ancestors(&concept.to_lowercase(), &mut ancestors, &mut visited, 0, max_depth);
+        self.collect_ancestors(
+            &concept.to_lowercase(),
+            &mut ancestors,
+            &mut visited,
+            0,
+            max_depth,
+        );
         ancestors
     }
 
@@ -195,7 +204,13 @@ impl ConceptGraph {
     pub fn get_descendants(&self, concept: &str, max_depth: usize) -> Vec<String> {
         let mut descendants = Vec::new();
         let mut visited = HashSet::new();
-        self.collect_descendants(&concept.to_lowercase(), &mut descendants, &mut visited, 0, max_depth);
+        self.collect_descendants(
+            &concept.to_lowercase(),
+            &mut descendants,
+            &mut visited,
+            0,
+            max_depth,
+        );
         descendants
     }
 
@@ -296,7 +311,8 @@ impl ConceptGraph {
             return true;
         }
 
-        self.get_ancestors(&child_lower, max_depth).contains(&parent_lower)
+        self.get_ancestors(&child_lower, max_depth)
+            .contains(&parent_lower)
     }
 
     /// Get number of concepts
@@ -344,7 +360,9 @@ mod tests {
 
         let descendants = graph.get_descendants("animal", 3);
         assert!(descendants.contains(&"mammal".to_string()));
-        assert!(descendants.contains(&"dog".to_string()) || descendants.contains(&"cat".to_string()));
+        assert!(
+            descendants.contains(&"dog".to_string()) || descendants.contains(&"cat".to_string())
+        );
     }
 
     #[test]

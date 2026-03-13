@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnchorData {
@@ -7,7 +7,7 @@ pub struct AnchorData {
     pub category: String,
     pub dna: String,
     pub impact: f32,
-    pub crystallization_trigger: String,  // "explicit", "identity", "intensity", "structural"
+    pub crystallization_trigger: String, // "explicit", "identity", "intensity", "structural"
 }
 
 /// Anchor detection via Cognitive Crystallization.
@@ -17,46 +17,47 @@ pub struct AnchorData {
 /// 2. Intensity exceeds crystallization threshold (3.5)
 /// 3. Structural significance (long, detailed content with metrics)
 /// 4. SFT text markers ("Anchor:", "Important:", "Critical:", "Identity:")
-    pub struct AnchorManager {
-        crystallization_threshold: f32,
-        min_text_length: usize,
-        metrics_re: Regex,
-    }
+pub struct AnchorManager {
+    crystallization_threshold: f32,
+    min_text_length: usize,
+    metrics_re: Regex,
+}
 
-    impl Default for AnchorManager {
-        fn default() -> Self {
-            Self::new()
+impl Default for AnchorManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AnchorManager {
+    pub fn new() -> Self {
+        Self {
+            crystallization_threshold: 3.5,
+            min_text_length: 20,
+            metrics_re: Regex::new(r"(?i)\d+\.?\d*\s*(ms|%|gb|mb|kb|fps|hz)")
+                .expect("invalid metrics regex"),
         }
     }
 
-    impl AnchorManager {
-        pub fn new() -> Self {
-            Self {
-                crystallization_threshold: 3.5,
-                min_text_length: 20,
-                metrics_re: Regex::new(r"(?i)\d+\.?\d*\s*(ms|%|gb|mb|kb|fps|hz)").expect("invalid metrics regex"),
-            }
+    pub fn evaluate_impact(&self, text: &str) -> f32 {
+        let mut impact_score = 0.0;
+
+        // 1. Structural weight (length)
+        let char_count = text.chars().count();
+        if char_count > 150 {
+            impact_score += 1.0;
+        } else if char_count > 80 {
+            impact_score += 0.5;
         }
 
-        pub fn evaluate_impact(&self, text: &str) -> f32 {
-            let mut impact_score = 0.0;
-    
-            // 1. Structural weight (length)
-            let char_count = text.chars().count();
-            if char_count > 150 {
-                impact_score += 1.0;
-            } else if char_count > 80 {
-                impact_score += 0.5;
-            }
-    
-            // 2. Numeric content (dates, metrics)
-            let digit_count = text.chars().filter(|c| c.is_ascii_digit()).count();
-            if digit_count >= 2 {
-                impact_score += 0.3;
-            }
-            
-            // 3. Technical precision: mentions of units/metrics (ms, %, GB, etc.)
-            if self.metrics_re.is_match(text) {
+        // 2. Numeric content (dates, metrics)
+        let digit_count = text.chars().filter(|c| c.is_ascii_digit()).count();
+        if digit_count >= 2 {
+            impact_score += 0.3;
+        }
+
+        // 3. Technical precision: mentions of units/metrics (ms, %, GB, etc.)
+        if self.metrics_re.is_match(text) {
             impact_score += 0.5;
         }
 
@@ -70,7 +71,12 @@ pub struct AnchorData {
     /// - intensity >= 3.5: High-salience content
     /// - Structural significance: Long, detailed content with metrics (impact >= 1.3)
     /// - SFT markers: Explicit text prefixes ("Anchor:", "Important:", etc.)
-    pub fn evaluate_and_pin(&self, text: &str, intensity: f32, force_pin: bool) -> Option<AnchorData> {
+    pub fn evaluate_and_pin(
+        &self,
+        text: &str,
+        intensity: f32,
+        force_pin: bool,
+    ) -> Option<AnchorData> {
         if text.len() < self.min_text_length {
             return None;
         }
@@ -111,16 +117,13 @@ pub struct AnchorData {
 mod tests {
     use super::*;
 
-
-
     #[test]
     fn test_metrics_impact() {
         let manager = AnchorManager::new();
-        
+
         let impact1 = manager.evaluate_impact("Our latency is 0.29ms");
         let impact2 = manager.evaluate_impact("Hello world");
-        
+
         assert!(impact1 > impact2, "Metrics should boost impact");
     }
 }
-

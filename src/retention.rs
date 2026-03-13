@@ -26,8 +26,6 @@ impl Default for RetentionPolicy {
 impl RetentionPolicy {
     /// Check if any policy is active.
     pub fn is_active(&self) -> bool {
-        self.max_age_days > 0.0
-            || self.auto_delete_below_strength > 0.0
-            || self.max_records > 0
+        self.max_age_days > 0.0 || self.auto_delete_below_strength > 0.0 || self.max_records > 0
     }
 }

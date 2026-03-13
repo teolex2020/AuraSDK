@@ -3,9 +3,9 @@
 //! Combines metadata from both aura-memory (SDR-based) and aura-cognitive
 //! (hierarchical decay) into a single struct exposed via PyO3.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Deserialize, Serialize};
 
 use crate::levels::Level;
 
@@ -71,7 +71,6 @@ pub struct Record {
     pub activation_velocity: f32,
 
     // ── Epistemic fields (Belief layer support) ──
-
     /// Epistemic confidence — how reliable this record is.
     /// Initialized from source_type: recorded=0.90, retrieved=0.75,
     /// inferred=0.60, generated=0.50. Range: 0.0–1.0.
@@ -182,10 +181,7 @@ impl Record {
         let conn_score = (self.connections.len() as f32 / 50.0).min(1.0);
         let act_score = (self.activation_count as f32 / 20.0).min(1.0);
 
-        0.40 * self.strength
-            + 0.25 * level_score
-            + 0.20 * conn_score
-            + 0.15 * act_score
+        0.40 * self.strength + 0.25 * level_score + 0.20 * conn_score + 0.15 * act_score
     }
 
     /// Activate this record (boost strength, update timestamp, update velocity).
@@ -250,9 +246,7 @@ impl Record {
     ///
     /// Requires: activation_count >= 5, strength >= 0.7, level < IDENTITY.
     pub fn can_promote(&self) -> bool {
-        self.activation_count >= 5
-            && self.strength >= 0.7
-            && self.level < Level::Identity
+        self.activation_count >= 5 && self.strength >= 0.7 && self.level < Level::Identity
     }
 
     /// Promote to the next level, if eligible.
@@ -274,7 +268,8 @@ impl Record {
     /// Add a typed bidirectional connection to another record.
     pub fn add_typed_connection(&mut self, other_id: &str, weight: f32, relationship: &str) {
         self.add_connection(other_id, weight);
-        self.connection_types.insert(other_id.to_string(), relationship.to_string());
+        self.connection_types
+            .insert(other_id.to_string(), relationship.to_string());
     }
 
     /// Get the relationship type for a connection (None if untyped).
@@ -301,8 +296,13 @@ impl Record {
         if ns.len() > 64 {
             return Err("Namespace cannot exceed 64 characters".into());
         }
-        if !ns.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-            return Err("Namespace must contain only ASCII alphanumeric, hyphens, or underscores".into());
+        if !ns
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(
+                "Namespace must contain only ASCII alphanumeric, hyphens, or underscores".into(),
+            );
         }
         Ok(())
     }
@@ -355,11 +355,7 @@ impl Record {
     /// Call this during maintenance with pre-computed neighbor counts.
     /// - `confirming`: number of neighbors that support this record
     /// - `conflicting`: number of neighbors that contradict this record
-    pub fn update_epistemic_signals(
-        &mut self,
-        confirming: u32,
-        conflicting: u32,
-    ) {
+    pub fn update_epistemic_signals(&mut self, confirming: u32, conflicting: u32) {
         let prev_confidence = self.confidence;
         let prev_support = self.support_mass;
         let prev_conflict = self.conflict_mass;
@@ -376,8 +372,8 @@ impl Record {
         let support_delta = (confirming.abs_diff(prev_support) as f32 / support_den) * 0.2;
         let conflict_delta = (conflicting.abs_diff(prev_conflict) as f32 / conflict_den) * 0.8;
         let instant_volatility = (confidence_delta + support_delta + conflict_delta).min(1.0);
-        self.volatility = VOLATILITY_ALPHA * instant_volatility
-            + (1.0 - VOLATILITY_ALPHA) * self.volatility;
+        self.volatility =
+            VOLATILITY_ALPHA * instant_volatility + (1.0 - VOLATILITY_ALPHA) * self.volatility;
     }
 
     /// Epistemic health score — combines confidence with support/conflict ratio.
@@ -407,53 +403,101 @@ impl Record {
 #[pymethods]
 impl Record {
     #[getter]
-    fn get_id(&self) -> &str { &self.id }
+    fn get_id(&self) -> &str {
+        &self.id
+    }
     #[getter]
-    fn get_content(&self) -> &str { &self.content }
+    fn get_content(&self) -> &str {
+        &self.content
+    }
     #[getter]
-    fn get_level(&self) -> Level { self.level }
+    fn get_level(&self) -> Level {
+        self.level
+    }
     #[getter]
-    fn get_strength(&self) -> f32 { self.strength }
+    fn get_strength(&self) -> f32 {
+        self.strength
+    }
     #[getter]
-    fn get_activation_count(&self) -> u32 { self.activation_count }
+    fn get_activation_count(&self) -> u32 {
+        self.activation_count
+    }
     #[getter]
-    fn get_created_at(&self) -> f64 { self.created_at }
+    fn get_created_at(&self) -> f64 {
+        self.created_at
+    }
     #[getter]
-    fn get_last_activated(&self) -> f64 { self.last_activated }
+    fn get_last_activated(&self) -> f64 {
+        self.last_activated
+    }
     #[getter]
-    fn get_tags(&self) -> Vec<String> { self.tags.clone() }
+    fn get_tags(&self) -> Vec<String> {
+        self.tags.clone()
+    }
     #[getter]
-    fn get_connections(&self) -> HashMap<String, f32> { self.connections.clone() }
+    fn get_connections(&self) -> HashMap<String, f32> {
+        self.connections.clone()
+    }
     #[getter]
-    fn get_connection_types(&self) -> HashMap<String, String> { self.connection_types.clone() }
+    fn get_connection_types(&self) -> HashMap<String, String> {
+        self.connection_types.clone()
+    }
     #[getter]
-    fn get_content_type(&self) -> &str { &self.content_type }
+    fn get_content_type(&self) -> &str {
+        &self.content_type
+    }
     #[getter]
-    fn get_metadata(&self) -> HashMap<String, String> { self.metadata.clone() }
+    fn get_metadata(&self) -> HashMap<String, String> {
+        self.metadata.clone()
+    }
     #[getter]
-    fn get_aura_id(&self) -> Option<String> { self.aura_id.clone() }
+    fn get_aura_id(&self) -> Option<String> {
+        self.aura_id.clone()
+    }
     #[getter]
-    fn get_caused_by_id(&self) -> Option<String> { self.caused_by_id.clone() }
+    fn get_caused_by_id(&self) -> Option<String> {
+        self.caused_by_id.clone()
+    }
     #[getter]
-    fn get_namespace(&self) -> &str { &self.namespace }
+    fn get_namespace(&self) -> &str {
+        &self.namespace
+    }
     #[getter]
-    fn get_source_type(&self) -> &str { &self.source_type }
+    fn get_source_type(&self) -> &str {
+        &self.source_type
+    }
     #[getter]
-    fn get_semantic_type(&self) -> &str { &self.semantic_type }
+    fn get_semantic_type(&self) -> &str {
+        &self.semantic_type
+    }
     #[getter]
-    fn get_activation_velocity(&self) -> f32 { self.activation_velocity }
+    fn get_activation_velocity(&self) -> f32 {
+        self.activation_velocity
+    }
     #[getter]
-    fn get_confidence(&self) -> f32 { self.confidence }
+    fn get_confidence(&self) -> f32 {
+        self.confidence
+    }
     #[getter]
-    fn get_support_mass(&self) -> u32 { self.support_mass }
+    fn get_support_mass(&self) -> u32 {
+        self.support_mass
+    }
     #[getter]
-    fn get_conflict_mass(&self) -> u32 { self.conflict_mass }
+    fn get_conflict_mass(&self) -> u32 {
+        self.conflict_mass
+    }
     #[getter]
-    fn get_volatility(&self) -> f32 { self.volatility }
+    fn get_volatility(&self) -> f32 {
+        self.volatility
+    }
     #[getter]
-    fn get_epistemic_health(&self) -> f32 { self.epistemic_health() }
+    fn get_epistemic_health(&self) -> f32 {
+        self.epistemic_health()
+    }
     #[getter]
-    fn get_importance(&self) -> f32 { self.importance() }
+    fn get_importance(&self) -> f32 {
+        self.importance()
+    }
 
     fn __repr__(&self) -> String {
         let ns_suffix = if self.namespace == DEFAULT_NAMESPACE {

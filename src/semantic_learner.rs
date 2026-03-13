@@ -3,8 +3,8 @@
 //! Observes co-activated records and discovers synonym relationships
 //! without external ML. Rewritten from aura-cognitive semantic_learner.py.
 
-use std::collections::HashMap;
 use crate::synonym::SynonymRing;
+use std::collections::HashMap;
 
 /// Configuration for the semantic learner.
 #[derive(Debug, Clone)]

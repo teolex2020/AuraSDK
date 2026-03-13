@@ -6,13 +6,13 @@
 //! - Quota management (memory/record limits)
 //! - Tenant-aware operations
 
+use anyhow::{anyhow, Result};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use anyhow::{anyhow, Result};
-use parking_lot::RwLock;
-use serde::{Serialize, Deserialize};
 
 use crate::crypto::EncryptionKey;
 use crate::memory::AuraMemory;
@@ -49,8 +49,8 @@ impl TenantConfig {
         Self {
             id: id.into(),
             name: name.into(),
-            max_records: 0,  // Unlimited
-            max_storage_bytes: 0,  // Unlimited
+            max_records: 0,       // Unlimited
+            max_storage_bytes: 0, // Unlimited
             require_encryption: false,
             metadata: HashMap::new(),
             created_at: now,
@@ -168,7 +168,10 @@ impl TenantManager {
     }
 
     /// Create tenant manager with master encryption key
-    pub fn with_encryption<P: AsRef<Path>>(base_path: P, master_key: EncryptionKey) -> Result<Self> {
+    pub fn with_encryption<P: AsRef<Path>>(
+        base_path: P,
+        master_key: EncryptionKey,
+    ) -> Result<Self> {
         let base_path = base_path.as_ref().to_path_buf();
         fs::create_dir_all(&base_path)?;
 
@@ -242,7 +245,9 @@ impl TenantManager {
 
         // Validate encryption requirement
         if config.require_encryption && self.master_key.is_none() {
-            return Err(anyhow!("Tenant requires encryption but no master key configured"));
+            return Err(anyhow!(
+                "Tenant requires encryption but no master key configured"
+            ));
         }
 
         // Create tenant directory
@@ -328,7 +333,8 @@ impl TenantManager {
         }
 
         // Load tenant config
-        let config = self.get_tenant(tenant_id)
+        let config = self
+            .get_tenant(tenant_id)
             .ok_or_else(|| anyhow!("Tenant '{}' not found", tenant_id))?;
 
         // Check quota before loading
@@ -380,7 +386,9 @@ impl TenantManager {
 
     /// Derive tenant-specific password from master key
     fn derive_tenant_password(&self, tenant_id: &str) -> Result<String> {
-        let master_key = self.master_key.as_ref()
+        let master_key = self
+            .master_key
+            .as_ref()
             .ok_or_else(|| anyhow!("No master key configured"))?;
 
         // Use HMAC to derive tenant-specific password
@@ -405,19 +413,20 @@ impl TenantManager {
     /// Record a store operation for quota tracking
     pub fn record_store(&self, tenant_id: &str, bytes_added: u64) -> Result<()> {
         // Get config for quota check
-        let config = self.get_tenant(tenant_id)
+        let config = self
+            .get_tenant(tenant_id)
             .ok_or_else(|| anyhow!("Tenant not found"))?;
 
         let mut guard = self.usage.write();
-        let usage = guard.entry(tenant_id.to_string())
-            .or_default();
+        let usage = guard.entry(tenant_id.to_string()).or_default();
 
         // Check quotas before recording
         if usage.exceeds_record_quota(&config) {
             return Err(anyhow!("Record quota exceeded"));
         }
-        if config.max_storage_bytes > 0 &&
-           usage.storage_bytes + bytes_added > config.max_storage_bytes {
+        if config.max_storage_bytes > 0
+            && usage.storage_bytes + bytes_added > config.max_storage_bytes
+        {
             return Err(anyhow!("Storage quota exceeded"));
         }
 
@@ -434,8 +443,7 @@ impl TenantManager {
     /// Record a retrieve operation
     pub fn record_retrieve(&self, tenant_id: &str) -> Result<()> {
         let mut guard = self.usage.write();
-        let usage = guard.entry(tenant_id.to_string())
-            .or_default();
+        let usage = guard.entry(tenant_id.to_string()).or_default();
 
         usage.record_retrieve_op();
 
@@ -502,8 +510,12 @@ mod tests {
         let manager = TenantManager::new(dir.path()).unwrap();
 
         // Create two tenants
-        manager.create_tenant(TenantConfig::new("tenant_a", "Tenant A")).unwrap();
-        manager.create_tenant(TenantConfig::new("tenant_b", "Tenant B")).unwrap();
+        manager
+            .create_tenant(TenantConfig::new("tenant_a", "Tenant A"))
+            .unwrap();
+        manager
+            .create_tenant(TenantConfig::new("tenant_b", "Tenant B"))
+            .unwrap();
 
         // Get separate memory instances
         let mem_a = manager.get_memory("tenant_a").unwrap();
@@ -540,9 +552,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = TenantManager::new(dir.path()).unwrap();
 
-        manager.create_tenant(TenantConfig::new("a", "Tenant A")).unwrap();
-        manager.create_tenant(TenantConfig::new("b", "Tenant B")).unwrap();
-        manager.create_tenant(TenantConfig::new("c", "Tenant C")).unwrap();
+        manager
+            .create_tenant(TenantConfig::new("a", "Tenant A"))
+            .unwrap();
+        manager
+            .create_tenant(TenantConfig::new("b", "Tenant B"))
+            .unwrap();
+        manager
+            .create_tenant(TenantConfig::new("c", "Tenant C"))
+            .unwrap();
 
         let tenants = manager.list_tenants();
         assert_eq!(tenants.len(), 3);
@@ -553,7 +571,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = TenantManager::new(dir.path()).unwrap();
 
-        manager.create_tenant(TenantConfig::new("delete_me", "To Delete")).unwrap();
+        manager
+            .create_tenant(TenantConfig::new("delete_me", "To Delete"))
+            .unwrap();
         assert!(manager.get_tenant("delete_me").is_some());
 
         manager.delete_tenant("delete_me").unwrap();
@@ -565,7 +585,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = TenantManager::new(dir.path()).unwrap();
 
-        manager.create_tenant(TenantConfig::new("tracked", "Tracked")).unwrap();
+        manager
+            .create_tenant(TenantConfig::new("tracked", "Tracked"))
+            .unwrap();
 
         manager.record_store("tracked", 500).unwrap();
         manager.record_store("tracked", 500).unwrap();

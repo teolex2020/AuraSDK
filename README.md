@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">AuraSDK</h1>
-  <p align="center"><strong>Cognitive Memory Engine for AI Agents</strong></p>
+  <p align="center"><strong>Deterministic Local Memory Engine for AI Agents</strong></p>
   <p align="center">
     Learns from experience · <1ms recall · No LLM calls · No cloud · ~3 MB
   </p>
@@ -26,7 +26,7 @@
 
 LLMs forget everything. Every conversation starts from zero. Existing solutions bolt on vector databases and LLM calls for basic recall, adding latency, cloud dependency, and cost to every operation.
 
-Aura gives your AI agent an adaptive cognitive layer: memory that decays, consolidates, learns from feedback, and evolves over time. Every record carries a semantic type (fact, decision, trend, preference, contradiction, serendipity) that shapes how it decays, promotes, and surfaces in recall. Like a brain, not a database. One `pip install`, works fully offline.
+Aura gives your agent a deterministic local memory engine with bounded belief-aware recall ranking and advisory cognitive overlays. Every record carries a semantic type (fact, decision, trend, preference, contradiction, serendipity) that shapes how it decays, promotes, and surfaces in local recall. One `pip install`, works fully offline.
 
 ```bash
 pip install aura-memory
@@ -45,7 +45,7 @@ brain.store("Deploy to staging first", level=Level.Decisions, tags=["workflow"],
 context = brain.recall("user preferences")  # <1ms — inject into any LLM prompt
 ```
 
-Your agent now remembers. No API keys. No embeddings. No config.
+Your agent now remembers. No API keys. No embeddings required. No cloud runtime.
 
 > **⭐ If AuraSDK is useful to you, a [GitHub star](https://github.com/teolex2020/AuraSDK) helps us get funding to continue development from Kyiv.**
 
@@ -55,7 +55,7 @@ Your agent now remembers. No API keys. No embeddings. No config.
 
 | | **Aura** | Mem0 | Zep | Cognee | Letta/MemGPT |
 |---|---|---|---|---|---|
-| **Architecture** | **Cognitive engine** | Vector + LLM | Vector + LLM | Graph + LLM | LLM orchestration |
+| **Architecture** | **Deterministic local memory** | Vector + LLM | Vector + LLM | Graph + LLM | LLM orchestration |
 | **LLM required** | **No** | Yes | Yes | Yes | Yes |
 | **Recall latency** | **<1ms** | ~200ms+ | ~200ms | LLM-bound | LLM-bound |
 | **Works offline** | **Fully** | Partial | No | No | With local LLM |
@@ -79,6 +79,21 @@ Benchmarked on 1,000 records (Windows 10 / Ryzen 7):
 | Maintenance cycle | 1.1 ms | No equivalent |
 
 Mem0 recall requires an embedding API call (~200ms+) + vector search. Aura recall is pure local computation.
+
+---
+
+## What Ships Today
+
+Aura's supported production path is:
+
+`Record -> Belief -> bounded recall rerank`
+
+Higher layers exist, but remain advisory:
+
+- `Concept` is available through surfaced inspect output only
+- `Causal` is advisory only
+- `Policy` is advisory surfaced output only
+- no concept, causal, or policy layer changes recall ordering or agent behavior automatically
 
 ---
 
@@ -144,6 +159,11 @@ report = brain.run_maintenance()  # background memory maintenance
 - **Pure Rust Core** — No Python dependencies, no external services
 
 ---
+
+**Advisory Cognitive Overlays**
+- **Belief-Aware Recall Rerank** — bounded production influence with strict guardrails
+- **Concept Inspect Surface** — surfaced concepts and per-record annotations for inspection only
+- **Causal / Policy Overlays** — advisory surfaced output only, no automatic control path
 
 ## Quick Start
 
@@ -335,8 +355,11 @@ Publicly documented concepts are:
 - Two-tier memory: cognitive + core
 - Semantic roles for records
 - Local multi-signal recall
+- Belief-aware bounded reranking
 - Trust, provenance, and namespace isolation
 - Maintenance, insights, consolidation, and versioning
+
+Higher cognitive layers may be present in the SDK as advisory inspection surfaces. They are not default runtime decision-making or behavior control.
 
 The public repository documents the user-facing behavior and integration surface. Detailed internal architecture, tuning, and research notes are intentionally not published.
 

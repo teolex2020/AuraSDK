@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 
 // SDR resolution based on feature flags
 #[cfg(feature = "lite")]
-const DEFAULT_TOTAL_BITS: usize = 16384;  // 16k bits for embedded
+const DEFAULT_TOTAL_BITS: usize = 16384; // 16k bits for embedded
 #[cfg(feature = "lite")]
 const DEFAULT_NUM_ACTIVE: usize = 128;
 #[cfg(feature = "lite")]
@@ -12,7 +12,7 @@ const DEFAULT_PROTECTED_RANGE: (usize, usize) = (0, 1024);
 const DEFAULT_GENERAL_RANGE: (usize, usize) = (1024, 16384);
 
 #[cfg(not(feature = "lite"))]
-const DEFAULT_TOTAL_BITS: usize = 262144;  // 256k bits (High Sparsity)
+const DEFAULT_TOTAL_BITS: usize = 262144; // 256k bits (High Sparsity)
 #[cfg(not(feature = "lite"))]
 const DEFAULT_NUM_ACTIVE: usize = 512;
 #[cfg(not(feature = "lite"))]
@@ -130,9 +130,15 @@ impl SDRInterpreter {
             // Zero-alloc path for ASCII text (RF-SIG, TGT, frequencies, etc.)
             let bytes = trimmed.as_bytes();
             let len = bytes.len();
-            if len == 0 { return vec![]; }
+            if len == 0 {
+                return vec![];
+            }
 
-            let estimated = if len >= 4 { (len - 3) * 20 + (len - 2) * 2 + (len - 1) } else { len * 3 };
+            let estimated = if len >= 4 {
+                (len - 3) * 20 + (len - 2) * 2 + (len - 1)
+            } else {
+                len * 3
+            };
             let mut indices: Vec<u16> = Vec::with_capacity(estimated);
             let mut gram_buf = [0u8; 4];
 
@@ -142,8 +148,14 @@ impl SDRInterpreter {
                     let mut has_digit = false;
                     for j in 0..4 {
                         let b = bytes[i + j];
-                        gram_buf[j] = if pre_lowered { b } else { b.to_ascii_lowercase() };
-                        if b.is_ascii_digit() { has_digit = true; }
+                        gram_buf[j] = if pre_lowered {
+                            b
+                        } else {
+                            b.to_ascii_lowercase()
+                        };
+                        if b.is_ascii_digit() {
+                            has_digit = true;
+                        }
                     }
 
                     let mut seed = xxhash_rust::xxh3::xxh3_64(&gram_buf[..4]);
@@ -164,8 +176,14 @@ impl SDRInterpreter {
                     let mut has_digit = false;
                     for j in 0..3 {
                         let b = bytes[i + j];
-                        gram_buf[j] = if pre_lowered { b } else { b.to_ascii_lowercase() };
-                        if b.is_ascii_digit() { has_digit = true; }
+                        gram_buf[j] = if pre_lowered {
+                            b
+                        } else {
+                            b.to_ascii_lowercase()
+                        };
+                        if b.is_ascii_digit() {
+                            has_digit = true;
+                        }
                     }
 
                     let mut seed = xxhash_rust::xxh3::xxh3_64(&gram_buf[..3]);
@@ -182,7 +200,11 @@ impl SDRInterpreter {
                 // Very short text
                 let mut lowered_buf = [0u8; 4];
                 for (j, &b) in bytes.iter().enumerate().take(4) {
-                    lowered_buf[j] = if pre_lowered { b } else { b.to_ascii_lowercase() };
+                    lowered_buf[j] = if pre_lowered {
+                        b
+                    } else {
+                        b.to_ascii_lowercase()
+                    };
                 }
                 let seed = xxhash_rust::xxh3::xxh3_64(&lowered_buf[..bytes.len()]);
                 for k in 0..2u64 {
@@ -194,8 +216,16 @@ impl SDRInterpreter {
             // --- 3. Bigrams (5% signal, 1 bit per gram) ---
             if len >= 2 {
                 for i in 0..=(len - 2) {
-                    gram_buf[0] = if pre_lowered { bytes[i] } else { bytes[i].to_ascii_lowercase() };
-                    gram_buf[1] = if pre_lowered { bytes[i + 1] } else { bytes[i + 1].to_ascii_lowercase() };
+                    gram_buf[0] = if pre_lowered {
+                        bytes[i]
+                    } else {
+                        bytes[i].to_ascii_lowercase()
+                    };
+                    gram_buf[1] = if pre_lowered {
+                        bytes[i + 1]
+                    } else {
+                        bytes[i + 1].to_ascii_lowercase()
+                    };
                     let seed = xxhash_rust::xxh3::xxh3_64(&gram_buf[..2]);
                     let idx = seed as usize % range_size;
                     indices.push((base + idx) as u16);
@@ -219,7 +249,11 @@ impl SDRInterpreter {
             return vec![];
         }
 
-        let estimated = if len >= 4 { (len - 3) * 20 + (len - 2) * 2 + (len - 1) } else { len * 3 };
+        let estimated = if len >= 4 {
+            (len - 3) * 20 + (len - 2) * 2 + (len - 1)
+        } else {
+            len * 3
+        };
         let mut indices: Vec<u16> = Vec::with_capacity(estimated);
         let mut gram_buf = [0u8; 16];
 
@@ -231,7 +265,9 @@ impl SDRInterpreter {
                 for &c in w {
                     let encoded = c.encode_utf8(&mut gram_buf[pos..]);
                     pos += encoded.len();
-                    if c.is_ascii_digit() { has_digit = true; }
+                    if c.is_ascii_digit() {
+                        has_digit = true;
+                    }
                 }
 
                 let mut seed = xxhash_rust::xxh3::xxh3_64(&gram_buf[..pos]);
@@ -254,7 +290,9 @@ impl SDRInterpreter {
                 for &c in w {
                     let encoded = c.encode_utf8(&mut gram_buf[pos..]);
                     pos += encoded.len();
-                    if c.is_ascii_digit() { has_digit = true; }
+                    if c.is_ascii_digit() {
+                        has_digit = true;
+                    }
                 }
 
                 let mut seed = xxhash_rust::xxh3::xxh3_64(&gram_buf[..pos]);
@@ -293,7 +331,7 @@ impl SDRInterpreter {
         indices.dedup();
         indices
     }
-    
+
     // Helper used in tests
     #[cfg(test)]
     pub fn to_dense(&self, sparse: &Vec<u16>) -> Vec<u8> {
@@ -318,7 +356,11 @@ impl SDRInterpreter {
                 union += 1;
             }
         }
-        if union == 0 { 0.0 } else { intersection as f32 / union as f32 }
+        if union == 0 {
+            0.0
+        } else {
+            intersection as f32 / union as f32
+        }
     }
 }
 
@@ -349,12 +391,11 @@ mod python_sdr {
         }
 
         /// Batch process multiple strings into a list of SDR lists.
-        pub fn batch_text_to_sdr(
-            &self,
-            texts: Vec<String>,
-            is_identity: bool
-        ) -> Vec<Vec<u16>> {
-            texts.iter().map(|t| self.text_to_sdr(t, is_identity)).collect()
+        pub fn batch_text_to_sdr(&self, texts: Vec<String>, is_identity: bool) -> Vec<Vec<u16>> {
+            texts
+                .iter()
+                .map(|t| self.text_to_sdr(t, is_identity))
+                .collect()
         }
 
         /// Calculate Tanimoto similarity (Python wrapper).
@@ -374,7 +415,7 @@ mod tests {
         let sdr = SDRInterpreter::default();
         let indices1 = sdr.text_to_sdr("Hello World", false);
         let indices2 = sdr.text_to_sdr("Hello World", false);
-        
+
         assert_eq!(indices1, indices2, "SDR must be deterministic");
         assert!(!indices1.is_empty());
     }
@@ -391,7 +432,7 @@ mod tests {
 
         assert!(sim1 > sim2, "Similar texts should have higher score");
     }
-    
+
     #[test]
     fn test_sdr_deterministic() {
         // Verify SDR generation is deterministic
@@ -417,16 +458,31 @@ mod tests {
         assert!(sim_identical > 0.15, "near-identical: {:.3}", sim_identical);
 
         // Same-topic pair (moderate paraphrase)
-        let sa = sdr.text_to_sdr("Always run integration tests before merging pull requests", false);
-        let sb = sdr.text_to_sdr("Run all integration tests before merging any pull request", false);
+        let sa = sdr.text_to_sdr(
+            "Always run integration tests before merging pull requests",
+            false,
+        );
+        let sb = sdr.text_to_sdr(
+            "Run all integration tests before merging any pull request",
+            false,
+        );
         let sim_paraphrase = sdr.tanimoto_sparse(&sa, &sb);
-        assert!(sim_paraphrase > 0.15, "moderate paraphrase: {:.3}", sim_paraphrase);
+        assert!(
+            sim_paraphrase > 0.15,
+            "moderate paraphrase: {:.3}",
+            sim_paraphrase
+        );
 
         // Cross-topic pair (should be low)
-        let sa = sdr.text_to_sdr("Configure blue-green deployment pipeline for zero-downtime releases", false);
-        let sb = sdr.text_to_sdr("Configure PostgreSQL connection pool with maximum twenty-five connections", false);
+        let sa = sdr.text_to_sdr(
+            "Configure blue-green deployment pipeline for zero-downtime releases",
+            false,
+        );
+        let sb = sdr.text_to_sdr(
+            "Configure PostgreSQL connection pool with maximum twenty-five connections",
+            false,
+        );
         let sim_cross = sdr.tanimoto_sparse(&sa, &sb);
         assert!(sim_cross < 0.15, "cross-topic: {:.3}", sim_cross);
-
     }
 }

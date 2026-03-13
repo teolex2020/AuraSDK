@@ -9,7 +9,7 @@ use axum::{
 };
 use metrics::{counter, histogram};
 
-use super::state::{API_PATHS, ServerState};
+use super::state::{ServerState, API_PATHS};
 
 pub(super) async fn auth_middleware(
     State(state): State<ServerState>,
@@ -27,7 +27,8 @@ pub(super) async fn auth_middleware(
         return next.run(req).await;
     }
 
-    let auth_header = req.headers()
+    let auth_header = req
+        .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
@@ -86,7 +87,8 @@ pub(super) async fn metrics_middleware(req: Request, next: Next) -> Response {
     let status = response.status().as_u16().to_string();
 
     counter!("aura_http_requests_total", "method" => method.clone(), "path" => path.clone(), "status" => status).increment(1);
-    histogram!("aura_http_request_duration_seconds", "method" => method, "path" => path).record(duration);
+    histogram!("aura_http_request_duration_seconds", "method" => method, "path" => path)
+        .record(duration);
 
     response
 }

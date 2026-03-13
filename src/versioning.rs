@@ -12,13 +12,13 @@
 //! - Delta from previous snapshot
 //! - Metadata (timestamp, message, parent)
 
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Write, BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use anyhow::{anyhow, Result};
-use serde::{Serialize, Deserialize};
 
 /// Snapshot identifier (first 12 chars of hash)
 pub type SnapshotId = String;
@@ -103,7 +103,10 @@ impl VersionDiff {
     pub fn summary(&self) -> String {
         format!(
             "+{} ~{} -{} ({} changes)",
-            self.added, self.modified, self.deleted, self.changes.len()
+            self.added,
+            self.modified,
+            self.deleted,
+            self.changes.len()
         )
     }
 }
@@ -172,12 +175,15 @@ impl VersionManager {
 
         // Ensure main branch exists
         if !manager.branches.contains_key("main") {
-            manager.branches.insert("main".to_string(), Branch {
-                name: "main".to_string(),
-                head: String::new(),
-                created_at: Self::now_ms(),
-                updated_at: Self::now_ms(),
-            });
+            manager.branches.insert(
+                "main".to_string(),
+                Branch {
+                    name: "main".to_string(),
+                    head: String::new(),
+                    created_at: Self::now_ms(),
+                    updated_at: Self::now_ms(),
+                },
+            );
         }
 
         Ok(manager)
@@ -260,9 +266,13 @@ impl VersionManager {
         }
 
         // Get parent from current branch
-        let parent = self.branches
-            .get(&self.current_branch)
-            .and_then(|b| if b.head.is_empty() { None } else { Some(b.head.clone()) });
+        let parent = self.branches.get(&self.current_branch).and_then(|b| {
+            if b.head.is_empty() {
+                None
+            } else {
+                Some(b.head.clone())
+            }
+        });
 
         let snapshot = Snapshot {
             id: id.clone(),
@@ -278,7 +288,8 @@ impl VersionManager {
         };
 
         // Save snapshot data
-        let snapshot_path = self.storage_path
+        let snapshot_path = self
+            .storage_path
             .join("versions")
             .join(format!("{}.snap", id));
 
@@ -319,10 +330,12 @@ impl VersionManager {
 
     /// Load records from a snapshot
     pub fn load_snapshot(&self, id: &str) -> Result<Vec<VersionedRecord>> {
-        let snapshot = self.get_snapshot(id)
+        let snapshot = self
+            .get_snapshot(id)
             .ok_or_else(|| anyhow!("Snapshot not found: {}", id))?;
 
-        let snapshot_path = self.storage_path
+        let snapshot_path = self
+            .storage_path
             .join("versions")
             .join(format!("{}.snap", snapshot.id));
 
@@ -339,15 +352,11 @@ impl VersionManager {
         let to_records = self.load_snapshot(to_id)?;
 
         // Index records by ID
-        let from_map: HashMap<&str, &VersionedRecord> = from_records
-            .iter()
-            .map(|r| (r.id.as_str(), r))
-            .collect();
+        let from_map: HashMap<&str, &VersionedRecord> =
+            from_records.iter().map(|r| (r.id.as_str(), r)).collect();
 
-        let to_map: HashMap<&str, &VersionedRecord> = to_records
-            .iter()
-            .map(|r| (r.id.as_str(), r))
-            .collect();
+        let to_map: HashMap<&str, &VersionedRecord> =
+            to_records.iter().map(|r| (r.id.as_str(), r)).collect();
 
         let mut changes = Vec::new();
         let mut added = 0;
@@ -402,9 +411,11 @@ impl VersionManager {
         }
 
         // Resolve full IDs
-        let from_snapshot = self.get_snapshot(from_id)
+        let from_snapshot = self
+            .get_snapshot(from_id)
             .ok_or_else(|| anyhow!("Snapshot not found: {}", from_id))?;
-        let to_snapshot = self.get_snapshot(to_id)
+        let to_snapshot = self
+            .get_snapshot(to_id)
             .ok_or_else(|| anyhow!("Snapshot not found: {}", to_id))?;
 
         Ok(VersionDiff {
@@ -419,7 +430,8 @@ impl VersionManager {
 
     /// Get history of snapshots (newest first)
     pub fn history(&self, limit: usize) -> Vec<HistoryEntry> {
-        let head_id = self.branches
+        let head_id = self
+            .branches
             .get(&self.current_branch)
             .map(|b| b.head.clone())
             .unwrap_or_default();
@@ -450,7 +462,8 @@ impl VersionManager {
 
     /// Get all snapshots for a branch
     pub fn branch_history(&self, branch_name: &str) -> Vec<&Snapshot> {
-        let mut snapshots: Vec<_> = self.snapshots
+        let mut snapshots: Vec<_> = self
+            .snapshots
             .values()
             .filter(|s| s.branch == branch_name)
             .collect();
@@ -465,7 +478,8 @@ impl VersionManager {
             return Err(anyhow!("Branch '{}' already exists", name));
         }
 
-        let current_head = self.branches
+        let current_head = self
+            .branches
             .get(&self.current_branch)
             .map(|b| b.head.clone())
             .unwrap_or_default();
@@ -524,7 +538,8 @@ impl VersionManager {
 
     /// Get current HEAD snapshot
     pub fn head(&self) -> Option<&Snapshot> {
-        let head_id = self.branches
+        let head_id = self
+            .branches
             .get(&self.current_branch)
             .map(|b| b.head.as_str())?;
 
@@ -537,7 +552,9 @@ impl VersionManager {
 
     /// Tag a snapshot
     pub fn tag_snapshot(&mut self, id: &str, tag: &str) -> Result<()> {
-        let snapshot = self.snapshots.get_mut(id)
+        let snapshot = self
+            .snapshots
+            .get_mut(id)
             .ok_or_else(|| anyhow!("Snapshot not found: {}", id))?;
 
         if !snapshot.tags.contains(&tag.to_string()) {
@@ -550,7 +567,9 @@ impl VersionManager {
 
     /// Find snapshot by tag
     pub fn find_by_tag(&self, tag: &str) -> Option<&Snapshot> {
-        self.snapshots.values().find(|s| s.tags.contains(&tag.to_string()))
+        self.snapshots
+            .values()
+            .find(|s| s.tags.contains(&tag.to_string()))
     }
 
     /// Get snapshot count
@@ -587,7 +606,8 @@ impl VersionManager {
         }
 
         // Remove unreachable snapshots
-        let to_remove: Vec<_> = self.snapshots
+        let to_remove: Vec<_> = self
+            .snapshots
             .keys()
             .filter(|id| !reachable.contains(*id))
             .cloned()
@@ -598,7 +618,8 @@ impl VersionManager {
             self.snapshots.remove(id);
 
             // Delete snapshot file
-            let snapshot_path = self.storage_path
+            let snapshot_path = self
+                .storage_path
                 .join("versions")
                 .join(format!("{}.snap", id));
             let _ = fs::remove_file(snapshot_path);
@@ -626,12 +647,16 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_records(texts: &[&str]) -> Vec<VersionedRecord> {
-        texts.iter().enumerate().map(|(i, text)| VersionedRecord {
-            id: format!("rec_{}", i),
-            text: text.to_string(),
-            timestamp: 1000000 + i as u64,
-            layer: "general".to_string(),
-        }).collect()
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| VersionedRecord {
+                id: format!("rec_{}", i),
+                text: text.to_string(),
+                timestamp: 1000000 + i as u64,
+                layer: "general".to_string(),
+            })
+            .collect()
     }
 
     #[test]
@@ -674,14 +699,14 @@ mod tests {
         let records2 = vec![
             VersionedRecord {
                 id: "rec_0".to_string(),
-                text: "Hello world modified".to_string(),  // Modified
+                text: "Hello world modified".to_string(), // Modified
                 timestamp: 2000000,
                 layer: "general".to_string(),
             },
             // rec_1 deleted
             VersionedRecord {
                 id: "rec_2".to_string(),
-                text: "New record".to_string(),  // Added
+                text: "New record".to_string(), // Added
                 timestamp: 2000001,
                 layer: "general".to_string(),
             },
@@ -700,12 +725,13 @@ mod tests {
         let mut vm = VersionManager::new(dir.path()).unwrap();
 
         vm.create_snapshot(&make_records(&["v1"]), "First").unwrap();
-        vm.create_snapshot(&make_records(&["v2"]), "Second").unwrap();
+        vm.create_snapshot(&make_records(&["v2"]), "Second")
+            .unwrap();
         vm.create_snapshot(&make_records(&["v3"]), "Third").unwrap();
 
         let history = vm.history(10);
         assert_eq!(history.len(), 3);
-        assert_eq!(history[0].snapshot.message, "Third");  // Newest first
+        assert_eq!(history[0].snapshot.message, "Third"); // Newest first
         assert!(history[0].is_head);
     }
 
@@ -715,14 +741,17 @@ mod tests {
         let mut vm = VersionManager::new(dir.path()).unwrap();
 
         // Create initial commit on main
-        vm.create_snapshot(&make_records(&["main v1"]), "Main commit").unwrap();
+        vm.create_snapshot(&make_records(&["main v1"]), "Main commit")
+            .unwrap();
 
         // Create and switch to feature branch
         vm.create_branch("feature").unwrap();
         vm.checkout_branch("feature").unwrap();
 
         // Commit on feature branch
-        let feature_snap = vm.create_snapshot(&make_records(&["feature v1"]), "Feature commit").unwrap();
+        let feature_snap = vm
+            .create_snapshot(&make_records(&["feature v1"]), "Feature commit")
+            .unwrap();
         assert_eq!(feature_snap.branch, "feature");
 
         // Switch back to main
@@ -739,7 +768,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut vm = VersionManager::new(dir.path()).unwrap();
 
-        let snap = vm.create_snapshot(&make_records(&["release"]), "Release").unwrap();
+        let snap = vm
+            .create_snapshot(&make_records(&["release"]), "Release")
+            .unwrap();
         vm.tag_snapshot(&snap.id, "v1.0.0").unwrap();
 
         let found = vm.find_by_tag("v1.0.0").unwrap();
@@ -769,7 +800,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut vm = VersionManager::new(dir.path()).unwrap();
 
-        let snap = vm.create_snapshot(&make_records(&["test"]), "Test").unwrap();
+        let snap = vm
+            .create_snapshot(&make_records(&["test"]), "Test")
+            .unwrap();
 
         // Should find by partial ID (first 6 chars)
         let partial = &snap.id[..6];

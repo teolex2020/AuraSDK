@@ -59,48 +59,83 @@ impl TemporalResolver {
         self.patterns.insert("now".to_string(), DayOffset(0));
         self.patterns.insert("yesterday".to_string(), DayOffset(-1));
         self.patterns.insert("tomorrow".to_string(), DayOffset(1));
-        self.patterns.insert("day before yesterday".to_string(), DayOffset(-2));
-        self.patterns.insert("day after tomorrow".to_string(), DayOffset(2));
+        self.patterns
+            .insert("day before yesterday".to_string(), DayOffset(-2));
+        self.patterns
+            .insert("day after tomorrow".to_string(), DayOffset(2));
 
         // Ranges
-        self.patterns.insert("last week".to_string(), DayRange(-7, -1));
-        self.patterns.insert("this week".to_string(), DayRange(-6, 0));
-        self.patterns.insert("next week".to_string(), DayRange(1, 7));
-        self.patterns.insert("last month".to_string(), DayRange(-30, -1));
-        self.patterns.insert("this month".to_string(), DayRange(-29, 0));
-        self.patterns.insert("last year".to_string(), DayRange(-365, -1));
-        self.patterns.insert("past week".to_string(), DayRange(-7, 0));
-        self.patterns.insert("past month".to_string(), DayRange(-30, 0));
-        self.patterns.insert("recently".to_string(), DayRange(-7, 0));
+        self.patterns
+            .insert("last week".to_string(), DayRange(-7, -1));
+        self.patterns
+            .insert("this week".to_string(), DayRange(-6, 0));
+        self.patterns
+            .insert("next week".to_string(), DayRange(1, 7));
+        self.patterns
+            .insert("last month".to_string(), DayRange(-30, -1));
+        self.patterns
+            .insert("this month".to_string(), DayRange(-29, 0));
+        self.patterns
+            .insert("last year".to_string(), DayRange(-365, -1));
+        self.patterns
+            .insert("past week".to_string(), DayRange(-7, 0));
+        self.patterns
+            .insert("past month".to_string(), DayRange(-30, 0));
+        self.patterns
+            .insert("recently".to_string(), DayRange(-7, 0));
         self.patterns.insert("lately".to_string(), DayRange(-14, 0));
 
         // Weekdays (last)
-        self.patterns.insert("last monday".to_string(), LastWeekday(Weekday::Mon));
-        self.patterns.insert("last tuesday".to_string(), LastWeekday(Weekday::Tue));
-        self.patterns.insert("last wednesday".to_string(), LastWeekday(Weekday::Wed));
-        self.patterns.insert("last thursday".to_string(), LastWeekday(Weekday::Thu));
-        self.patterns.insert("last friday".to_string(), LastWeekday(Weekday::Fri));
-        self.patterns.insert("last saturday".to_string(), LastWeekday(Weekday::Sat));
-        self.patterns.insert("last sunday".to_string(), LastWeekday(Weekday::Sun));
+        self.patterns
+            .insert("last monday".to_string(), LastWeekday(Weekday::Mon));
+        self.patterns
+            .insert("last tuesday".to_string(), LastWeekday(Weekday::Tue));
+        self.patterns
+            .insert("last wednesday".to_string(), LastWeekday(Weekday::Wed));
+        self.patterns
+            .insert("last thursday".to_string(), LastWeekday(Weekday::Thu));
+        self.patterns
+            .insert("last friday".to_string(), LastWeekday(Weekday::Fri));
+        self.patterns
+            .insert("last saturday".to_string(), LastWeekday(Weekday::Sat));
+        self.patterns
+            .insert("last sunday".to_string(), LastWeekday(Weekday::Sun));
 
         // Weekdays (next)
-        self.patterns.insert("next monday".to_string(), NextWeekday(Weekday::Mon));
-        self.patterns.insert("next tuesday".to_string(), NextWeekday(Weekday::Tue));
-        self.patterns.insert("next wednesday".to_string(), NextWeekday(Weekday::Wed));
-        self.patterns.insert("next thursday".to_string(), NextWeekday(Weekday::Thu));
-        self.patterns.insert("next friday".to_string(), NextWeekday(Weekday::Fri));
-        self.patterns.insert("next saturday".to_string(), NextWeekday(Weekday::Sat));
-        self.patterns.insert("next sunday".to_string(), NextWeekday(Weekday::Sun));
+        self.patterns
+            .insert("next monday".to_string(), NextWeekday(Weekday::Mon));
+        self.patterns
+            .insert("next tuesday".to_string(), NextWeekday(Weekday::Tue));
+        self.patterns
+            .insert("next wednesday".to_string(), NextWeekday(Weekday::Wed));
+        self.patterns
+            .insert("next thursday".to_string(), NextWeekday(Weekday::Thu));
+        self.patterns
+            .insert("next friday".to_string(), NextWeekday(Weekday::Fri));
+        self.patterns
+            .insert("next saturday".to_string(), NextWeekday(Weekday::Sat));
+        self.patterns
+            .insert("next sunday".to_string(), NextWeekday(Weekday::Sun));
 
         // Time of day
-        self.patterns.insert("morning".to_string(), TimeOfDay("morning".to_string()));
-        self.patterns.insert("this morning".to_string(), TimeOfDay("morning".to_string()));
-        self.patterns.insert("afternoon".to_string(), TimeOfDay("afternoon".to_string()));
-        self.patterns.insert("this afternoon".to_string(), TimeOfDay("afternoon".to_string()));
-        self.patterns.insert("evening".to_string(), TimeOfDay("evening".to_string()));
-        self.patterns.insert("this evening".to_string(), TimeOfDay("evening".to_string()));
-        self.patterns.insert("tonight".to_string(), TimeOfDay("night".to_string()));
-        self.patterns.insert("last night".to_string(), TimeOfDay("night".to_string()));
+        self.patterns
+            .insert("morning".to_string(), TimeOfDay("morning".to_string()));
+        self.patterns
+            .insert("this morning".to_string(), TimeOfDay("morning".to_string()));
+        self.patterns
+            .insert("afternoon".to_string(), TimeOfDay("afternoon".to_string()));
+        self.patterns.insert(
+            "this afternoon".to_string(),
+            TimeOfDay("afternoon".to_string()),
+        );
+        self.patterns
+            .insert("evening".to_string(), TimeOfDay("evening".to_string()));
+        self.patterns
+            .insert("this evening".to_string(), TimeOfDay("evening".to_string()));
+        self.patterns
+            .insert("tonight".to_string(), TimeOfDay("night".to_string()));
+        self.patterns
+            .insert("last night".to_string(), TimeOfDay("night".to_string()));
     }
 
     /// Resolve temporal expressions in text to concrete dates
@@ -117,8 +152,11 @@ impl TemporalResolver {
             if text_lower.contains(pattern) {
                 let replacement = self.resolve_pattern(temporal, today);
                 // Case-insensitive replacement
-                let pattern_regex = regex::Regex::new(&format!("(?i){}", regex::escape(pattern))).unwrap();
-                result = pattern_regex.replace_all(&result, replacement.as_str()).to_string();
+                let pattern_regex =
+                    regex::Regex::new(&format!("(?i){}", regex::escape(pattern))).unwrap();
+                result = pattern_regex
+                    .replace_all(&result, replacement.as_str())
+                    .to_string();
             }
         }
 

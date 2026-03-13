@@ -13,12 +13,12 @@
 //! - Claim 7: O(k) SDR search complexity
 //! - Claim 8: Entropy-weighted stability
 
-pub mod synonym;
 pub mod concepts;
+pub mod synonym;
 pub mod temporal;
 
-pub use synonym::SynonymExpander;
 pub use concepts::ConceptGraph;
+pub use synonym::SynonymExpander;
 pub use temporal::TemporalResolver;
 
 /// Semantic enhancement configuration
@@ -99,14 +99,18 @@ impl SemanticEnhancer {
 
         // 2. Expand with synonyms
         if self.config.expand_synonyms {
-            let synonym_expansion = self.synonyms.expand_text(&resolved_text, self.config.max_synonyms_per_word);
+            let synonym_expansion = self
+                .synonyms
+                .expand_text(&resolved_text, self.config.max_synonyms_per_word);
             expanded.push_str(&synonym_expansion);
             expanded.push(' ');
         }
 
         // 3. Expand with concept hierarchy (upward traversal)
         if self.config.use_concepts {
-            let concept_expansion = self.concepts.expand_upward(&resolved_text, self.config.max_concept_depth);
+            let concept_expansion = self
+                .concepts
+                .expand_upward(&resolved_text, self.config.max_concept_depth);
             expanded.push_str(&concept_expansion);
         }
 

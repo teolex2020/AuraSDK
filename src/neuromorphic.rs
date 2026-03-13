@@ -13,12 +13,12 @@
 //! - Ultra-low power edge inference
 //! - Real-time pattern matching
 
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Write, BufWriter};
+use std::io::{BufWriter, Write};
 use std::path::Path;
-use anyhow::Result;
-use serde::{Serialize, Deserialize};
 
 /// SpiNNaker neuron population configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,7 +46,7 @@ impl Default for SpiNNakerPopulation {
 
         Self {
             label: "aura_sdr".to_string(),
-            n_neurons: 262144,  // Default SDR size
+            n_neurons: 262144, // Default SDR size
             model: "IF_curr_exp".to_string(),
             params,
         }
@@ -130,7 +130,7 @@ impl SpiNNakerExporter {
     /// Export multiple SDRs as concatenated spike trains
     pub fn export_spike_trains(
         &self,
-        memories: &[(&str, &[u32])],  // (id, active_bits)
+        memories: &[(&str, &[u32])], // (id, active_bits)
     ) -> Vec<SpikeTrain> {
         let mut offset_ms = 0.0;
         let mut trains = Vec::new();
@@ -161,10 +161,7 @@ impl SpiNNakerExporter {
         script.push_str("from pyNN.utility.plotting import Figure, Panel\n\n");
 
         // Setup
-        script.push_str(&format!(
-            "sim.setup(timestep={})\n\n",
-            self.timestep_ms
-        ));
+        script.push_str(&format!("sim.setup(timestep={})\n\n", self.timestep_ms));
 
         // Population
         script.push_str(&format!(
@@ -173,8 +170,7 @@ impl SpiNNakerExporter {
         ));
         script.push_str(&format!(
             "sdr_pop = sim.Population({}, sim.{}(**{{\n",
-            self.population.n_neurons,
-            self.population.model
+            self.population.n_neurons, self.population.model
         ));
         for (key, value) in &self.population.params {
             script.push_str(&format!("    '{}': {},\n", key, value));
@@ -199,19 +195,14 @@ impl SpiNNakerExporter {
                     .push(spike.timestamp_ms);
             }
             for (neuron, times) in &neuron_spikes {
-                script.push_str(&format!(
-                    "    {}: {:?},\n",
-                    neuron, times
-                ));
+                script.push_str(&format!("    {}: {:?},\n", neuron, times));
             }
             script.push_str("}\n\n");
         }
 
         // Record and run
-        let total_time: f64 = trains.iter()
-            .map(|t| t.duration_ms)
-            .sum::<f64>()
-            + (trains.len() as f64 * self.gap_ms);
+        let total_time: f64 =
+            trains.iter().map(|t| t.duration_ms).sum::<f64>() + (trains.len() as f64 * self.gap_ms);
 
         script.push_str("sdr_pop.record(['spikes', 'v'])\n");
         script.push_str(&format!("sim.run({})\n\n", total_time));
@@ -236,8 +227,8 @@ impl SpiNNakerExporter {
         let mut writer = BufWriter::new(file);
 
         // Header: magic, version, n_patterns, n_neurons
-        writer.write_all(b"AURA")?;  // Magic
-        writer.write_all(&[1u8])?;   // Version
+        writer.write_all(b"AURA")?; // Magic
+        writer.write_all(&[1u8])?; // Version
         writer.write_all(&(trains.len() as u32).to_le_bytes())?;
         writer.write_all(&self.population.n_neurons.to_le_bytes())?;
 
@@ -370,7 +361,9 @@ impl FpgaExporter {
         verilog.push_str("                DIVIDE: begin\n");
         verilog.push_str("                    // Tanimoto = intersection / union\n");
         verilog.push_str("                    if (union_count > 0)\n");
-        verilog.push_str("                        similarity <= (intersection << 16) / union_count;\n");
+        verilog.push_str(
+            "                        similarity <= (intersection << 16) / union_count;\n",
+        );
         verilog.push_str("                    else\n");
         verilog.push_str("                        similarity <= 0;\n");
         verilog.push_str("                    state <= DONE;\n");
@@ -430,7 +423,7 @@ impl FpgaExporter {
         let mut writer = BufWriter::new(file);
 
         // Header
-        writer.write_all(b"AFPG")?;  // Magic: Aura FPGA
+        writer.write_all(b"AFPG")?; // Magic: Aura FPGA
         writer.write_all(&self.sdr_width.to_le_bytes())?;
         writer.write_all(&(patterns.len() as u32).to_le_bytes())?;
 
@@ -457,7 +450,7 @@ impl Loihi2Exporter {
     pub fn new(n_cores: u32) -> Self {
         Self {
             n_cores,
-            neurons_per_core: 128,  // Loihi 2 default
+            neurons_per_core: 128, // Loihi 2 default
         }
     }
 
@@ -542,10 +535,7 @@ mod tests {
         let exporter = SpiNNakerExporter::default();
         let mem1_bits = vec![1u32, 2, 3];
         let mem2_bits = vec![10u32, 20, 30];
-        let memories: Vec<(&str, &[u32])> = vec![
-            ("mem1", &mem1_bits),
-            ("mem2", &mem2_bits),
-        ];
+        let memories: Vec<(&str, &[u32])> = vec![("mem1", &mem1_bits), ("mem2", &mem2_bits)];
 
         let trains = exporter.export_spike_trains(&memories);
 
@@ -566,13 +556,13 @@ mod tests {
 
         assert_eq!(packed.n_bits, 256);
         assert_eq!(packed.active_count, 5);
-        assert_eq!(packed.packed_bits.len(), 32);  // 256/8 bytes
+        assert_eq!(packed.packed_bits.len(), 32); // 256/8 bytes
 
         // Check specific bits
-        assert_eq!(packed.packed_bits[0] & 0x01, 1);  // bit 0
-        assert_eq!(packed.packed_bits[0] & 0x80, 128);  // bit 7
-        assert_eq!(packed.packed_bits[1] & 0x01, 1);  // bit 8
-        assert_eq!(packed.packed_bits[31] & 0x80, 128);  // bit 255
+        assert_eq!(packed.packed_bits[0] & 0x01, 1); // bit 0
+        assert_eq!(packed.packed_bits[0] & 0x80, 128); // bit 7
+        assert_eq!(packed.packed_bits[1] & 0x01, 1); // bit 8
+        assert_eq!(packed.packed_bits[31] & 0x80, 128); // bit 255
     }
 
     #[test]
@@ -591,7 +581,7 @@ mod tests {
         assert!(core_map.contains_key(&2));
         assert!(core_map.contains_key(&7));
 
-        assert_eq!(core_map.get(&0).unwrap().len(), 2);  // neurons 0 and 127
+        assert_eq!(core_map.get(&0).unwrap().len(), 2); // neurons 0 and 127
     }
 
     #[test]
@@ -608,10 +598,7 @@ mod tests {
     #[test]
     fn test_generate_mif() {
         let exporter = FpgaExporter::new(16, 4);
-        let patterns = vec![
-            exporter.pack_sdr(&[0, 8]),
-            exporter.pack_sdr(&[1, 9]),
-        ];
+        let patterns = vec![exporter.pack_sdr(&[0, 8]), exporter.pack_sdr(&[1, 9])];
 
         let mif = exporter.generate_mif(&patterns);
 

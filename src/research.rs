@@ -2,8 +2,8 @@
 //!
 //! Rewritten from brain_tools.py research logic.
 
-use std::collections::HashMap;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::credibility::SourceCredibility;
@@ -109,7 +109,8 @@ impl ResearchEngine {
         };
 
         let mut projects = self.projects.write();
-        let project = projects.get_mut(project_id)
+        let project = projects
+            .get_mut(project_id)
             .ok_or_else(|| format!("Project {} not found", project_id))?;
 
         if project.status != ResearchStatus::Active {
@@ -130,7 +131,8 @@ impl ResearchEngine {
         synthesis: Option<String>,
     ) -> Result<ResearchProject, String> {
         let mut projects = self.projects.write();
-        let project = projects.get_mut(project_id)
+        let project = projects
+            .get_mut(project_id)
             .ok_or_else(|| format!("Project {} not found", project_id))?;
 
         project.status = ResearchStatus::Completed;
@@ -142,7 +144,8 @@ impl ResearchEngine {
     /// Cancel a research project.
     pub fn cancel_research(&self, project_id: &str) -> Result<(), String> {
         let mut projects = self.projects.write();
-        let project = projects.get_mut(project_id)
+        let project = projects
+            .get_mut(project_id)
             .ok_or_else(|| format!("Project {} not found", project_id))?;
         project.status = ResearchStatus::Cancelled;
         Ok(())
@@ -150,7 +153,8 @@ impl ResearchEngine {
 
     /// Get all active research projects.
     pub fn active_projects(&self) -> Vec<ResearchProject> {
-        self.projects.read()
+        self.projects
+            .read()
             .values()
             .filter(|p| p.status == ResearchStatus::Active)
             .cloned()
@@ -193,19 +197,26 @@ mod tests {
         assert_eq!(project.queries.len(), 4);
 
         // Add findings
-        engine.add_finding(
-            &project.id, "GRPO paper", "Published by DeepSeek...",
-            Some("https://arxiv.org/paper/123"),
-        ).unwrap();
+        engine
+            .add_finding(
+                &project.id,
+                "GRPO paper",
+                "Published by DeepSeek...",
+                Some("https://arxiv.org/paper/123"),
+            )
+            .unwrap();
 
         let p = engine.get_project(&project.id).unwrap();
         assert_eq!(p.findings.len(), 1);
         assert!(p.findings[0].credibility > 0.8); // arxiv = 0.90
 
         // Complete
-        let completed = engine.complete_research(
-            &project.id, Some("GRPO is a group-relative policy optimization...".into()),
-        ).unwrap();
+        let completed = engine
+            .complete_research(
+                &project.id,
+                Some("GRPO is a group-relative policy optimization...".into()),
+            )
+            .unwrap();
         assert_eq!(completed.status, ResearchStatus::Completed);
         assert!(completed.synthesis.is_some());
     }
@@ -215,8 +226,17 @@ mod tests {
         let engine = ResearchEngine::new();
         let project = engine.start_research("test", None);
 
-        engine.add_finding(&project.id, "q1", "result", Some("https://reddit.com/r/test")).unwrap();
-        engine.add_finding(&project.id, "q2", "result", Some("https://nature.com/123")).unwrap();
+        engine
+            .add_finding(
+                &project.id,
+                "q1",
+                "result",
+                Some("https://reddit.com/r/test"),
+            )
+            .unwrap();
+        engine
+            .add_finding(&project.id, "q2", "result", Some("https://nature.com/123"))
+            .unwrap();
 
         let p = engine.get_project(&project.id).unwrap();
         assert!(p.findings[1].credibility > p.findings[0].credibility);

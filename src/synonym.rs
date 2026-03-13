@@ -3,9 +3,9 @@
 //! Rewritten from aura-cognitive synonym.py.
 //! Complements CanonicalProjector: canonical normalizes input, SynonymRing expands queries.
 
+use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use anyhow::Result;
 
 /// Bidirectional synonym ring for query expansion.
 #[derive(Debug, Clone)]
@@ -30,10 +30,7 @@ impl SynonymRing {
             .entry(a_lower.clone())
             .or_default()
             .insert(b_lower.clone());
-        self.ring
-            .entry(b_lower)
-            .or_default()
-            .insert(a_lower);
+        self.ring.entry(b_lower).or_default().insert(a_lower);
     }
 
     /// Add a group of synonyms (all linked to each other).
@@ -87,10 +84,7 @@ impl SynonymRing {
         if let Some(groups) = value.get("groups").and_then(|v| v.as_array()) {
             for group in groups {
                 if let Some(words) = group.get("words").and_then(|v| v.as_array()) {
-                    let word_strs: Vec<&str> = words
-                        .iter()
-                        .filter_map(|w| w.as_str())
-                        .collect();
+                    let word_strs: Vec<&str> = words.iter().filter_map(|w| w.as_str()).collect();
                     self.add_group(&word_strs);
                     count += word_strs.len();
                 }

@@ -4,8 +4,8 @@
 //! and used as an additional ranked list in the recall pipeline.
 //! This is optional — Aura works fully without embeddings.
 
-use std::collections::HashMap;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 
 /// Stores pre-computed embeddings for records.
 pub struct EmbeddingStore {
@@ -22,7 +22,9 @@ impl EmbeddingStore {
 
     /// Store an embedding for a record.
     pub fn insert(&self, record_id: &str, embedding: Vec<f32>) {
-        self.embeddings.write().insert(record_id.to_string(), embedding);
+        self.embeddings
+            .write()
+            .insert(record_id.to_string(), embedding);
     }
 
     /// Remove an embedding.

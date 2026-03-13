@@ -185,7 +185,11 @@ impl NGramIndex {
             None => return 0.0,
         };
 
-        let matching = sig_a.iter().zip(sig_b.iter()).filter(|(a, b)| a == b).count();
+        let matching = sig_a
+            .iter()
+            .zip(sig_b.iter())
+            .filter(|(a, b)| a == b)
+            .count();
         matching as f32 / self.num_hashes as f32
     }
 
@@ -251,8 +255,14 @@ mod tests {
 
         let sim_ab = idx.jaccard("a", "b");
         let sim_ac = idx.jaccard("a", "c");
-        assert!(sim_ab > sim_ac, "Identical texts should have higher Jaccard");
-        assert!((sim_ab - 1.0).abs() < 0.01, "Identical texts should be ~1.0");
+        assert!(
+            sim_ab > sim_ac,
+            "Identical texts should have higher Jaccard"
+        );
+        assert!(
+            (sim_ab - 1.0).abs() < 0.01,
+            "Identical texts should be ~1.0"
+        );
     }
 
     #[test]

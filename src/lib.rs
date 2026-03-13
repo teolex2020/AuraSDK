@@ -25,21 +25,22 @@ use pyo3::prelude::*;
 pub mod backend;
 
 // ── FROM aura-memory (already Rust) ──
-mod types;
-pub mod sdr;
-pub mod storage;
-pub mod index;
-mod salience;
 mod anchors;
-mod cortex;
-pub mod semantic;
-pub mod versioning;
-pub mod neuromorphic;
-pub mod federated;
-pub mod canonical;
-pub mod learner;
 pub mod backup;
+pub mod canonical;
+mod cortex;
+pub mod federated;
+pub mod gates;
+pub mod index;
+pub mod learner;
+pub mod neuromorphic;
 pub mod rbac;
+mod salience;
+pub mod sdr;
+pub mod semantic;
+pub mod storage;
+mod types;
+pub mod versioning;
 
 #[cfg(feature = "encryption")]
 pub mod crypto;
@@ -53,11 +54,17 @@ pub mod crypto {
     pub struct EncryptionKey;
 
     impl EncryptionKey {
-        pub fn generate() -> Self { Self }
-        pub fn from_password(_: &str, _: &[u8; 16]) -> Result<Self> {
-            Err(anyhow!("Encryption not enabled - rebuild with 'encryption' feature"))
+        pub fn generate() -> Self {
+            Self
         }
-        pub fn as_bytes(&self) -> &[u8; 32] { &[0u8; 32] }
+        pub fn from_password(_: &str, _: &[u8; 16]) -> Result<Self> {
+            Err(anyhow!(
+                "Encryption not enabled - rebuild with 'encryption' feature"
+            ))
+        }
+        pub fn as_bytes(&self) -> &[u8; 32] {
+            &[0u8; 32]
+        }
         pub fn save_to_file(&self, _: &std::path::Path, _: &str) -> Result<()> {
             Err(anyhow!("Encryption not enabled"))
         }
@@ -101,7 +108,9 @@ pub mod server {
     //! Server stub for builds without server feature
     use anyhow::{anyhow, Result};
     pub fn start_server(_port: u16, _path: &str) -> Result<()> {
-        Err(anyhow!("Server not enabled - rebuild with 'server' feature"))
+        Err(anyhow!(
+            "Server not enabled - rebuild with 'server' feature"
+        ))
     }
 }
 
@@ -119,7 +128,9 @@ pub mod telemetry {
     pub struct TracerProvider;
 
     pub fn init_telemetry() -> Result<TracerProvider> {
-        Err(anyhow!("Telemetry not enabled - rebuild with 'telemetry' feature"))
+        Err(anyhow!(
+            "Telemetry not enabled - rebuild with 'telemetry' feature"
+        ))
     }
 
     pub fn shutdown_telemetry(_: TracerProvider) {}
@@ -128,27 +139,27 @@ pub mod telemetry {
 pub mod license;
 
 // ── FROM aura-cognitive (rewritten to Rust) ──
-pub mod levels;
-pub mod record;
 pub mod cognitive_store;
-pub mod ngram;
-pub mod synonym;
-pub mod graph;
-pub mod recall;
-pub mod insights;
 pub mod consolidation;
-pub mod semantic_learner;
-pub mod scheduler;
+pub mod graph;
+pub mod insights;
+pub mod levels;
+pub mod ngram;
+pub mod recall;
+pub mod record;
 pub mod retention;
+pub mod scheduler;
+pub mod semantic_learner;
+pub mod synonym;
 
 // ── SDK Wrapper (from brain_tools.py — generic parts) ──
-pub mod trust;
-pub mod guards;
 pub mod cache;
 pub mod circuit_breaker;
 pub mod credibility;
-pub mod research;
+pub mod guards;
 pub mod identity;
+pub mod research;
+pub mod trust;
 
 // ── Optional Embedding Support ──
 pub mod embedding;

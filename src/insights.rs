@@ -5,9 +5,9 @@
 //! - Phase 1: Relationship analysis (clusters, conflicts, co-activation, hubs, chains)
 //! - Phase 2: Cross-domain discovery (serendipity, trending, knowledge gaps)
 
-use std::collections::{HashMap, HashSet};
-use crate::record::Record;
 use crate::levels::Level;
+use crate::record::Record;
+use std::collections::{HashMap, HashSet};
 
 /// Insight severity level.
 #[derive(Debug, Clone, PartialEq)]
@@ -109,7 +109,10 @@ fn detect_decay_risks(records: &HashMap<String, Record>) -> Vec<Insight> {
         insight_type: "decay_risks".into(),
         severity: Severity::High,
         phase: Phase::RecordHealth,
-        description: format!("{} records at risk of archival (strength < 0.15)", at_risk.len()),
+        description: format!(
+            "{} records at risk of archival (strength < 0.15)",
+            at_risk.len()
+        ),
         record_ids: at_risk,
         evidence,
     }]
@@ -366,7 +369,9 @@ fn detect_causal_chains(records: &HashMap<String, Record>) -> Vec<Insight> {
         // Follow children
         let mut current_id = root.id.clone();
         for _ in 0..10 {
-            let child = records.values().find(|r| r.caused_by_id.as_ref() == Some(&current_id));
+            let child = records
+                .values()
+                .find(|r| r.caused_by_id.as_ref() == Some(&current_id));
             match child {
                 Some(c) => {
                     chain.push(c.id.clone());
@@ -471,14 +476,24 @@ pub fn detect_serendipity(records: &HashMap<String, Record>) -> Vec<Insight> {
             evidence.insert("tag_jaccard".into(), format!("{:.2}", jaccard));
             evidence.insert(
                 "connection_type".into(),
-                rec.connection_type(conn_id).unwrap_or("untyped").to_string(),
+                rec.connection_type(conn_id)
+                    .unwrap_or("untyped")
+                    .to_string(),
             );
             evidence.insert("importance_a".into(), format!("{:.2}", rec.importance()));
             evidence.insert("importance_b".into(), format!("{:.2}", other.importance()));
 
             // Build descriptive domain labels from tags
-            let domain_a = rec.tags.first().cloned().unwrap_or_else(|| "untagged".into());
-            let domain_b = other.tags.first().cloned().unwrap_or_else(|| "untagged".into());
+            let domain_a = rec
+                .tags
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "untagged".into());
+            let domain_b = other
+                .tags
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "untagged".into());
 
             insights.push(Insight {
                 insight_type: "serendipity".into(),
@@ -531,7 +546,10 @@ pub fn detect_trending(records: &HashMap<String, Record>) -> Vec<Insight> {
     let mut evidence = HashMap::new();
     evidence.insert("count".into(), trending.len().to_string());
     evidence.insert("top_velocity".into(), format!("{:.1}", top_velocity));
-    evidence.insert("threshold".into(), format!("{:.1}", TRENDING_VELOCITY_THRESHOLD));
+    evidence.insert(
+        "threshold".into(),
+        format!("{:.1}", TRENDING_VELOCITY_THRESHOLD),
+    );
 
     vec![Insight {
         insight_type: "trending".into(),
@@ -560,7 +578,10 @@ pub fn detect_knowledge_gaps(records: &HashMap<String, Record>) -> Vec<Insight> 
             continue;
         }
         for tag in &rec.tags {
-            tag_groups.entry(tag.clone()).or_default().insert(rec.id.clone());
+            tag_groups
+                .entry(tag.clone())
+                .or_default()
+                .insert(rec.id.clone());
         }
     }
 
@@ -644,7 +665,11 @@ pub fn detect_preference_patterns(records: &HashMap<String, Record>) -> Vec<Insi
 
     for rec in records.values() {
         if rec.semantic_type == "preference" && rec.is_alive() {
-            let domain = rec.tags.first().cloned().unwrap_or_else(|| "general".into());
+            let domain = rec
+                .tags
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "general".into());
             domain_prefs.entry(domain).or_default().push(rec.id.clone());
         }
     }
@@ -662,7 +687,8 @@ pub fn detect_preference_patterns(records: &HashMap<String, Record>) -> Vec<Insi
                 phase: Phase::CrossDomain,
                 description: format!(
                     "Preference pattern in '{}': {} preference records form a style cluster",
-                    domain, ids.len(),
+                    domain,
+                    ids.len(),
                 ),
                 record_ids: ids,
                 evidence,
@@ -705,7 +731,9 @@ pub fn detect_decision_conflicts(records: &HashMap<String, Record>) -> Vec<Insig
             evidence.insert("strength_a".into(), format!("{:.2}", a.strength));
             evidence.insert("strength_b".into(), format!("{:.2}", b.strength));
 
-            let shared_tags: Vec<&str> = a.tags.iter()
+            let shared_tags: Vec<&str> = a
+                .tags
+                .iter()
                 .filter(|t| b.tags.contains(t))
                 .map(|s| s.as_str())
                 .collect();
@@ -793,7 +821,10 @@ mod tests {
         let mut records = HashMap::new();
 
         // Record A: "rust" domain
-        let mut a = Record::new("Rust is great for systems programming".into(), Level::Domain);
+        let mut a = Record::new(
+            "Rust is great for systems programming".into(),
+            Level::Domain,
+        );
         a.tags = vec!["rust".into(), "systems".into()];
         a.strength = 0.9;
         a.activation_count = 3;
@@ -942,20 +973,16 @@ mod tests {
 
     #[test]
     fn test_tag_jaccard() {
-        assert!((tag_jaccard(
-            &["a".into(), "b".into()],
-            &["b".into(), "c".into()],
-        ) - 1.0 / 3.0).abs() < 0.01);
+        assert!(
+            (tag_jaccard(&["a".into(), "b".into()], &["b".into(), "c".into()],) - 1.0 / 3.0).abs()
+                < 0.01
+        );
 
-        assert!((tag_jaccard(
-            &["a".into()],
-            &["b".into()],
-        ) - 0.0).abs() < 0.01);
+        assert!((tag_jaccard(&["a".into()], &["b".into()],) - 0.0).abs() < 0.01);
 
-        assert!((tag_jaccard(
-            &["a".into(), "b".into()],
-            &["a".into(), "b".into()],
-        ) - 1.0).abs() < 0.01);
+        assert!(
+            (tag_jaccard(&["a".into(), "b".into()], &["a".into(), "b".into()],) - 1.0).abs() < 0.01
+        );
     }
 
     #[test]

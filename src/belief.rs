@@ -10,12 +10,13 @@
 //! Currently operates in **read-only mode**: it builds and updates beliefs
 //! during maintenance but does NOT influence recall ranking or policy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::record::Record;
+use crate::sdr::SDRInterpreter;
 
 /// SDR lookup table: record_id → sparse SDR indices.
 /// Passed into the belief engine so it can do content-aware grouping
@@ -48,6 +49,9 @@ const UNCERTAINTY_BAND: f32 = 0.10;
 /// A threshold of 0.15 safely separates genuinely different topics
 /// while keeping paraphrases together.
 const CLAIM_SIMILARITY_THRESHOLD: f32 = 0.15;
+/// Minimum Tanimoto overlap between tag SDR fingerprints in `SdrTagPool`.
+/// Slightly lower than content threshold because tag strings are much shorter.
+const TAG_FINGERPRINT_SIMILARITY_THRESHOLD: f32 = 0.08;
 
 /// Maximum records per hypothesis before pruning weakest.
 /// Reserved for large-scale belief groups.
@@ -73,6 +77,28 @@ pub enum CoarseKeyMode {
     /// Tag family = alphabetically first tag. Reduces fragmentation while
     /// keeping some topic boundary signal.
     TagFamily,
+    /// Variant A1: `TagFamily` with a guarded softer SDR threshold.
+    /// Keeps the same coarse corridor as `TagFamily`, but only lowers the SDR
+    /// split threshold for non-generic families if the strict baseline pass
+    /// would otherwise collapse the whole corridor into singleton clusters.
+    TagFamilyAdaptive,
+    /// Variant A2: `TagFamily` with guarded coarse fallback.
+    /// Runs normal SDR subclustering first, but if an entire coarse corridor
+    /// collapses into singleton subclusters, retains the original coarse group
+    /// as one belief candidate instead of dropping belief creation to zero.
+    TagFamilyBackoff,
+    /// Variant A3: `TagFamilyBackoff` but with a richer family fingerprint.
+    /// Uses the first two sorted tags instead of only the first tag for the
+    /// coarse corridor, reducing same-family over-merges on dense synthetic
+    /// corpora while keeping the same guarded coarse fallback semantics.
+    TagFamilyPairBackoff,
+    /// Variant A4: `TagFamilyBackoff` with dense-corridor local refinement.
+    /// Starts from the normal dominant-family corridor, but if a corridor is
+    /// dense enough and contains stable secondary tags, records are regrouped
+    /// into bounded corridor-local keys of `family + stable_secondary_tag`.
+    /// This is narrower than `TagFamilyPairBackoff` because it only applies
+    /// inside dense same-family corridors and only uses corridor-stable tags.
+    TagFamilyDenseBackoff,
     /// Variant B: `namespace:semantic_type` corridor with tag-guarded SDR subclustering.
     /// Broad pool like SemanticOnly, but sdr_subcluster requires shared_tags >= 1
     /// before merging, preventing cross-topic false merges.
@@ -81,6 +107,14 @@ pub enum CoarseKeyMode {
     /// Uses tag overlap + SDR similarity jointly: records must share >= 1 tag AND
     /// have Tanimoto >= threshold to merge. Like DualKey but with relaxed threshold (0.08).
     NeighborhoodPool,
+    /// Variant D: `namespace:normalized_tags(top3):semantic_type`.
+    /// Uses a tiny deterministic bridge table to collapse a few safe near-synonym
+    /// tag families before SDR subclustering.
+    BridgeKey,
+    /// Variant E: `namespace:semantic_type` corridor with SDR tag fingerprint guard.
+    /// Records may only merge if their tag-SDR fingerprints overlap above a
+    /// threshold before normal content SDR subclustering is allowed.
+    SdrTagPool,
 }
 
 impl Default for CoarseKeyMode {
@@ -181,9 +215,8 @@ impl Hypothesis {
         // Consistency = 1 / (1 + variance(confidences))
         let consistency = if confidences.len() > 1 {
             let mean = confidence;
-            let variance: f32 = confidences.iter()
-                .map(|c| (c - mean).powi(2))
-                .sum::<f32>() / (confidences.len() - 1) as f32;
+            let variance: f32 = confidences.iter().map(|c| (c - mean).powi(2)).sum::<f32>()
+                / (confidences.len() - 1) as f32;
             1.0 / (1.0 + variance)
         } else {
             1.0
@@ -309,7 +342,11 @@ impl Belief {
 
         // Find top-2 by score
         let mut sorted: Vec<&Hypothesis> = hypotheses.to_vec();
-        sorted.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let top1 = sorted[0];
         let top2 = sorted[1];
@@ -390,7 +427,8 @@ impl BeliefEngine {
 
     /// Effective SDR subclustering threshold.
     fn effective_similarity_threshold(&self) -> f32 {
-        self.claim_similarity_override.unwrap_or(CLAIM_SIMILARITY_THRESHOLD)
+        self.claim_similarity_override
+            .unwrap_or(CLAIM_SIMILARITY_THRESHOLD)
     }
 
     /// Build a coarse claim key from a record (tag-group level).
@@ -409,29 +447,186 @@ impl BeliefEngine {
                 let mut tags: Vec<&str> = record.tags.iter().map(|s| s.as_str()).collect();
                 tags.sort();
                 tags.truncate(3);
-                format!("{}:{}:{}", record.namespace, tags.join(","), record.semantic_type)
+                format!(
+                    "{}:{}:{}",
+                    record.namespace,
+                    tags.join(","),
+                    record.semantic_type
+                )
             }
             CoarseKeyMode::TopOneTag => {
                 let mut tags: Vec<&str> = record.tags.iter().map(|s| s.as_str()).collect();
                 tags.sort();
                 tags.truncate(1);
-                format!("{}:{}:{}", record.namespace, tags.join(","), record.semantic_type)
+                format!(
+                    "{}:{}:{}",
+                    record.namespace,
+                    tags.join(","),
+                    record.semantic_type
+                )
             }
             CoarseKeyMode::SemanticOnly => {
                 format!("{}:{}", record.namespace, record.semantic_type)
             }
-            CoarseKeyMode::TagFamily => {
+            CoarseKeyMode::TagFamily
+            | CoarseKeyMode::TagFamilyAdaptive
+            | CoarseKeyMode::TagFamilyBackoff
+            | CoarseKeyMode::TagFamilyDenseBackoff => {
                 // Dominant tag family = alphabetically first tag
                 let mut tags: Vec<&str> = record.tags.iter().map(|s| s.as_str()).collect();
                 tags.sort();
                 let family = tags.first().copied().unwrap_or("");
                 format!("{}:{}:{}", record.namespace, family, record.semantic_type)
             }
+            CoarseKeyMode::TagFamilyPairBackoff => {
+                let mut tags: Vec<&str> = record.tags.iter().map(|s| s.as_str()).collect();
+                tags.sort();
+                tags.truncate(2);
+                format!(
+                    "{}:{}:{}",
+                    record.namespace,
+                    tags.join(","),
+                    record.semantic_type
+                )
+            }
             CoarseKeyMode::DualKey | CoarseKeyMode::NeighborhoodPool => {
                 // Broad corridor: namespace + semantic_type only
                 // Fine grouping handled by tag-guarded sdr_subcluster
                 format!("{}:{}", record.namespace, record.semantic_type)
             }
+            CoarseKeyMode::SdrTagPool => {
+                // Broad corridor: namespace + semantic_type only
+                // Fine grouping handled by tag-SDR guard + content SDR subclustering
+                format!("{}:{}", record.namespace, record.semantic_type)
+            }
+            CoarseKeyMode::BridgeKey => {
+                let tags = Self::normalized_bridge_tags(record);
+                format!(
+                    "{}:{}:{}",
+                    record.namespace,
+                    tags.join(","),
+                    record.semantic_type
+                )
+            }
+        }
+    }
+
+    /// Minimal deterministic tag bridge table for safe densification experiments.
+    fn normalize_bridge_tag(tag: &str) -> String {
+        let lower = tag.trim().to_ascii_lowercase();
+        match lower.as_str() {
+            "ui" | "frontend" => "frontend".to_string(),
+            "auth" | "authentication" => "authentication".to_string(),
+            "deploy" | "release" => "release".to_string(),
+            _ => lower,
+        }
+    }
+
+    fn normalized_bridge_tags(record: &Record) -> Vec<String> {
+        let mut tags: Vec<String> = record
+            .tags
+            .iter()
+            .map(|t| Self::normalize_bridge_tag(t))
+            .collect();
+        tags.sort();
+        tags.dedup();
+        tags.truncate(3);
+        tags
+    }
+
+    fn canonical_tag_text(record: &Record) -> String {
+        let mut tags: Vec<String> = record
+            .tags
+            .iter()
+            .map(|tag| tag.trim().to_ascii_lowercase())
+            .filter(|tag| !tag.is_empty())
+            .collect();
+        tags.sort();
+        tags.dedup();
+        tags.join(" ")
+    }
+
+    fn parse_tag_family_from_key(key: &str) -> &str {
+        let mut parts = key.split(':');
+        let _ns = parts.next();
+        parts.next().unwrap_or("")
+    }
+
+    fn is_generic_tag_family(family: &str) -> bool {
+        matches!(family, "alerts")
+    }
+
+    fn dense_corridor_stable_tags(records: &[&Record], family: &str) -> Vec<String> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for rec in records {
+            let mut tags: Vec<String> = rec
+                .tags
+                .iter()
+                .map(|t| t.trim().to_ascii_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect();
+            tags.sort();
+            tags.dedup();
+            for tag in tags {
+                if Self::is_generic_tag_family(&tag) {
+                    continue;
+                }
+                *counts.entry(tag).or_default() += 1;
+            }
+        }
+
+        let mut stable: Vec<String> = counts
+            .into_iter()
+            .filter_map(|(tag, count)| {
+                if tag == family {
+                    Some(tag)
+                } else if count >= 4 {
+                    Some(tag)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        stable.sort();
+        if !stable.iter().any(|tag| tag == family) {
+            stable.insert(0, family.to_string());
+        }
+        stable
+    }
+
+    fn dense_backoff_group_key(coarse_key: &str, records: &[&Record], record: &Record) -> String {
+        let family = Self::parse_tag_family_from_key(coarse_key);
+        let stable_tags = Self::dense_corridor_stable_tags(records, family);
+        if records.len() < 4 || stable_tags.len() < 2 {
+            return coarse_key.to_string();
+        }
+
+        let mut record_tags: Vec<String> = record
+            .tags
+            .iter()
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        record_tags.sort();
+        record_tags.dedup();
+
+        let mut picked: Vec<String> = stable_tags
+            .into_iter()
+            .filter(|tag| record_tags.iter().any(|t| t == tag))
+            .collect();
+        picked.sort();
+        picked.dedup();
+        picked.truncate(3);
+
+        if picked.len() >= 2 {
+            format!(
+                "{}:{}:{}",
+                record.namespace,
+                picked.join(","),
+                record.semantic_type
+            )
+        } else {
+            coarse_key.to_string()
         }
     }
 
@@ -444,12 +639,22 @@ impl BeliefEngine {
         let mut intersection = 0usize;
         let (mut i, mut j) = (0, 0);
         while i < a.len() && j < b.len() {
-            if a[i] < b[j] { i += 1; }
-            else if a[i] > b[j] { j += 1; }
-            else { intersection += 1; i += 1; j += 1; }
+            if a[i] < b[j] {
+                i += 1;
+            } else if a[i] > b[j] {
+                j += 1;
+            } else {
+                intersection += 1;
+                i += 1;
+                j += 1;
+            }
         }
         let union = a.len() + b.len() - intersection;
-        if union == 0 { 0.0 } else { intersection as f32 / union as f32 }
+        if union == 0 {
+            0.0
+        } else {
+            intersection as f32 / union as f32
+        }
     }
 
     /// Split a coarse tag-group into SDR sub-clusters.
@@ -482,18 +687,24 @@ impl BeliefEngine {
         fn union(parent: &mut [usize], a: usize, b: usize) {
             let ra = find(parent, a);
             let rb = find(parent, b);
-            if ra != rb { parent[ra] = rb; }
+            if ra != rb {
+                parent[ra] = rb;
+            }
         }
 
         // Pairwise Tanimoto comparison
         for i in 0..n {
             let sdr_i = sdr_lookup.get(&records[i].id);
-            if sdr_i.is_none() { continue; }
+            if sdr_i.is_none() {
+                continue;
+            }
             let sdr_i = sdr_i.unwrap();
 
             for j in (i + 1)..n {
                 let sdr_j = sdr_lookup.get(&records[j].id);
-                if sdr_j.is_none() { continue; }
+                if sdr_j.is_none() {
+                    continue;
+                }
                 let sdr_j = sdr_j.unwrap();
 
                 if Self::tanimoto(sdr_i, sdr_j) >= threshold {
@@ -538,27 +749,186 @@ impl BeliefEngine {
         fn union(parent: &mut [usize], a: usize, b: usize) {
             let ra = find(parent, a);
             let rb = find(parent, b);
-            if ra != rb { parent[ra] = rb; }
+            if ra != rb {
+                parent[ra] = rb;
+            }
         }
 
         for i in 0..n {
             let sdr_i = sdr_lookup.get(&records[i].id);
-            if sdr_i.is_none() { continue; }
+            if sdr_i.is_none() {
+                continue;
+            }
             let sdr_i = sdr_i.unwrap();
 
-            let tags_i: std::collections::HashSet<&str> = records[i].tags.iter()
-                .map(|s| s.as_str()).collect();
+            let tags_i: std::collections::HashSet<&str> =
+                records[i].tags.iter().map(|s| s.as_str()).collect();
 
             for j in (i + 1)..n {
                 // Tag barrier: require shared tags >= 1
-                let shared = records[j].tags.iter()
-                    .any(|t| tags_i.contains(t.as_str()));
+                let shared = records[j].tags.iter().any(|t| tags_i.contains(t.as_str()));
                 if !shared && !tags_i.is_empty() && !records[j].tags.is_empty() {
                     continue;
                 }
 
                 let sdr_j = sdr_lookup.get(&records[j].id);
-                if sdr_j.is_none() { continue; }
+                if sdr_j.is_none() {
+                    continue;
+                }
+                let sdr_j = sdr_j.unwrap();
+
+                if Self::tanimoto(sdr_i, sdr_j) >= threshold {
+                    union(&mut parent, i, j);
+                }
+            }
+        }
+
+        let mut clusters: HashMap<usize, Vec<&'a Record>> = HashMap::new();
+        for i in 0..n {
+            let root = find(&mut parent, i);
+            clusters.entry(root).or_default().push(records[i]);
+        }
+        clusters.into_values().collect()
+    }
+
+    /// Bridge-tag-guarded SDR subclustering for BridgeKey mode.
+    ///
+    /// Records may merge only if they share at least one normalized bridge tag
+    /// family and pass the SDR threshold. This keeps corridor widening local and
+    /// deterministic.
+    fn sdr_subcluster_bridge_guarded<'a>(
+        records: &[&'a Record],
+        sdr_lookup: &SdrLookup,
+        threshold: f32,
+    ) -> Vec<Vec<&'a Record>> {
+        let n = records.len();
+        if n <= 1 {
+            return vec![records.to_vec()];
+        }
+
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent[ra] = rb;
+            }
+        }
+
+        let bridge_sets: Vec<HashSet<String>> = records
+            .iter()
+            .map(|rec| Self::normalized_bridge_tags(rec).into_iter().collect())
+            .collect();
+
+        for i in 0..n {
+            let sdr_i = sdr_lookup.get(&records[i].id);
+            if sdr_i.is_none() {
+                continue;
+            }
+            let sdr_i = sdr_i.unwrap();
+
+            for j in (i + 1)..n {
+                let shared_bridge = bridge_sets[i]
+                    .iter()
+                    .any(|tag| bridge_sets[j].contains(tag));
+                if !shared_bridge {
+                    continue;
+                }
+
+                let sdr_j = sdr_lookup.get(&records[j].id);
+                if sdr_j.is_none() {
+                    continue;
+                }
+                let sdr_j = sdr_j.unwrap();
+
+                if Self::tanimoto(sdr_i, sdr_j) >= threshold {
+                    union(&mut parent, i, j);
+                }
+            }
+        }
+
+        let mut clusters: HashMap<usize, Vec<&'a Record>> = HashMap::new();
+        for i in 0..n {
+            let root = find(&mut parent, i);
+            clusters.entry(root).or_default().push(records[i]);
+        }
+        clusters.into_values().collect()
+    }
+
+    /// SDR-tag-guarded subclustering for `SdrTagPool`.
+    ///
+    /// Uses two deterministic guards:
+    /// 1. tag fingerprint overlap must exceed the tag threshold
+    /// 2. content SDR overlap must exceed the normal claim threshold
+    fn sdr_subcluster_tag_sdr_guarded<'a>(
+        records: &[&'a Record],
+        sdr_lookup: &SdrLookup,
+        threshold: f32,
+    ) -> Vec<Vec<&'a Record>> {
+        let n = records.len();
+        if n <= 1 {
+            return vec![records.to_vec()];
+        }
+
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent[ra] = rb;
+            }
+        }
+
+        let tag_sdr = SDRInterpreter::default();
+        let tag_fingerprints: Vec<Vec<u16>> = records
+            .iter()
+            .map(|rec| {
+                let tag_text = Self::canonical_tag_text(rec);
+                if tag_text.is_empty() {
+                    Vec::new()
+                } else {
+                    tag_sdr.text_to_sdr_lowered(&tag_text, false)
+                }
+            })
+            .collect();
+
+        for i in 0..n {
+            let sdr_i = sdr_lookup.get(&records[i].id);
+            if sdr_i.is_none() {
+                continue;
+            }
+            let sdr_i = sdr_i.unwrap();
+
+            for j in (i + 1)..n {
+                if tag_fingerprints[i].is_empty() || tag_fingerprints[j].is_empty() {
+                    continue;
+                }
+
+                let tag_similarity = Self::tanimoto(&tag_fingerprints[i], &tag_fingerprints[j]);
+                if tag_similarity < TAG_FINGERPRINT_SIMILARITY_THRESHOLD {
+                    continue;
+                }
+
+                let sdr_j = sdr_lookup.get(&records[j].id);
+                if sdr_j.is_none() {
+                    continue;
+                }
                 let sdr_j = sdr_j.unwrap();
 
                 if Self::tanimoto(sdr_i, sdr_j) >= threshold {
@@ -612,12 +982,41 @@ impl BeliefEngine {
             }
             let key = Self::claim_key_with_mode(rec, self.coarse_key_mode);
             // Skip empty keys (no tags) — only applies to tag-based modes
-            let uses_tags = matches!(self.coarse_key_mode,
-                CoarseKeyMode::Standard | CoarseKeyMode::TopOneTag | CoarseKeyMode::TagFamily);
+            let uses_tags = matches!(
+                self.coarse_key_mode,
+                CoarseKeyMode::Standard
+                    | CoarseKeyMode::TopOneTag
+                    | CoarseKeyMode::TagFamily
+                    | CoarseKeyMode::TagFamilyAdaptive
+                    | CoarseKeyMode::TagFamilyBackoff
+                    | CoarseKeyMode::TagFamilyDenseBackoff
+                    | CoarseKeyMode::TagFamilyPairBackoff
+                    | CoarseKeyMode::BridgeKey
+            );
             if uses_tags && key.contains("::") {
                 continue;
             }
             coarse_groups.entry(key).or_default().push(rec);
+        }
+
+        if self.coarse_key_mode == CoarseKeyMode::TagFamilyDenseBackoff {
+            let mut refined_groups: HashMap<String, Vec<&Record>> = HashMap::new();
+            for (coarse_key, group_records) in coarse_groups {
+                let family = Self::parse_tag_family_from_key(&coarse_key);
+                if group_records.len() >= 4
+                    && !Self::is_generic_tag_family(family)
+                    && Self::dense_corridor_stable_tags(&group_records, family).len() >= 2
+                {
+                    for rec in &group_records {
+                        let refined_key =
+                            Self::dense_backoff_group_key(&coarse_key, &group_records, rec);
+                        refined_groups.entry(refined_key).or_default().push(rec);
+                    }
+                } else {
+                    refined_groups.insert(coarse_key, group_records);
+                }
+            }
+            coarse_groups = refined_groups;
         }
 
         // Step 2: Fine grouping — split each coarse group by SDR similarity
@@ -632,24 +1031,69 @@ impl BeliefEngine {
             // Choose subclustering strategy based on mode
             let threshold = match self.coarse_key_mode {
                 // NeighborhoodPool uses relaxed threshold (0.08) unless overridden
-                CoarseKeyMode::NeighborhoodPool => {
-                    self.claim_similarity_override.unwrap_or(0.08)
-                }
+                CoarseKeyMode::NeighborhoodPool => self.claim_similarity_override.unwrap_or(0.08),
+                // TagFamilyAdaptive starts with the strict baseline threshold.
+                // A second, softer pass may be allowed below only if the strict
+                // pass would leave the entire corridor fragmented into singletons.
+                CoarseKeyMode::TagFamilyAdaptive => self
+                    .claim_similarity_override
+                    .unwrap_or(CLAIM_SIMILARITY_THRESHOLD),
                 // DualKey uses lowered threshold (0.10) unless overridden
-                CoarseKeyMode::DualKey => {
-                    self.claim_similarity_override.unwrap_or(0.10)
-                }
+                CoarseKeyMode::DualKey => self.claim_similarity_override.unwrap_or(0.10),
+                // SdrTagPool uses a broad corridor, so keep a slightly stricter
+                // content threshold than Neighborhood while letting tag-SDR
+                // decide whether two records are even comparable.
+                CoarseKeyMode::SdrTagPool => self.claim_similarity_override.unwrap_or(0.10),
                 _ => self.effective_similarity_threshold(),
             };
 
-            let use_tag_guard = matches!(self.coarse_key_mode,
-                CoarseKeyMode::DualKey | CoarseKeyMode::NeighborhoodPool);
+            let use_tag_guard = matches!(
+                self.coarse_key_mode,
+                CoarseKeyMode::DualKey | CoarseKeyMode::NeighborhoodPool
+            );
+            let use_bridge_guard = self.coarse_key_mode == CoarseKeyMode::BridgeKey;
+            let use_tag_sdr_guard = self.coarse_key_mode == CoarseKeyMode::SdrTagPool;
 
             let subclusters = if use_tag_guard {
                 Self::sdr_subcluster_tag_guarded(group_records, sdr_lookup, threshold)
+            } else if use_bridge_guard {
+                Self::sdr_subcluster_bridge_guarded(group_records, sdr_lookup, threshold)
+            } else if use_tag_sdr_guard {
+                Self::sdr_subcluster_tag_sdr_guarded(group_records, sdr_lookup, threshold)
             } else {
                 Self::sdr_subcluster(group_records, sdr_lookup, threshold)
             };
+
+            let subclusters = if self.coarse_key_mode == CoarseKeyMode::TagFamilyAdaptive {
+                let family = Self::parse_tag_family_from_key(coarse_key);
+                let strict_all_singletons = subclusters.iter().all(|cluster| cluster.len() < 2);
+                if group_records.len() >= 2
+                    && strict_all_singletons
+                    && !Self::is_generic_tag_family(family)
+                {
+                    let adaptive_threshold = self.claim_similarity_override.unwrap_or(0.10);
+                    Self::sdr_subcluster(group_records, sdr_lookup, adaptive_threshold)
+                } else {
+                    subclusters
+                }
+            } else {
+                subclusters
+            };
+
+            let use_tagfamily_backoff = matches!(
+                self.coarse_key_mode,
+                CoarseKeyMode::TagFamilyBackoff
+                    | CoarseKeyMode::TagFamilyPairBackoff
+                    | CoarseKeyMode::TagFamilyDenseBackoff
+            );
+            if use_tagfamily_backoff
+                && group_records.len() >= 2
+                && !Self::is_generic_tag_family(Self::parse_tag_family_from_key(coarse_key))
+                && subclusters.iter().all(|cluster| cluster.len() < 2)
+            {
+                groups.insert(coarse_key.clone(), group_records.clone());
+                continue;
+            }
 
             if subclusters.len() == 1 {
                 // All records are similar enough — single group
@@ -671,17 +1115,14 @@ impl BeliefEngine {
             }
 
             // Get or create belief
-            let belief_id = self.key_index
-                .get(key)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let b = Belief::new(key.clone());
-                    let bid = b.id.clone();
-                    self.key_index.insert(key.clone(), bid.clone());
-                    self.beliefs.insert(bid.clone(), b);
-                    report.beliefs_created += 1;
-                    bid
-                });
+            let belief_id = self.key_index.get(key).cloned().unwrap_or_else(|| {
+                let b = Belief::new(key.clone());
+                let bid = b.id.clone();
+                self.key_index.insert(key.clone(), bid.clone());
+                self.beliefs.insert(bid.clone(), b);
+                report.beliefs_created += 1;
+                bid
+            });
 
             // Cluster records into hypotheses.
             // Simple strategy: split by whether records have contradictions.
@@ -722,7 +1163,8 @@ impl BeliefEngine {
                 }
                 belief.hypothesis_ids = hyp_refs.clone();
 
-                let hyps: Vec<&Hypothesis> = hyp_refs.iter()
+                let hyps: Vec<&Hypothesis> = hyp_refs
+                    .iter()
                     .filter_map(|hid| self.hypotheses.get(hid))
                     .collect();
 
@@ -745,7 +1187,9 @@ impl BeliefEngine {
 
         // Prune beliefs for groups that no longer exist
         let active_keys: std::collections::HashSet<&String> = groups.keys().collect();
-        let stale_keys: Vec<String> = self.key_index.keys()
+        let stale_keys: Vec<String> = self
+            .key_index
+            .keys()
             .filter(|k| !active_keys.contains(k))
             .cloned()
             .collect();
@@ -762,15 +1206,17 @@ impl BeliefEngine {
 
         // Prune stale record_index entries — only keep records that belong
         // to a live hypothesis.
-        let live_record_ids: std::collections::HashSet<String> = self.hypotheses.values()
+        let live_record_ids: std::collections::HashSet<String> = self
+            .hypotheses
+            .values()
             .flat_map(|h| h.prototype_record_ids.iter().cloned())
             .collect();
-        self.record_index.retain(|rid, _| live_record_ids.contains(rid));
+        self.record_index
+            .retain(|rid, _| live_record_ids.contains(rid));
 
         report.total_beliefs = self.beliefs.len();
         report.total_hypotheses = self.hypotheses.len();
-        report.churn_rate = report.revisions as f32
-            / report.total_beliefs.max(1) as f32;
+        report.churn_rate = report.revisions as f32 / report.total_beliefs.max(1) as f32;
         report
     }
 
@@ -802,27 +1248,33 @@ impl BeliefEngine {
 
     /// Get all unresolved beliefs.
     pub fn unresolved_beliefs(&self) -> Vec<&Belief> {
-        self.beliefs.values()
+        self.beliefs
+            .values()
             .filter(|b| b.state == BeliefState::Unresolved)
             .collect()
     }
 
     /// Get summary statistics.
     pub fn stats(&self) -> BeliefStats {
-        let resolved = self.beliefs.values()
+        let resolved = self
+            .beliefs
+            .values()
             .filter(|b| b.state == BeliefState::Resolved)
             .count();
-        let unresolved = self.beliefs.values()
+        let unresolved = self
+            .beliefs
+            .values()
             .filter(|b| b.state == BeliefState::Unresolved)
             .count();
-        let singleton = self.beliefs.values()
+        let singleton = self
+            .beliefs
+            .values()
             .filter(|b| b.state == BeliefState::Singleton)
             .count();
         let avg_stability = if self.beliefs.is_empty() {
             0.0
         } else {
-            self.beliefs.values().map(|b| b.stability).sum::<f32>()
-                / self.beliefs.len() as f32
+            self.beliefs.values().map(|b| b.stability).sum::<f32>() / self.beliefs.len() as f32
         };
 
         BeliefStats {
@@ -938,8 +1390,16 @@ mod tests {
 
     #[test]
     fn test_hypothesis_scoring() {
-        let r1 = make_record("user prefers dark mode in editor", &["ui", "preferences"], "preference");
-        let r2 = make_record("user always uses dark theme for coding", &["ui", "preferences"], "preference");
+        let r1 = make_record(
+            "user prefers dark mode in editor",
+            &["ui", "preferences"],
+            "preference",
+        );
+        let r2 = make_record(
+            "user always uses dark theme for coding",
+            &["ui", "preferences"],
+            "preference",
+        );
 
         let h = Hypothesis::from_records("b1", &[&r1, &r2]);
         assert!(h.score > 0.0);
@@ -949,7 +1409,11 @@ mod tests {
 
     #[test]
     fn test_belief_resolve_singleton() {
-        let r1 = make_record("user uses vim keybindings always", &["editor", "preferences"], "preference");
+        let r1 = make_record(
+            "user uses vim keybindings always",
+            &["editor", "preferences"],
+            "preference",
+        );
         let h = Hypothesis::from_records("b1", &[&r1]);
 
         let mut belief = Belief::new("default:editor,preferences:preference".into());
@@ -962,12 +1426,20 @@ mod tests {
     #[test]
     fn test_belief_resolve_competing() {
         // Strong supporting hypothesis
-        let mut r1 = make_record("user prefers dark mode absolutely", &["ui", "theme"], "preference");
+        let mut r1 = make_record(
+            "user prefers dark mode absolutely",
+            &["ui", "theme"],
+            "preference",
+        );
         r1.support_mass = 10;
         r1.confidence = 0.95;
 
         // Weak opposing hypothesis
-        let mut r2 = make_record("user sometimes uses light mode", &["ui", "theme"], "contradiction");
+        let mut r2 = make_record(
+            "user sometimes uses light mode",
+            &["ui", "theme"],
+            "contradiction",
+        );
         r2.support_mass = 1;
         r2.confidence = 0.50;
 
@@ -986,9 +1458,21 @@ mod tests {
         let mut engine = BeliefEngine::new();
 
         let mut records = HashMap::new();
-        let r1 = make_record("deploy staging first before production", &["deploy", "safety"], "decision");
-        let r2 = make_record("deploy staging first before production always", &["deploy", "safety"], "decision");
-        let mut r3 = make_record("skip deploy staging first before production", &["deploy", "safety"], "contradiction");
+        let r1 = make_record(
+            "deploy staging first before production",
+            &["deploy", "safety"],
+            "decision",
+        );
+        let r2 = make_record(
+            "deploy staging first before production always",
+            &["deploy", "safety"],
+            "decision",
+        );
+        let mut r3 = make_record(
+            "skip deploy staging first before production",
+            &["deploy", "safety"],
+            "contradiction",
+        );
         r3.conflict_mass = 2;
 
         records.insert(r1.id.clone(), r1);
@@ -1006,8 +1490,16 @@ mod tests {
         let mut engine = BeliefEngine::new();
 
         let mut records = HashMap::new();
-        let r1 = make_record("Rust is the primary language for backend", &["tech", "language"], "fact");
-        let r2 = make_record("Rust is the primary language for backend services", &["tech", "language"], "fact");
+        let r1 = make_record(
+            "Rust is the primary language for backend",
+            &["tech", "language"],
+            "fact",
+        );
+        let r2 = make_record(
+            "Rust is the primary language for backend services",
+            &["tech", "language"],
+            "fact",
+        );
         records.insert(r1.id.clone(), r1);
         records.insert(r2.id.clone(), r2);
 
@@ -1021,11 +1513,197 @@ mod tests {
 
     #[test]
     fn test_claim_key_generation() {
-        let rec = make_record("test content for claim key", &["deploy", "safety", "production"], "decision");
+        let rec = make_record(
+            "test content for claim key",
+            &["deploy", "safety", "production"],
+            "decision",
+        );
         let key = BeliefEngine::claim_key(&rec);
         assert!(key.starts_with("default:"));
         assert!(key.contains("deploy"));
-        assert!(key.ends_with(":decision"));  // format: namespace:tags:type
+        assert!(key.ends_with(":decision")); // format: namespace:tags:type
+    }
+
+    #[test]
+    fn test_bridge_key_normalizes_safe_tag_families() {
+        let rec_a = make_record(
+            "project ui work item for dashboard",
+            &["project", "ui"],
+            "fact",
+        );
+        let rec_b = make_record(
+            "project frontend work item for dashboard",
+            &["project", "frontend"],
+            "fact",
+        );
+
+        let key_a = BeliefEngine::claim_key_with_mode(&rec_a, CoarseKeyMode::BridgeKey);
+        let key_b = BeliefEngine::claim_key_with_mode(&rec_b, CoarseKeyMode::BridgeKey);
+
+        assert_eq!(
+            key_a, key_b,
+            "BridgeKey should normalize ui/frontend into the same corridor"
+        );
+    }
+
+    #[test]
+    fn test_bridge_key_keeps_risky_tags_separate() {
+        let rec_a = make_record(
+            "gRPC architecture for service mesh traffic",
+            &["architecture", "api"],
+            "decision",
+        );
+        let rec_b = make_record(
+            "API rate limit configuration for public endpoints",
+            &["api", "config"],
+            "decision",
+        );
+
+        let key_a = BeliefEngine::claim_key_with_mode(&rec_a, CoarseKeyMode::BridgeKey);
+        let key_b = BeliefEngine::claim_key_with_mode(&rec_b, CoarseKeyMode::BridgeKey);
+
+        assert_ne!(
+            key_a, key_b,
+            "BridgeKey must not collapse broad topic tags like api/architecture"
+        );
+    }
+
+    #[test]
+    fn test_bridge_guard_merges_synonym_tag_pairs_with_sdr_support() {
+        let r1 = make_record(
+            "project ui dashboard polish in current release",
+            &["project", "ui"],
+            "fact",
+        );
+        let r2 = make_record(
+            "project frontend dashboard polish in current release",
+            &["project", "frontend"],
+            "fact",
+        );
+
+        let sdr1: Vec<u16> = (0..100).collect();
+        let sdr2: Vec<u16> = (0..82).chain(100..118).collect();
+        let mut lookup = HashMap::new();
+        lookup.insert(r1.id.clone(), sdr1);
+        lookup.insert(r2.id.clone(), sdr2);
+
+        let clusters = BeliefEngine::sdr_subcluster_bridge_guarded(
+            &[&r1, &r2],
+            &lookup,
+            CLAIM_SIMILARITY_THRESHOLD,
+        );
+        assert_eq!(
+            clusters.len(),
+            1,
+            "BridgeKey should merge safe bridge-tag pairs when SDR also agrees"
+        );
+    }
+
+    #[test]
+    fn test_bridge_guard_blocks_records_without_bridge_overlap() {
+        let r1 = make_record(
+            "release pipeline policy for production rollout",
+            &["deploy", "pipeline"],
+            "decision",
+        );
+        let r2 = make_record(
+            "database backup retention policy for replicas",
+            &["database", "backup"],
+            "decision",
+        );
+
+        let sdr1: Vec<u16> = (0..100).collect();
+        let sdr2: Vec<u16> = (0..85).chain(100..115).collect();
+        let mut lookup = HashMap::new();
+        lookup.insert(r1.id.clone(), sdr1);
+        lookup.insert(r2.id.clone(), sdr2);
+
+        let clusters = BeliefEngine::sdr_subcluster_bridge_guarded(
+            &[&r1, &r2],
+            &lookup,
+            CLAIM_SIMILARITY_THRESHOLD,
+        );
+        assert_eq!(
+            clusters.len(),
+            2,
+            "BridgeKey must not merge records without shared normalized bridge tags"
+        );
+    }
+
+    #[test]
+    fn test_sdr_tag_pool_uses_namespace_semantic_corridor() {
+        let rec = make_record(
+            "api authentication decision for admin access",
+            &["api", "auth"],
+            "decision",
+        );
+        let key = BeliefEngine::claim_key_with_mode(&rec, CoarseKeyMode::SdrTagPool);
+        assert_eq!(key, "default:decision");
+    }
+
+    #[test]
+    fn test_canonical_tag_text_is_sorted_and_deduped() {
+        let rec = make_record(
+            "duplicate tag text ordering",
+            &["Auth", "api", "auth", "API"],
+            "fact",
+        );
+        let text = BeliefEngine::canonical_tag_text(&rec);
+        assert_eq!(text, "api auth");
+    }
+
+    #[test]
+    fn test_sdr_tag_pool_guard_merges_overlapping_tag_fingerprints() {
+        let r1 = make_record(
+            "api authentication policy for internal admin routes",
+            &["api", "auth"],
+            "decision",
+        );
+        let r2 = make_record(
+            "api security policy for internal admin routes",
+            &["api", "security"],
+            "decision",
+        );
+
+        let sdr1: Vec<u16> = (0..100).collect();
+        let sdr2: Vec<u16> = (0..85).chain(100..115).collect();
+        let mut lookup = HashMap::new();
+        lookup.insert(r1.id.clone(), sdr1);
+        lookup.insert(r2.id.clone(), sdr2);
+
+        let clusters = BeliefEngine::sdr_subcluster_tag_sdr_guarded(&[&r1, &r2], &lookup, 0.10);
+        assert_eq!(
+            clusters.len(),
+            1,
+            "SdrTagPool should merge when tag fingerprints overlap and content SDR agrees"
+        );
+    }
+
+    #[test]
+    fn test_sdr_tag_pool_guard_blocks_disjoint_tag_fingerprints() {
+        let r1 = make_record(
+            "deployment canary validation for release pipeline",
+            &["deploy", "canary"],
+            "decision",
+        );
+        let r2 = make_record(
+            "serif reading theme preference for documentation",
+            &["ui", "reading"],
+            "decision",
+        );
+
+        let sdr1: Vec<u16> = (0..100).collect();
+        let sdr2: Vec<u16> = (0..85).chain(100..115).collect();
+        let mut lookup = HashMap::new();
+        lookup.insert(r1.id.clone(), sdr1);
+        lookup.insert(r2.id.clone(), sdr2);
+
+        let clusters = BeliefEngine::sdr_subcluster_tag_sdr_guarded(&[&r1, &r2], &lookup, 0.10);
+        assert_eq!(
+            clusters.len(),
+            2,
+            "SdrTagPool must block records whose tag fingerprints are disjoint"
+        );
     }
 
     #[test]
@@ -1075,8 +1753,16 @@ mod tests {
 
     #[test]
     fn test_split_by_contradiction() {
-        let r1 = make_record("normal fact about deployment safety patterns", &["deploy"], "fact");
-        let mut r2 = make_record("contradicting previous deployment claim here", &["deploy"], "contradiction");
+        let r1 = make_record(
+            "normal fact about deployment safety patterns",
+            &["deploy"],
+            "fact",
+        );
+        let mut r2 = make_record(
+            "contradicting previous deployment claim here",
+            &["deploy"],
+            "contradiction",
+        );
         r2.conflict_mass = 3;
 
         let (supporting, opposing) = BeliefEngine::split_by_contradiction(&[&r1, &r2]);
@@ -1091,24 +1777,46 @@ mod tests {
         let mut engine = BeliefEngine::new();
 
         let mut records = HashMap::new();
-        let r1 = make_record("deploy to staging before production release", &["deploy", "safety"], "decision");
-        let r2 = make_record("deploy to staging before production release always", &["deploy", "safety"], "decision");
+        let r1 = make_record(
+            "deploy to staging before production release",
+            &["deploy", "safety"],
+            "decision",
+        );
+        let r2 = make_record(
+            "deploy to staging before production release always",
+            &["deploy", "safety"],
+            "decision",
+        );
 
         let key1 = BeliefEngine::claim_key(&r1);
         let key2 = BeliefEngine::claim_key(&r2);
-        assert_eq!(key1, key2, "test records must share the same claim key: key1={}, key2={}", key1, key2);
+        assert_eq!(
+            key1, key2,
+            "test records must share the same claim key: key1={}, key2={}",
+            key1, key2
+        );
 
         records.insert(r1.id.clone(), r1);
         records.insert(r2.id.clone(), r2);
 
         // First cycle — beliefs are created, revisions expected
         let report1 = engine.update(&records);
-        assert!(report1.total_beliefs > 0, "first cycle should create beliefs (key={})", key1);
+        assert!(
+            report1.total_beliefs > 0,
+            "first cycle should create beliefs (key={})",
+            key1
+        );
 
         // Second cycle — same data, no changes → zero revisions
         let report2 = engine.update(&records);
-        assert_eq!(report2.revisions, 0, "replaying same data should produce zero revisions");
-        assert!(report2.churn_rate < 0.01, "churn rate should be near-zero on stable data");
+        assert_eq!(
+            report2.revisions, 0,
+            "replaying same data should produce zero revisions"
+        );
+        assert!(
+            report2.churn_rate < 0.01,
+            "churn rate should be near-zero on stable data"
+        );
     }
 
     // ── Edge case 1: context-dependent preferences should not falsely conflict ──
@@ -1121,8 +1829,16 @@ mod tests {
         let mut engine = BeliefEngine::new();
 
         let mut records = HashMap::new();
-        let r1 = make_record("user prefers dark mode in code editor environment", &["ui", "preferences"], "preference");
-        let r2 = make_record("user prefers light mode for reading documentation", &["ui", "preferences"], "preference");
+        let r1 = make_record(
+            "user prefers dark mode in code editor environment",
+            &["ui", "preferences"],
+            "preference",
+        );
+        let r2 = make_record(
+            "user prefers light mode for reading documentation",
+            &["ui", "preferences"],
+            "preference",
+        );
         records.insert(r1.id.clone(), r1.clone());
         records.insert(r2.id.clone(), r2.clone());
 
@@ -1136,9 +1852,14 @@ mod tests {
         // they should at least not be marked as conflicting (no contradiction type).
         // Check: no belief has state == Unresolved (no false conflict detected)
         let unresolved = engine.unresolved_beliefs();
-        assert_eq!(unresolved.len(), 0,
+        assert_eq!(
+            unresolved.len(),
+            0,
             "context-dependent preferences should not produce unresolved conflicts \
-             (key1={}, key2={})", key1, key2);
+             (key1={}, key2={})",
+            key1,
+            key2
+        );
     }
 
     // ── Edge case 2: shared tags alone should not count as support ──
@@ -1152,10 +1873,18 @@ mod tests {
         use crate::background_brain::update_epistemic_state;
 
         let mut records = HashMap::new();
-        let mut r1 = make_record("deploy to staging before production release always", &["deploy"], "decision");
+        let mut r1 = make_record(
+            "deploy to staging before production release always",
+            &["deploy"],
+            "decision",
+        );
         r1.support_mass = 0;
         r1.conflict_mass = 0;
-        let mut r2 = make_record("deploy container images with proper tagging scheme", &["deploy"], "observation");
+        let mut r2 = make_record(
+            "deploy container images with proper tagging scheme",
+            &["deploy"],
+            "observation",
+        );
         r2.support_mass = 0;
         r2.conflict_mass = 0;
 
@@ -1182,13 +1911,25 @@ mod tests {
         use crate::background_brain::update_epistemic_state;
 
         let mut records = HashMap::new();
-        let mut r1 = make_record("deploy staging first for safety always", &["deploy", "safety"], "decision");
+        let mut r1 = make_record(
+            "deploy staging first for safety always",
+            &["deploy", "safety"],
+            "decision",
+        );
         r1.support_mass = 0;
         r1.conflict_mass = 0;
-        let mut r2 = make_record("this contradicts the deploy safety policy", &["deploy", "safety"], "contradiction");
+        let mut r2 = make_record(
+            "this contradicts the deploy safety policy",
+            &["deploy", "safety"],
+            "contradiction",
+        );
         r2.support_mass = 0;
         r2.conflict_mass = 0;
-        let mut r3 = make_record("use structured logging for all services", &["logging"], "decision");
+        let mut r3 = make_record(
+            "use structured logging for all services",
+            &["logging"],
+            "decision",
+        );
         r3.support_mass = 0;
         r3.conflict_mass = 0;
 
@@ -1200,13 +1941,17 @@ mod tests {
 
         // r1 should have conflict (shares tags with contradiction r2)
         let r1_after = records.get(&r1.id).unwrap();
-        assert!(r1_after.conflict_mass > 0,
-            "r1 should gain conflict_mass from contradicting r2");
+        assert!(
+            r1_after.conflict_mass > 0,
+            "r1 should gain conflict_mass from contradicting r2"
+        );
 
         // r3 should have NO conflict (no shared tags with r2, no connection)
         let r3_after = records.get(&r3.id).unwrap();
-        assert_eq!(r3_after.conflict_mass, 0,
-            "r3 (logging) should not be pulled into conflict by unrelated contradiction r2");
+        assert_eq!(
+            r3_after.conflict_mass, 0,
+            "r3 (logging) should not be pulled into conflict by unrelated contradiction r2"
+        );
     }
 
     // ── Edge case 4: Unicode/non-English records should still group stably ──
@@ -1277,8 +2022,10 @@ mod tests {
         assert_eq!(report.unresolved, 0,
             "synonym-heavy paraphrases should not create false unresolved beliefs: key1={}, key2={}",
             key1, key2);
-        assert!(report.total_beliefs <= 1 || key1 != key2,
-            "if both records stay separate, the claim keys should explain the split");
+        assert!(
+            report.total_beliefs <= 1 || key1 != key2,
+            "if both records stay separate, the claim keys should explain the split"
+        );
     }
 
     // ── SDR sub-clustering tests ──
@@ -1286,8 +2033,16 @@ mod tests {
     #[test]
     fn test_sdr_subcluster_similar_records_merge() {
         // Two records with SDR overlap above threshold (0.15) should cluster together
-        let r1 = make_record("deploy staging before production release", &["deploy"], "decision");
-        let r2 = make_record("deploy staging before production release always", &["deploy"], "decision");
+        let r1 = make_record(
+            "deploy staging before production release",
+            &["deploy"],
+            "decision",
+        );
+        let r2 = make_record(
+            "deploy staging before production release always",
+            &["deploy"],
+            "decision",
+        );
 
         // Simulate moderate overlap: Tanimoto = 80/120 ≈ 0.67 (well above 0.15)
         let sdr1: Vec<u16> = (0..100).collect();
@@ -1296,15 +2051,28 @@ mod tests {
         lookup.insert(r1.id.clone(), sdr1);
         lookup.insert(r2.id.clone(), sdr2);
 
-        let clusters = BeliefEngine::sdr_subcluster(&[&r1, &r2], &lookup, CLAIM_SIMILARITY_THRESHOLD);
-        assert_eq!(clusters.len(), 1, "similar SDR records should merge into 1 cluster");
+        let clusters =
+            BeliefEngine::sdr_subcluster(&[&r1, &r2], &lookup, CLAIM_SIMILARITY_THRESHOLD);
+        assert_eq!(
+            clusters.len(),
+            1,
+            "similar SDR records should merge into 1 cluster"
+        );
     }
 
     #[test]
     fn test_sdr_subcluster_different_records_split() {
         // Two records with SDR overlap below threshold (< 0.15) should stay separate
-        let r1 = make_record("deploy staging before production release", &["deploy", "safety"], "decision");
-        let r2 = make_record("database connection pool configuration tuning", &["deploy", "safety"], "decision");
+        let r1 = make_record(
+            "deploy staging before production release",
+            &["deploy", "safety"],
+            "decision",
+        );
+        let r2 = make_record(
+            "database connection pool configuration tuning",
+            &["deploy", "safety"],
+            "decision",
+        );
 
         // Simulate low overlap: only 10% shared
         let sdr1: Vec<u16> = (0..100).collect();
@@ -1313,8 +2081,13 @@ mod tests {
         lookup.insert(r1.id.clone(), sdr1);
         lookup.insert(r2.id.clone(), sdr2);
 
-        let clusters = BeliefEngine::sdr_subcluster(&[&r1, &r2], &lookup, CLAIM_SIMILARITY_THRESHOLD);
-        assert_eq!(clusters.len(), 2, "different SDR records should split into 2 clusters");
+        let clusters =
+            BeliefEngine::sdr_subcluster(&[&r1, &r2], &lookup, CLAIM_SIMILARITY_THRESHOLD);
+        assert_eq!(
+            clusters.len(),
+            2,
+            "different SDR records should split into 2 clusters"
+        );
     }
 
     #[test]
@@ -1324,10 +2097,26 @@ mod tests {
         let mut engine = BeliefEngine::new();
 
         let mut records = HashMap::new();
-        let r1 = make_record("deploy staging before production release always", &["ops", "process"], "decision");
-        let r2 = make_record("deploy staging before production release every time", &["ops", "process"], "decision");
-        let r3 = make_record("database connection pool sizing and timeout config", &["ops", "process"], "decision");
-        let r4 = make_record("database connection pool sizing and timeout tuning", &["ops", "process"], "decision");
+        let r1 = make_record(
+            "deploy staging before production release always",
+            &["ops", "process"],
+            "decision",
+        );
+        let r2 = make_record(
+            "deploy staging before production release every time",
+            &["ops", "process"],
+            "decision",
+        );
+        let r3 = make_record(
+            "database connection pool sizing and timeout config",
+            &["ops", "process"],
+            "decision",
+        );
+        let r4 = make_record(
+            "database connection pool sizing and timeout tuning",
+            &["ops", "process"],
+            "decision",
+        );
 
         // r1 & r2 are similar (deploy topic), r3 & r4 are similar (database topic)
         // But r1 & r3 are dissimilar
@@ -1358,7 +2147,8 @@ mod tests {
         assert!(
             report_with_sdr.total_beliefs >= 2,
             "SDR grouping should create ≥2 beliefs (deploy + db), got {} (without SDR: {})",
-            report_with_sdr.total_beliefs, beliefs_without_sdr
+            report_with_sdr.total_beliefs,
+            beliefs_without_sdr
         );
     }
 
@@ -1368,8 +2158,16 @@ mod tests {
         let mut engine = BeliefEngine::new();
 
         let mut records = HashMap::new();
-        let r1 = make_record("deploy staging before production release always", &["deploy", "safety"], "decision");
-        let r2 = make_record("deploy staging before production release every time", &["deploy", "safety"], "decision");
+        let r1 = make_record(
+            "deploy staging before production release always",
+            &["deploy", "safety"],
+            "decision",
+        );
+        let r2 = make_record(
+            "deploy staging before production release every time",
+            &["deploy", "safety"],
+            "decision",
+        );
         records.insert(r1.id.clone(), r1);
         records.insert(r2.id.clone(), r2);
 
@@ -1388,15 +2186,25 @@ mod tests {
         let b: Vec<u16> = vec![3, 4, 5, 6, 7];
         // intersection = {3,4,5} = 3, union = {1,2,3,4,5,6,7} = 7
         let sim = BeliefEngine::tanimoto(&a, &b);
-        assert!((sim - 3.0 / 7.0).abs() < 0.001, "expected 3/7 ≈ 0.4286, got {}", sim);
+        assert!(
+            (sim - 3.0 / 7.0).abs() < 0.001,
+            "expected 3/7 ≈ 0.4286, got {}",
+            sim
+        );
 
         // Identical
         let sim_same = BeliefEngine::tanimoto(&a, &a);
-        assert!((sim_same - 1.0).abs() < 0.001, "identical vectors should have similarity 1.0");
+        assert!(
+            (sim_same - 1.0).abs() < 0.001,
+            "identical vectors should have similarity 1.0"
+        );
 
         // Disjoint
         let c: Vec<u16> = vec![10, 20, 30];
         let sim_disjoint = BeliefEngine::tanimoto(&a, &c);
-        assert!((sim_disjoint).abs() < 0.001, "disjoint vectors should have similarity 0.0");
+        assert!(
+            (sim_disjoint).abs() < 0.001,
+            "disjoint vectors should have similarity 0.0"
+        );
     }
 }

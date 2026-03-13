@@ -9,10 +9,10 @@
 //! - Loaded from binary `.aura.syn` files (compiled from TOML source)
 //! - Optional: if no synonym file exists, pipeline is unchanged (v1.8 behavior)
 
+use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use anyhow::Result;
 
 /// Canonical projector — maps words to their canonical forms.
 ///
@@ -219,7 +219,6 @@ fn fold_diacritic(ch: char) -> char {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,9 +284,7 @@ mod tests {
 
     #[test]
     fn test_from_groups() {
-        let p = CanonicalProjector::from_groups(&[
-            vec!["alpha", "beta", "gamma"],
-        ]);
+        let p = CanonicalProjector::from_groups(&[vec!["alpha", "beta", "gamma"]]);
         assert_eq!(p.len(), 2); // beta→alpha, gamma→alpha
         assert_eq!(p.project("beta"), "alpha");
         assert_eq!(p.project("gamma"), "alpha");
@@ -336,9 +333,17 @@ mod tests {
         let proj_tanimoto = sdr.tanimoto_sparse(&sdr_cat_proj, &sdr_kitten_proj);
 
         // Raw should be very low (structural mismatch)
-        assert!(raw_tanimoto < 0.1, "Raw tanimoto should be near 0, got {}", raw_tanimoto);
+        assert!(
+            raw_tanimoto < 0.1,
+            "Raw tanimoto should be near 0, got {}",
+            raw_tanimoto
+        );
         // Projected should be identical (both → "cat")
-        assert!(proj_tanimoto > 0.99, "Projected tanimoto should be ~1.0, got {}", proj_tanimoto);
+        assert!(
+            proj_tanimoto > 0.99,
+            "Projected tanimoto should be ~1.0, got {}",
+            proj_tanimoto
+        );
     }
 
     #[test]

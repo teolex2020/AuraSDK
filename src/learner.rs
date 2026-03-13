@@ -33,16 +33,16 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
-use std::io::{BufReader, BufWriter, Read, Write};
 use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 use crate::sdr::SDRInterpreter;
 use crate::storage::{AuraStorage, StoredHeader};
@@ -202,7 +202,8 @@ impl LearnedCanonicalMap {
     /// Look up canonical form for a token
     /// Returns Some(canonical) only if confidence is above threshold
     pub fn lookup(&self, token: &str, min_confidence: f32) -> Option<&str> {
-        self.entries.get(token)
+        self.entries
+            .get(token)
             .filter(|e| e.confidence >= min_confidence)
             .map(|e| e.canonical.as_str())
     }
@@ -210,7 +211,8 @@ impl LearnedCanonicalMap {
     /// Get a runtime HashMap<String, String> for integration with SDR pipeline
     /// Only includes entries above the confidence threshold
     pub fn to_projection_map(&self, min_confidence: f32) -> HashMap<String, String> {
-        self.entries.iter()
+        self.entries
+            .iter()
             .filter(|(_, e)| e.confidence >= min_confidence)
             .map(|(token, e)| (token.clone(), e.canonical.clone()))
             .collect()
@@ -218,7 +220,10 @@ impl LearnedCanonicalMap {
 
     /// Number of active entries above confidence threshold
     pub fn active_count(&self, min_confidence: f32) -> usize {
-        self.entries.values().filter(|e| e.confidence >= min_confidence).count()
+        self.entries
+            .values()
+            .filter(|e| e.confidence >= min_confidence)
+            .count()
     }
 }
 
@@ -251,7 +256,8 @@ impl CoOccurrenceMap {
     }
 
     fn pairs_above_threshold(&self, min_count: u32) -> Vec<(&str, &str, u32)> {
-        self.pairs.iter()
+        self.pairs
+            .iter()
             .filter(|(_, &count)| count >= min_count)
             .map(|((a, b), &count)| (a.as_str(), b.as_str(), count))
             .collect()
@@ -297,22 +303,70 @@ fn tokenize(text: &str, min_length: usize, max_tokens: usize) -> Vec<String> {
 
 /// Basic stopword filter — keeps the tokenizer lightweight
 fn is_stopword(word: &str) -> bool {
-    matches!(word,
-        "the" | "and" | "for" | "are" | "but" | "not" | "you" | "all" |
-        "can" | "had" | "her" | "was" | "one" | "our" | "out" | "has" |
-        "have" | "been" | "were" | "they" | "this" | "that" | "with" |
-        "from" | "will" | "what" | "when" | "make" | "like" | "just" |
-        "into" | "than" | "them" | "then" | "also" | "some" | "these" |
-        "його" | "яка" | "які" | "або" | "для" | "при" | "між" |
-        "але" | "також" | "інші" | "цей" | "вона" | "вони"
+    matches!(
+        word,
+        "the"
+            | "and"
+            | "for"
+            | "are"
+            | "but"
+            | "not"
+            | "you"
+            | "all"
+            | "can"
+            | "had"
+            | "her"
+            | "was"
+            | "one"
+            | "our"
+            | "out"
+            | "has"
+            | "have"
+            | "been"
+            | "were"
+            | "they"
+            | "this"
+            | "that"
+            | "with"
+            | "from"
+            | "will"
+            | "what"
+            | "when"
+            | "make"
+            | "like"
+            | "just"
+            | "into"
+            | "than"
+            | "them"
+            | "then"
+            | "also"
+            | "some"
+            | "these"
+            | "його"
+            | "яка"
+            | "які"
+            | "або"
+            | "для"
+            | "при"
+            | "між"
+            | "але"
+            | "також"
+            | "інші"
+            | "цей"
+            | "вона"
+            | "вони"
     )
 }
 
 /// Extract unique tokens from a record header
 fn extract_tokens(header: &StoredHeader, config: &LearnerConfig) -> HashSet<String> {
-    tokenize(&header.text, config.min_token_length, config.max_tokens_per_record)
-        .into_iter()
-        .collect()
+    tokenize(
+        &header.text,
+        config.min_token_length,
+        config.max_tokens_per_record,
+    )
+    .into_iter()
+    .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -369,12 +423,16 @@ impl SemanticLearner {
     /// Get the current learned projection map for SDR pipeline integration.
     /// Returns HashMap<token, canonical> with entries above confidence threshold.
     pub fn get_projection_map(&self) -> HashMap<String, String> {
-        self.learned_map.read().to_projection_map(self.config.min_confidence)
+        self.learned_map
+            .read()
+            .to_projection_map(self.config.min_confidence)
     }
 
     /// Number of active learned pairs
     pub fn active_pair_count(&self) -> usize {
-        self.learned_map.read().active_count(self.config.min_confidence)
+        self.learned_map
+            .read()
+            .active_count(self.config.min_confidence)
     }
 
     /// Total learned pairs (including below-threshold)
@@ -389,7 +447,8 @@ impl SemanticLearner {
 
     /// Look up a single token's canonical form
     pub fn lookup(&self, token: &str) -> Option<String> {
-        self.learned_map.read()
+        self.learned_map
+            .read()
             .lookup(token, self.config.min_confidence)
             .map(|s| s.to_string())
     }
@@ -422,7 +481,11 @@ impl SemanticLearner {
             });
         }
 
-        tracing::info!("Seeded {} new pairs (skipped {} existing)", added, pairs.len() - added);
+        tracing::info!(
+            "Seeded {} new pairs (skipped {} existing)",
+            added,
+            pairs.len() - added
+        );
         added
     }
 
@@ -528,7 +591,8 @@ impl SemanticLearner {
         // Strategy C: Time window proximity
         // Sort by timestamp, then pair records within temporal_window_secs
         // Max 50 pairs per record to prevent batch import explosion
-        let mut sorted: Vec<(&str, f64)> = cache.iter()
+        let mut sorted: Vec<(&str, f64)> = cache
+            .iter()
             .map(|(id, h)| (id.as_str(), h.timestamp()))
             .collect();
         sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -557,11 +621,7 @@ impl SemanticLearner {
     // Step 2: Gap Detection
     // ═══════════════════════════════════════════════════════════
 
-    fn detect_gaps(
-        &self,
-        storage: &AuraStorage,
-        cooc: &CoOccurrenceMap,
-    ) -> Result<Vec<GapPair>> {
+    fn detect_gaps(&self, storage: &AuraStorage, cooc: &CoOccurrenceMap) -> Result<Vec<GapPair>> {
         let cache = storage.header_cache.read();
         let threshold_cooc = self.config.min_cooccurrence;
         let threshold_sdr = self.config.max_sdr_tanimoto_for_gap;
@@ -580,10 +640,9 @@ impl SemanticLearner {
             };
 
             // Compare SDR similarity
-            let tanimoto = self.sdr.tanimoto_sparse(
-                &header_a.sdr_indices,
-                &header_b.sdr_indices,
-            );
+            let tanimoto = self
+                .sdr
+                .tanimoto_sparse(&header_a.sdr_indices, &header_b.sdr_indices);
 
             // Gap condition: high co-occurrence + low SDR similarity
             if tanimoto < threshold_sdr {
@@ -599,7 +658,11 @@ impl SemanticLearner {
         // Sort by co-occurrence descending (most confident gaps first)
         gaps.sort_by(|a, b| b.cooccurrence.cmp(&a.cooccurrence));
 
-        tracing::debug!("Gap detection: {} gaps from {} frequent pairs", gaps.len(), cooc.pairs.len());
+        tracing::debug!(
+            "Gap detection: {} gaps from {} frequent pairs",
+            gaps.len(),
+            cooc.pairs.len()
+        );
         Ok(gaps)
     }
 
@@ -625,7 +688,8 @@ impl SemanticLearner {
         }
         let total_records = cache.len() as f32;
 
-        for gap in gaps.iter().take(500) { // Limit processing
+        for gap in gaps.iter().take(500) {
+            // Limit processing
             let header_a = match cache.get(&gap.id_a) {
                 Some(h) => h,
                 None => continue,
@@ -663,7 +727,11 @@ impl SemanticLearner {
                     let idf_b = (total_records / freq_b).ln();
 
                     // IDF similarity: tokens with similar rarity are more likely synonyms
-                    let idf_ratio = if idf_a > idf_b { idf_b / idf_a } else { idf_a / idf_b };
+                    let idf_ratio = if idf_a > idf_b {
+                        idf_b / idf_a
+                    } else {
+                        idf_a / idf_b
+                    };
 
                     if idf_ratio < 0.3 {
                         continue; // Very different frequencies — unlikely synonyms
@@ -716,31 +784,28 @@ impl SemanticLearner {
     // Step 4: Merge into Learned Map
     // ═══════════════════════════════════════════════════════════
 
-    fn merge_candidates(
-        &self,
-        candidates: &[CandidatePair],
-    ) -> Result<(usize, usize, usize)> {
+    fn merge_candidates(&self, candidates: &[CandidatePair]) -> Result<(usize, usize, usize)> {
         let mut map = self.learned_map.write();
         let now = now_timestamp();
         let mut new_pairs = 0;
         let mut confirmed = 0;
 
         // Set of tokens confirmed this cycle
-        let confirmed_tokens: HashSet<&str> = candidates.iter()
-            .map(|c| c.token.as_str())
-            .collect();
+        let confirmed_tokens: HashSet<&str> = candidates.iter().map(|c| c.token.as_str()).collect();
 
         // Merge new candidates
         for cand in candidates {
             match map.entries.get_mut(&cand.token) {
                 Some(existing) => {
                     // Existing entry: boost confidence
-                    existing.confidence = (existing.confidence + self.config.confidence_boost).min(1.0);
+                    existing.confidence =
+                        (existing.confidence + self.config.confidence_boost).min(1.0);
                     existing.observations += 1;
                     existing.last_confirmed = now;
 
                     // Upgrade source if we have multi-source confirmation
-                    if existing.source != cand.source && existing.source != PairSource::MultiSource {
+                    if existing.source != cand.source && existing.source != PairSource::MultiSource
+                    {
                         existing.source = PairSource::MultiSource;
                     }
 
@@ -748,14 +813,17 @@ impl SemanticLearner {
                 }
                 None => {
                     // New entry
-                    map.entries.insert(cand.token.clone(), LearnedEntry {
-                        canonical: cand.canonical.clone(),
-                        confidence: cand.confidence,
-                        observations: 1,
-                        discovered_at: now,
-                        last_confirmed: now,
-                        source: cand.source.clone(),
-                    });
+                    map.entries.insert(
+                        cand.token.clone(),
+                        LearnedEntry {
+                            canonical: cand.canonical.clone(),
+                            confidence: cand.confidence,
+                            observations: 1,
+                            discovered_at: now,
+                            last_confirmed: now,
+                            source: cand.source.clone(),
+                        },
+                    );
                     new_pairs += 1;
                 }
             }
@@ -785,7 +853,9 @@ impl SemanticLearner {
 
         // Enforce size limit: remove lowest confidence entries
         if map.entries.len() > self.config.max_learned_pairs {
-            let mut entries_vec: Vec<(String, f32)> = map.entries.iter()
+            let mut entries_vec: Vec<(String, f32)> = map
+                .entries
+                .iter()
                 .filter(|(_, e)| e.source != PairSource::Seed) // Never evict seeds
                 .map(|(k, e)| (k.clone(), e.confidence))
                 .collect();
@@ -889,7 +959,10 @@ impl LearnerScheduler {
         std::thread::Builder::new()
             .name("aura-learner".to_string())
             .spawn(move || {
-                tracing::info!("Learner background thread started (interval: {:?})", interval);
+                tracing::info!(
+                    "Learner background thread started (interval: {:?})",
+                    interval
+                );
 
                 while running.load(Ordering::SeqCst) {
                     // Sleep in small increments to allow quick shutdown
@@ -982,14 +1055,17 @@ mod tests {
         let path = dir.path().join(".aura.learned");
 
         let mut map = LearnedCanonicalMap::default();
-        map.entries.insert("car".to_string(), LearnedEntry {
-            canonical: "automobile".to_string(),
-            confidence: 0.8,
-            observations: 5,
-            discovered_at: 1000.0,
-            last_confirmed: 2000.0,
-            source: PairSource::MultiSource,
-        });
+        map.entries.insert(
+            "car".to_string(),
+            LearnedEntry {
+                canonical: "automobile".to_string(),
+                confidence: 0.8,
+                observations: 5,
+                discovered_at: 1000.0,
+                last_confirmed: 2000.0,
+                source: PairSource::MultiSource,
+            },
+        );
         map.save(&path).unwrap();
 
         let loaded = LearnedCanonicalMap::load(&path).unwrap();
@@ -1000,22 +1076,28 @@ mod tests {
     #[test]
     fn test_learned_map_confidence_filter() {
         let mut map = LearnedCanonicalMap::default();
-        map.entries.insert("low".to_string(), LearnedEntry {
-            canonical: "high".to_string(),
-            confidence: 0.1,
-            observations: 1,
-            discovered_at: 0.0,
-            last_confirmed: 0.0,
-            source: PairSource::Temporal,
-        });
-        map.entries.insert("good".to_string(), LearnedEntry {
-            canonical: "great".to_string(),
-            confidence: 0.9,
-            observations: 10,
-            discovered_at: 0.0,
-            last_confirmed: 0.0,
-            source: PairSource::MultiSource,
-        });
+        map.entries.insert(
+            "low".to_string(),
+            LearnedEntry {
+                canonical: "high".to_string(),
+                confidence: 0.1,
+                observations: 1,
+                discovered_at: 0.0,
+                last_confirmed: 0.0,
+                source: PairSource::Temporal,
+            },
+        );
+        map.entries.insert(
+            "good".to_string(),
+            LearnedEntry {
+                canonical: "great".to_string(),
+                confidence: 0.9,
+                observations: 10,
+                discovered_at: 0.0,
+                last_confirmed: 0.0,
+                source: PairSource::MultiSource,
+            },
+        );
 
         assert_eq!(map.active_count(0.3), 1);
         assert!(map.lookup("low", 0.3).is_none());

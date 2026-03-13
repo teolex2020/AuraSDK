@@ -36,32 +36,68 @@ impl Default for TagTaxonomy {
     fn default() -> Self {
         Self {
             identity_tags: ["user-profile", "identity"]
-                .iter().map(|s| s.to_string()).collect(),
-            stable_tags: [
-                "identity", "contact", "credential", "financial", "person",
-            ].iter().map(|s| s.to_string()).collect(),
-            volatile_tags: [
-                "cache", "scheduled-task", "todo-item", "web-search-cache",
-            ].iter().map(|s| s.to_string()).collect(),
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            stable_tags: ["identity", "contact", "credential", "financial", "person"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            volatile_tags: ["cache", "scheduled-task", "todo-item", "web-search-cache"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             non_identity_tags: [
-                "session-summary", "cache", "outcome", "plan", "reflection",
-                "research-finding", "web-search-cache", "proactive-session",
-                "action-plan", "session-reflection", "scheduled-task",
-                "consolidated-meta", "research-project", "autonomous-outcome",
+                "session-summary",
+                "cache",
+                "outcome",
+                "plan",
+                "reflection",
+                "research-finding",
+                "web-search-cache",
+                "proactive-session",
+                "action-plan",
+                "session-reflection",
+                "scheduled-task",
+                "consolidated-meta",
+                "research-project",
+                "autonomous-outcome",
                 "autonomous-goal",
-            ].iter().map(|s| s.to_string()).collect(),
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
             consolidation_skip_tags: [
-                "identity", "contact", "credential", "financial", "person",
-                "user-profile", "session-summary", "scheduled-task",
-                "health-metric", "extracted-fact", "todo-item",
-            ].iter().map(|s| s.to_string()).collect(),
+                "identity",
+                "contact",
+                "credential",
+                "financial",
+                "person",
+                "user-profile",
+                "session-summary",
+                "scheduled-task",
+                "health-metric",
+                "extracted-fact",
+                "todo-item",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
             archive_protected_tags: [
-                "identity", "contact", "person", "health-metric",
-                "extracted-fact", "relationship",
-            ].iter().map(|s| s.to_string()).collect(),
-            sensitive_tags: [
-                "financial", "credential", "wallet",
-            ].iter().map(|s| s.to_string()).collect(),
+                "identity",
+                "contact",
+                "person",
+                "health-metric",
+                "extracted-fact",
+                "relationship",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            sensitive_tags: ["financial", "credential", "wallet"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 }
@@ -169,9 +205,7 @@ pub fn get_provenance(channel: Option<&str>, trust_config: &TrustConfig) -> Prov
         None => "agent".to_string(),
     };
 
-    let trust_score = *trust_config.source_trust
-        .get(&source)
-        .unwrap_or(&0.5);
+    let trust_score = *trust_config.source_trust.get(&source).unwrap_or(&0.5);
 
     let verified = source.starts_with("user-");
 
@@ -195,11 +229,15 @@ pub fn stamp_provenance(
     let prov = get_provenance(channel, trust_config);
 
     metadata.entry("source".into()).or_insert(prov.source);
-    metadata.entry("verified".into()).or_insert(prov.verified.to_string());
-    metadata.entry("trust_score".into()).or_insert(format!("{:.2}", prov.trust_score));
-    metadata.entry("volatility".into()).or_insert_with(|| {
-        infer_volatility(tags, taxonomy).to_string()
-    });
+    metadata
+        .entry("verified".into())
+        .or_insert(prov.verified.to_string());
+    metadata
+        .entry("trust_score".into())
+        .or_insert(format!("{:.2}", prov.trust_score));
+    metadata
+        .entry("volatility".into())
+        .or_insert_with(|| infer_volatility(tags, taxonomy).to_string());
     metadata.entry("timestamp".into()).or_insert(prov.timestamp);
 }
 
@@ -223,12 +261,11 @@ pub fn compute_effective_trust(
     let source = metadata.get("source").map(|s| s.as_str()).unwrap_or("");
 
     // Source authority multiplier
-    let authority = *trust_config.source_authority
-        .get(source)
-        .unwrap_or(&0.85);
+    let authority = *trust_config.source_authority.get(source).unwrap_or(&0.85);
 
     // Recency boost — fresh records get +max, decays over half_life days
-    let timestamp_str = metadata.get("timestamp")
+    let timestamp_str = metadata
+        .get("timestamp")
         .or_else(|| metadata.get("created_at"))
         .map(|s| s.as_str())
         .unwrap_or("");
@@ -311,9 +348,18 @@ mod tests {
         let inferred = compute_effective_trust(&meta, now, &config, "inferred");
         let generated = compute_effective_trust(&meta, now, &config, "generated");
 
-        assert!(recorded > retrieved, "recorded should rank higher than retrieved");
-        assert!(retrieved > inferred, "retrieved should rank higher than inferred");
-        assert!(inferred > generated, "inferred should rank higher than generated");
+        assert!(
+            recorded > retrieved,
+            "recorded should rank higher than retrieved"
+        );
+        assert!(
+            retrieved > inferred,
+            "retrieved should rank higher than inferred"
+        );
+        assert!(
+            inferred > generated,
+            "inferred should rank higher than generated"
+        );
     }
 
     #[test]

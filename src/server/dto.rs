@@ -70,8 +70,12 @@ pub(super) struct MemoriesQuery {
     pub(super) dna: String,
 }
 
-fn default_limit() -> usize { 50 }
-fn default_dna() -> String { "all".to_string() }
+fn default_limit() -> usize {
+    50
+}
+fn default_dna() -> String {
+    "all".to_string()
+}
 
 #[derive(Serialize, ToSchema)]
 pub(super) struct MemoriesResponse {

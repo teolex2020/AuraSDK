@@ -18,12 +18,12 @@ pub struct SalienceScorer {
     identity_patterns: Vec<Regex>,
     factual_patterns: Vec<Regex>,
     intensifier_patterns: Vec<Regex>,
-    emotional_patterns: Vec<(Regex, f32)>,  // (pattern, weight)
+    emotional_patterns: Vec<(Regex, f32)>, // (pattern, weight)
 
     // Weights for the final formula
-    alpha: f32,  // Intensity weight
-    beta: f32,   // Entropy weight
-    gamma: f32,  // Resonance weight
+    alpha: f32, // Intensity weight
+    beta: f32,  // Entropy weight
+    gamma: f32, // Resonance weight
 }
 
 impl Default for SalienceScorer {
@@ -51,21 +51,45 @@ impl SalienceScorer {
             ],
             emotional_patterns: vec![
                 // High positive emotions
-                (Regex::new(r"(?i)\b(love|adore|cherish|treasure)\b").unwrap(), 2.0),
-                (Regex::new(r"(?i)\b(happy|joy|excited|thrilled)\b").unwrap(), 1.5),
-                (Regex::new(r"(?i)\b(кохаю|люблю|щасливий|радий)\b").unwrap(), 2.0),
-
+                (
+                    Regex::new(r"(?i)\b(love|adore|cherish|treasure)\b").unwrap(),
+                    2.0,
+                ),
+                (
+                    Regex::new(r"(?i)\b(happy|joy|excited|thrilled)\b").unwrap(),
+                    1.5,
+                ),
+                (
+                    Regex::new(r"(?i)\b(кохаю|люблю|щасливий|радий)\b").unwrap(),
+                    2.0,
+                ),
                 // High negative emotions (also high salience)
-                (Regex::new(r"(?i)\b(hate|despise|fear|terrified)\b").unwrap(), 2.0),
-                (Regex::new(r"(?i)\b(angry|furious|devastated)\b").unwrap(), 1.8),
-                (Regex::new(r"(?i)\b(ненавиджу|боюся|злий|сумний)\b").unwrap(), 2.0),
-
+                (
+                    Regex::new(r"(?i)\b(hate|despise|fear|terrified)\b").unwrap(),
+                    2.0,
+                ),
+                (
+                    Regex::new(r"(?i)\b(angry|furious|devastated)\b").unwrap(),
+                    1.8,
+                ),
+                (
+                    Regex::new(r"(?i)\b(ненавиджу|боюся|злий|сумний)\b").unwrap(),
+                    2.0,
+                ),
                 // Safety-critical
-                (Regex::new(r"(?i)\b(danger|emergency|urgent|critical)\b").unwrap(), 3.0),
-                (Regex::new(r"(?i)\b(небезпека|терміново|критично)\b").unwrap(), 3.0),
-
+                (
+                    Regex::new(r"(?i)\b(danger|emergency|urgent|critical)\b").unwrap(),
+                    3.0,
+                ),
+                (
+                    Regex::new(r"(?i)\b(небезпека|терміново|критично)\b").unwrap(),
+                    3.0,
+                ),
                 // Strategic importance
-                (Regex::new(r"(?i)\b(secret|confidential|password|key)\b").unwrap(), 2.5),
+                (
+                    Regex::new(r"(?i)\b(secret|confidential|password|key)\b").unwrap(),
+                    2.5,
+                ),
                 (Regex::new(r"(?i)\b(таємниця|пароль|ключ)\b").unwrap(), 2.5),
             ],
             alpha: 0.5,
@@ -99,7 +123,7 @@ impl SalienceScorer {
         // 2. Factual Check (+1.5)
         // Check for numbers
         if self.factual_patterns[0].is_match(text) {
-             score += 1.5;
+            score += 1.5;
         }
 
         // 3. Intensifier Check (+0.5 per match, max 1.0)
@@ -233,9 +257,7 @@ impl SalienceScorer {
 
         // Geometric mean of similarities
         let n = similarities.len() as f32;
-        let product: f32 = similarities.iter()
-            .filter(|&&s| s > 0.0)
-            .product();
+        let product: f32 = similarities.iter().filter(|&&s| s > 0.0).product();
 
         if product > 0.0 {
             product.powf(1.0 / n)

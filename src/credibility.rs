@@ -170,7 +170,10 @@ mod tests {
     #[test]
     fn test_unknown_domain() {
         let cred = SourceCredibility::new();
-        assert_eq!(cred.get_score("https://random-blog.xyz/post"), DEFAULT_SCORE);
+        assert_eq!(
+            cred.get_score("https://random-blog.xyz/post"),
+            DEFAULT_SCORE
+        );
     }
 
     #[test]

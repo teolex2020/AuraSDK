@@ -11,10 +11,22 @@ use pyo3::prelude::*;
 
 /// Standard user profile fields.
 pub const PROFILE_FIELDS: &[&str] = &[
-    "name", "full_name", "age", "birthday", "gender",
-    "location", "city", "country", "timezone",
-    "language", "languages", "occupation", "company",
-    "email", "phone", "bio",
+    "name",
+    "full_name",
+    "age",
+    "birthday",
+    "gender",
+    "location",
+    "city",
+    "country",
+    "timezone",
+    "language",
+    "languages",
+    "occupation",
+    "company",
+    "email",
+    "phone",
+    "bio",
 ];
 
 /// Format profile data as human-readable content string.
@@ -114,7 +126,10 @@ impl AgentPersona {
 pub fn persona_to_instruction(persona: &AgentPersona) -> String {
     let mut lines = vec![
         format!("You are {}, a {}.", persona.name, persona.role),
-        format!("You help users with anything they need — {}.", persona.motivations),
+        format!(
+            "You help users with anything they need — {}.",
+            persona.motivations
+        ),
         format!("Your scope: {}.", persona.scope),
         format!("Speak {}.", persona.tone),
     ];

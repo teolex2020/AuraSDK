@@ -4,8 +4,8 @@ mod middleware;
 mod state;
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::{
@@ -52,7 +52,8 @@ pub fn start_server(port: u16, storage_path: &str) -> anyhow::Result<()> {
             CorsLayer::permissive()
         }
         Some(val) if !val.is_empty() => {
-            let origins: Vec<axum::http::HeaderValue> = val.split(',')
+            let origins: Vec<axum::http::HeaderValue> = val
+                .split(',')
                 .filter_map(|s| s.trim().parse().ok())
                 .collect();
             println!("[CORS] Allowed origins: {} configured", origins.len());
@@ -74,8 +75,7 @@ pub fn start_server(port: u16, storage_path: &str) -> anyhow::Result<()> {
         }
     };
 
-    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
-        .build_recorder();
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let prom_handle = recorder.handle();
     metrics::set_global_recorder(recorder).ok();
     println!("[METRICS] Prometheus metrics enabled at /metrics");
@@ -93,7 +93,10 @@ pub fn start_server(port: u16, storage_path: &str) -> anyhow::Result<()> {
 
     metrics::gauge!("aura_record_count").set(state.memory.count(None) as f64);
 
-    let use_json = std::env::var("AURA_LOG_JSON").ok().map(|v| v == "1").unwrap_or(false);
+    let use_json = std::env::var("AURA_LOG_JSON")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     if use_json {
@@ -129,13 +132,18 @@ pub fn start_server(port: u16, storage_path: &str) -> anyhow::Result<()> {
             .route("/import-sdr", post(handlers::import_sdr));
 
         let api = api
-            .layer(axum_middleware::from_fn_with_state(state.clone(), middleware::rate_limit_middleware))
-            .layer(axum_middleware::from_fn_with_state(state.clone(), middleware::auth_middleware));
+            .layer(axum_middleware::from_fn_with_state(
+                state.clone(),
+                middleware::rate_limit_middleware,
+            ))
+            .layer(axum_middleware::from_fn_with_state(
+                state.clone(),
+                middleware::auth_middleware,
+            ));
 
         let app = api
             .merge(
-                utoipa_swagger_ui::SwaggerUi::new("/docs")
-                    .url("/openapi.json", ApiDoc::openapi())
+                utoipa_swagger_ui::SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()),
             )
             .route("/metrics", get(handlers::prometheus_metrics))
             .route("/", get(handlers::static_handler))
@@ -160,9 +168,12 @@ pub fn start_server(port: u16, storage_path: &str) -> anyhow::Result<()> {
             let key_path = tls_key.unwrap();
             println!("[TLS] Loading cert: {}, key: {}", cert_path, key_path);
 
-            let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
-                .await
-                .expect("Failed to load TLS cert/key. Check AURA_TLS_CERT and AURA_TLS_KEY paths.");
+            let tls_config =
+                axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+                    .await
+                    .expect(
+                        "Failed to load TLS cert/key. Check AURA_TLS_CERT and AURA_TLS_KEY paths.",
+                    );
 
             let handle = axum_server::Handle::new();
             let shutdown_handle = handle.clone();

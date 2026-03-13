@@ -16,7 +16,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::belief::{BeliefEngine, BeliefState};
-use crate::causal::{CausalEngine, CausalState};
+use crate::causal::{
+    meets_counterevidence_gate, meets_counterfactual_gate, meets_evidence_gate, CausalEngine,
+    CausalEvidenceMode, CausalState,
+};
 use crate::concept::{ConceptEngine, ConceptState};
 use crate::record::Record;
 
@@ -24,6 +27,8 @@ use crate::record::Record;
 
 /// Minimum causal_strength to consider a pattern as policy seed.
 const MIN_CAUSAL_STRENGTH_FOR_SEED: f32 = 0.65;
+/// Minimum supporting observations before a causal pattern can seed policy hints.
+const MIN_CAUSAL_SUPPORT_FOR_SEED: usize = 2;
 
 /// Scoring weights for policy_strength.
 const W_CAUSAL: f32 = 0.35;
@@ -37,16 +42,39 @@ const CANDIDATE_THRESHOLD: f32 = 0.50;
 
 /// Negative outcome keywords (tag or semantic_type driven).
 const NEGATIVE_KEYWORDS: &[&str] = &[
-    "error", "failure", "fail", "crash", "bug", "incident",
-    "rollback", "revert", "risk", "vulnerability", "downtime",
-    "outage", "regression", "contradiction", "conflict",
+    "error",
+    "failure",
+    "fail",
+    "crash",
+    "bug",
+    "incident",
+    "rollback",
+    "revert",
+    "risk",
+    "vulnerability",
+    "downtime",
+    "outage",
+    "regression",
+    "contradiction",
+    "conflict",
 ];
 
 /// Positive outcome keywords.
 const POSITIVE_KEYWORDS: &[&str] = &[
-    "success", "improvement", "improve", "faster", "reliable",
-    "stable", "healthy", "secure", "optimized", "resolved",
-    "fixed", "deployed", "completed", "approved",
+    "success",
+    "improvement",
+    "improve",
+    "faster",
+    "reliable",
+    "stable",
+    "healthy",
+    "secure",
+    "optimized",
+    "resolved",
+    "fixed",
+    "deployed",
+    "completed",
+    "approved",
 ];
 
 // ── PolicyActionKind ──
@@ -206,10 +234,32 @@ impl PolicyEngine {
             .as_secs_f64();
 
         // Phase A: Select causal seeds — require stable lower-layer provenance
-        let seeds: Vec<&crate::causal::CausalPattern> = causal_engine.patterns.values()
+        let seeds: Vec<&crate::causal::CausalPattern> = causal_engine
+            .patterns
+            .values()
             .filter(|p| {
                 let strength_ok = p.state == CausalState::Stable
-                    || (p.state == CausalState::Candidate && p.causal_strength >= MIN_CAUSAL_STRENGTH_FOR_SEED);
+                    || (p.state == CausalState::Candidate
+                        && p.causal_strength >= MIN_CAUSAL_STRENGTH_FOR_SEED);
+                let support_ok = p.support_count >= MIN_CAUSAL_SUPPORT_FOR_SEED;
+                let evidence_ok =
+                    if meets_evidence_gate(p, CausalEvidenceMode::StrictRepeatedWindows) {
+                        true
+                    } else {
+                        // Comparison-only recovery path for purely temporal clustered evidence.
+                        // Do not allow it to piggyback on causes that already have explicit
+                        // outcome mass, otherwise old confounder packs reopen through temporal
+                        // side-paths around the explicit guards.
+                        causal_engine.evidence_mode == CausalEvidenceMode::TemporalClusterRecovery
+                            && meets_evidence_gate(p, CausalEvidenceMode::TemporalClusterRecovery)
+                            && p.explicit_support_count == 0
+                            && p.explicit_support_total_for_cause == 0
+                            && p.counterevidence == 0
+                            && p.positive_effect_signals > 0
+                            && p.negative_effect_signals == 0
+                    };
+                let counterevidence_ok = meets_counterevidence_gate(p);
+                let counterfactual_ok = meets_counterfactual_gate(p);
                 // Gate: at least one cause-side belief must be Resolved or Singleton.
                 // This prevents orphan causal patterns (no stable belief backing) from
                 // producing policy hints.
@@ -218,7 +268,12 @@ impl PolicyEngine {
                         matches!(b.state, BeliefState::Resolved | BeliefState::Singleton)
                     })
                 });
-                strength_ok && has_stable_belief
+                strength_ok
+                    && support_ok
+                    && evidence_ok
+                    && counterevidence_ok
+                    && counterfactual_ok
+                    && has_stable_belief
             })
             .collect();
 
@@ -239,14 +294,25 @@ impl PolicyEngine {
         for pattern in &seeds {
             // Phase B: Classify outcome polarity from effect records
             let polarity = self.classify_polarity(pattern, records);
+            let mixed_explicit_ambiguity =
+                self.has_mixed_explicit_outcome_ambiguity(pattern, records);
+
+            if mixed_explicit_ambiguity {
+                continue;
+            }
 
             // Phase C: Map to action kind
             let action_kind = Self::map_action_kind(polarity, pattern.causal_strength);
 
             // Phase D: Build the hint
             let hint = self.build_hint(
-                pattern, polarity, action_kind,
-                &belief_to_concepts, belief_engine, records, now,
+                pattern,
+                polarity,
+                action_kind,
+                &belief_to_concepts,
+                belief_engine,
+                records,
+                now,
             );
 
             let key = hint.key.clone();
@@ -308,6 +374,37 @@ impl PolicyEngine {
         pattern: &crate::causal::CausalPattern,
         records: &HashMap<String, Record>,
     ) -> Polarity {
+        let (positive_signals, negative_signals) = self.polarity_signal_counts(pattern, records);
+
+        if negative_signals > positive_signals && negative_signals >= 2 {
+            Polarity::Negative
+        } else if positive_signals > negative_signals && positive_signals >= 2 {
+            Polarity::Positive
+        } else {
+            Polarity::Neutral
+        }
+    }
+
+    fn has_mixed_explicit_outcome_ambiguity(
+        &self,
+        pattern: &crate::causal::CausalPattern,
+        records: &HashMap<String, Record>,
+    ) -> bool {
+        if pattern.explicit_support_count < MIN_CAUSAL_SUPPORT_FOR_SEED
+            || pattern.effect_record_signature_variants <= 1
+        {
+            return false;
+        }
+
+        let (positive_signals, negative_signals) = self.polarity_signal_counts(pattern, records);
+        positive_signals >= 2 && negative_signals >= 2
+    }
+
+    fn polarity_signal_counts(
+        &self,
+        pattern: &crate::causal::CausalPattern,
+        records: &HashMap<String, Record>,
+    ) -> (usize, usize) {
         let mut positive_signals = 0;
         let mut negative_signals = 0;
 
@@ -344,13 +441,7 @@ impl PolicyEngine {
             }
         }
 
-        if negative_signals > positive_signals && negative_signals >= 2 {
-            Polarity::Negative
-        } else if positive_signals > negative_signals && positive_signals >= 2 {
-            Polarity::Positive
-        } else {
-            Polarity::Neutral
-        }
+        (positive_signals, negative_signals)
     }
 
     // ── Phase C: Action kind mapping ──
@@ -377,17 +468,25 @@ impl PolicyEngine {
         records: &HashMap<String, Record>,
         now: f64,
     ) -> PolicyHint {
-        let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
-
         // Build domain from tags of cause records
         let domain = self.extract_domain(pattern, records);
 
         // Stable key from namespace + action_kind + causal pattern key
-        let key = format!("{}:{}:{}", pattern.namespace, action_kind_str(action_kind), pattern.key);
+        let key = format!(
+            "{}:{}:{}",
+            pattern.namespace,
+            action_kind_str(action_kind),
+            pattern.key
+        );
+        let id = deterministic_id(&key);
 
         // Collect concept IDs via belief → concept mapping
         let mut concept_ids = Vec::new();
-        for bid in pattern.cause_belief_ids.iter().chain(pattern.effect_belief_ids.iter()) {
+        for bid in pattern
+            .cause_belief_ids
+            .iter()
+            .chain(pattern.effect_belief_ids.iter())
+        {
             if let Some(cids) = belief_to_concepts.get(bid) {
                 for cid in cids {
                     if !concept_ids.contains(cid) {
@@ -432,8 +531,7 @@ impl PolicyEngine {
         // Stability proxy: use causal temporal_consistency as a proxy for now
         let stability = pattern.temporal_consistency;
 
-        let policy_strength =
-            W_CAUSAL * causal_strength
+        let policy_strength = W_CAUSAL * causal_strength
             + W_CONFIDENCE * confidence
             + W_UTILITY * utility_score
             + W_STABILITY * stability;
@@ -478,7 +576,11 @@ impl PolicyEngine {
         }
         let mut tags: Vec<(&&str, &usize)> = tag_counts.iter().collect();
         tags.sort_by(|a, b| b.1.cmp(a.1));
-        tags.iter().take(2).map(|(t, _)| **t).collect::<Vec<_>>().join("/")
+        tags.iter()
+            .take(2)
+            .map(|(t, _)| **t)
+            .collect::<Vec<_>>()
+            .join("/")
     }
 
     /// Aggregate confidence from resolved beliefs.
@@ -500,7 +602,11 @@ impl PolicyEngine {
                 }
             }
         }
-        if count > 0 { sum / count as f32 } else { 0.0 }
+        if count > 0 {
+            sum / count as f32
+        } else {
+            0.0
+        }
     }
 
     /// Generate deterministic recommendation text from template.
@@ -511,23 +617,34 @@ impl PolicyEngine {
         records: &HashMap<String, Record>,
     ) -> String {
         // Get a brief cause summary from first cause record
-        let cause_summary = pattern.cause_record_ids.first()
+        let cause_summary = pattern
+            .cause_record_ids
+            .first()
             .and_then(|rid| records.get(rid))
             .map(|r| truncate(&r.content, 80))
             .unwrap_or_else(|| "this action".to_string());
 
         match action_kind {
             PolicyActionKind::Avoid => {
-                format!("Avoid: '{}' in domain [{}] has been associated with negative outcomes.", cause_summary, domain)
+                format!(
+                    "Avoid: '{}' in domain [{}] has been associated with negative outcomes.",
+                    cause_summary, domain
+                )
             }
             PolicyActionKind::VerifyFirst => {
                 format!("Verify first: '{}' in domain [{}] has shown risk signals — check before proceeding.", cause_summary, domain)
             }
             PolicyActionKind::Prefer => {
-                format!("Prefer: '{}' in domain [{}] has consistently led to positive outcomes.", cause_summary, domain)
+                format!(
+                    "Prefer: '{}' in domain [{}] has consistently led to positive outcomes.",
+                    cause_summary, domain
+                )
             }
             PolicyActionKind::Recommend => {
-                format!("Recommend: '{}' in domain [{}] has shown positive signals.", cause_summary, domain)
+                format!(
+                    "Recommend: '{}' in domain [{}] has shown positive signals.",
+                    cause_summary, domain
+                )
             }
             PolicyActionKind::Warn => {
                 format!("Warning: '{}' in domain [{}] has a strong causal pattern but unclear polarity.", cause_summary, domain)
@@ -561,8 +678,14 @@ impl PolicyEngine {
                 }
 
                 // Check if they conflict: one positive, one negative
-                let a_positive = matches!(a.action_kind, PolicyActionKind::Prefer | PolicyActionKind::Recommend);
-                let b_positive = matches!(b.action_kind, PolicyActionKind::Prefer | PolicyActionKind::Recommend);
+                let a_positive = matches!(
+                    a.action_kind,
+                    PolicyActionKind::Prefer | PolicyActionKind::Recommend
+                );
+                let b_positive = matches!(
+                    b.action_kind,
+                    PolicyActionKind::Prefer | PolicyActionKind::Recommend
+                );
 
                 if a_positive == b_positive {
                     continue; // same direction — no conflict
@@ -610,6 +733,12 @@ impl PolicyEngine {
     }
 }
 
+/// Generate a deterministic policy hint ID from its stable key.
+fn deterministic_id(key: &str) -> String {
+    let hash = xxhash_rust::xxh3::xxh3_64(key.as_bytes());
+    format!("p-{:012x}", hash)
+}
+
 // ── Helpers ──
 
 fn action_kind_str(kind: PolicyActionKind) -> &'static str {
@@ -642,7 +771,9 @@ pub struct PolicyStore {
 
 impl PolicyStore {
     pub fn new<P: AsRef<std::path::Path>>(path: P) -> Self {
-        Self { path: path.as_ref().to_path_buf() }
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
     }
 
     /// Save current engine state to policies.cog (best-effort).
@@ -723,7 +854,10 @@ pub struct SurfacedPolicyHint {
 /// Surface filtering and sorting for policy hints.
 /// Takes the current engine state and returns a bounded, sorted, provenance-checked
 /// list of advisory hints suitable for external consumption.
-pub fn surface_policy_hints(engine: &PolicyEngine, limit: Option<usize>) -> Vec<SurfacedPolicyHint> {
+pub fn surface_policy_hints(
+    engine: &PolicyEngine,
+    limit: Option<usize>,
+) -> Vec<SurfacedPolicyHint> {
     surface_policy_hints_filtered(engine, limit, None)
 }
 
@@ -736,11 +870,15 @@ pub fn surface_policy_hints_filtered(
     let max = limit.unwrap_or(MAX_SURFACED_HINTS).min(MAX_SURFACED_HINTS);
 
     // Phase A+B: filter eligible hints
-    let mut eligible: Vec<&PolicyHint> = engine.hints.values()
+    let mut eligible: Vec<&PolicyHint> = engine
+        .hints
+        .values()
         .filter(|h| {
             // Namespace filter
             if let Some(ns) = namespace {
-                if h.namespace != ns { return false; }
+                if h.namespace != ns {
+                    return false;
+                }
             }
 
             // Must have provenance
@@ -758,7 +896,7 @@ pub fn surface_policy_hints_filtered(
                 PolicyState::Stable => true,
                 PolicyState::Candidate => {
                     h.policy_strength >= STRONG_CANDIDATE_THRESHOLD
-                    && h.confidence >= MIN_SURFACE_CONFIDENCE
+                        && h.confidence >= MIN_SURFACE_CONFIDENCE
                 }
                 PolicyState::Suppressed | PolicyState::Rejected => false,
             }
@@ -768,9 +906,19 @@ pub fn surface_policy_hints_filtered(
     // Phase C: sort deterministically
     // Higher policy_strength > higher confidence > higher risk_score > stable over candidate > key tiebreak
     eligible.sort_by(|a, b| {
-        b.policy_strength.partial_cmp(&a.policy_strength).unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal))
-            .then(b.risk_score.partial_cmp(&a.risk_score).unwrap_or(std::cmp::Ordering::Equal))
+        b.policy_strength
+            .partial_cmp(&a.policy_strength)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(
+                b.risk_score
+                    .partial_cmp(&a.risk_score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
             .then_with(|| {
                 let a_stable = matches!(a.state, PolicyState::Stable);
                 let b_stable = matches!(b.state, PolicyState::Stable);
@@ -783,7 +931,8 @@ pub fn surface_policy_hints_filtered(
     let mut result = Vec::new();
     let mut domain_counts: HashMap<String, usize> = HashMap::new();
     let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut seen_recommendations: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_recommendations: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for hint in &eligible {
         if result.len() >= max {
@@ -839,9 +988,9 @@ pub fn surface_policy_hints_filtered(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::belief::BeliefEngine;
     use crate::causal::{CausalEngine, CausalPattern, CausalState};
     use crate::concept::ConceptEngine;
-    use crate::belief::BeliefEngine;
     use crate::levels::Level;
 
     fn make_record(id: &str, content: &str, ns: &str, tags: &[&str], semantic: &str) -> Record {
@@ -871,7 +1020,16 @@ mod tests {
         strength: f32,
         state: CausalState,
     ) -> CausalPattern {
-        make_causal_pattern_with_beliefs(id, ns, cause_rids, effect_rids, &["b_cause"], &[], strength, state)
+        make_causal_pattern_with_beliefs(
+            id,
+            ns,
+            cause_rids,
+            effect_rids,
+            &["b_cause"],
+            &[],
+            strength,
+            state,
+        )
     }
 
     fn make_causal_pattern_with_beliefs(
@@ -884,6 +1042,34 @@ mod tests {
         strength: f32,
         state: CausalState,
     ) -> CausalPattern {
+        make_causal_pattern_with_evidence(
+            id,
+            ns,
+            cause_rids,
+            effect_rids,
+            cause_bids,
+            effect_bids,
+            strength,
+            state,
+            3,
+            1,
+            2,
+        )
+    }
+
+    fn make_causal_pattern_with_evidence(
+        id: &str,
+        ns: &str,
+        cause_rids: &[&str],
+        effect_rids: &[&str],
+        cause_bids: &[&str],
+        effect_bids: &[&str],
+        strength: f32,
+        state: CausalState,
+        support_count: usize,
+        explicit_support_count: usize,
+        unique_temporal_windows: usize,
+    ) -> CausalPattern {
         CausalPattern {
             id: id.to_string(),
             key: format!("{}:test_key:{}", ns, id),
@@ -892,8 +1078,16 @@ mod tests {
             effect_belief_ids: effect_bids.iter().map(|s| s.to_string()).collect(),
             cause_record_ids: cause_rids.iter().map(|s| s.to_string()).collect(),
             effect_record_ids: effect_rids.iter().map(|s| s.to_string()).collect(),
-            support_count: 3,
+            support_count,
+            explicit_support_count,
+            temporal_support_count: support_count.saturating_sub(explicit_support_count),
+            unique_temporal_windows,
+            effect_record_signature_variants: 1,
+            positive_effect_signals: 0,
+            negative_effect_signals: 0,
             counterevidence: 0,
+            explicit_support_total_for_cause: explicit_support_count,
+            explicit_effect_variants_for_cause: usize::from(explicit_support_count > 0),
             transition_lift: strength,
             temporal_consistency: 0.9,
             outcome_stability: 0.8,
@@ -938,11 +1132,45 @@ mod tests {
         inject_singleton_belief(&mut belief, "b_cause");
 
         let mut records = HashMap::new();
-        records.insert("c1".into(), make_record("c1", "Deployed untested code to production", "default", &["deploy"], "decision"));
-        records.insert("e1".into(), make_record("e1", "Application crashed after deployment failure", "default", &["deploy", "incident"], "fact"));
-        records.insert("e2".into(), make_record("e2", "Rollback was needed after the failure", "default", &["deploy", "incident"], "fact"));
+        records.insert(
+            "c1".into(),
+            make_record(
+                "c1",
+                "Deployed untested code to production",
+                "default",
+                &["deploy"],
+                "decision",
+            ),
+        );
+        records.insert(
+            "e1".into(),
+            make_record(
+                "e1",
+                "Application crashed after deployment failure",
+                "default",
+                &["deploy", "incident"],
+                "fact",
+            ),
+        );
+        records.insert(
+            "e2".into(),
+            make_record(
+                "e2",
+                "Rollback was needed after the failure",
+                "default",
+                &["deploy", "incident"],
+                "fact",
+            ),
+        );
 
-        let pattern = make_causal_pattern("p1", "default", &["c1"], &["e1", "e2"], 0.80, CausalState::Stable);
+        let pattern = make_causal_pattern(
+            "p1",
+            "default",
+            &["c1"],
+            &["e1", "e2"],
+            0.80,
+            CausalState::Stable,
+        );
         causal.patterns.insert("p1".into(), pattern);
 
         let report = engine.discover(&causal, &concept, &belief, &records);
@@ -950,10 +1178,15 @@ mod tests {
 
         let hint = engine.hints.values().next().unwrap();
         assert!(
-            hint.action_kind == PolicyActionKind::Avoid || hint.action_kind == PolicyActionKind::VerifyFirst,
-            "negative outcome should produce Avoid or VerifyFirst, got {:?}", hint.action_kind
+            hint.action_kind == PolicyActionKind::Avoid
+                || hint.action_kind == PolicyActionKind::VerifyFirst,
+            "negative outcome should produce Avoid or VerifyFirst, got {:?}",
+            hint.action_kind
         );
-        assert!(hint.risk_score > 0.0, "risk_score should be positive for negative polarity");
+        assert!(
+            hint.risk_score > 0.0,
+            "risk_score should be positive for negative polarity"
+        );
     }
 
     // ── 4. Positive outcome produces Prefer/Recommend ──
@@ -967,11 +1200,45 @@ mod tests {
         inject_singleton_belief(&mut belief, "b_cause");
 
         let mut records = HashMap::new();
-        records.insert("c1".into(), make_record("c1", "Enabled caching for API endpoints", "default", &["caching", "api"], "decision"));
-        records.insert("e1".into(), make_record("e1", "API response times improved significantly", "default", &["caching", "api"], "fact"));
-        records.insert("e2".into(), make_record("e2", "Successfully deployed the optimized caching layer", "default", &["caching", "api"], "fact"));
+        records.insert(
+            "c1".into(),
+            make_record(
+                "c1",
+                "Enabled caching for API endpoints",
+                "default",
+                &["caching", "api"],
+                "decision",
+            ),
+        );
+        records.insert(
+            "e1".into(),
+            make_record(
+                "e1",
+                "API response times improved significantly",
+                "default",
+                &["caching", "api"],
+                "fact",
+            ),
+        );
+        records.insert(
+            "e2".into(),
+            make_record(
+                "e2",
+                "Successfully deployed the optimized caching layer",
+                "default",
+                &["caching", "api"],
+                "fact",
+            ),
+        );
 
-        let pattern = make_causal_pattern("p1", "default", &["c1"], &["e1", "e2"], 0.80, CausalState::Stable);
+        let pattern = make_causal_pattern(
+            "p1",
+            "default",
+            &["c1"],
+            &["e1", "e2"],
+            0.80,
+            CausalState::Stable,
+        );
         causal.patterns.insert("p1".into(), pattern);
 
         let report = engine.discover(&causal, &concept, &belief, &records);
@@ -979,10 +1246,15 @@ mod tests {
 
         let hint = engine.hints.values().next().unwrap();
         assert!(
-            hint.action_kind == PolicyActionKind::Prefer || hint.action_kind == PolicyActionKind::Recommend,
-            "positive outcome should produce Prefer or Recommend, got {:?}", hint.action_kind
+            hint.action_kind == PolicyActionKind::Prefer
+                || hint.action_kind == PolicyActionKind::Recommend,
+            "positive outcome should produce Prefer or Recommend, got {:?}",
+            hint.action_kind
         );
-        assert!(hint.risk_score == 0.0, "risk_score should be 0 for positive polarity");
+        assert!(
+            hint.risk_score == 0.0,
+            "risk_score should be 0 for positive polarity"
+        );
     }
 
     // ── 5. Neutral polarity produces Warn ──
@@ -996,18 +1268,111 @@ mod tests {
         inject_singleton_belief(&mut belief, "b_cause");
 
         let mut records = HashMap::new();
-        records.insert("c1".into(), make_record("c1", "Changed the database schema version", "default", &["database"], "decision"));
-        records.insert("e1".into(), make_record("e1", "Migration completed on schedule", "default", &["database"], "fact"));
+        records.insert(
+            "c1".into(),
+            make_record(
+                "c1",
+                "Changed the database schema version",
+                "default",
+                &["database"],
+                "decision",
+            ),
+        );
+        records.insert(
+            "e1".into(),
+            make_record(
+                "e1",
+                "Migration completed on schedule",
+                "default",
+                &["database"],
+                "fact",
+            ),
+        );
 
-        let pattern = make_causal_pattern("p1", "default", &["c1"], &["e1"], 0.80, CausalState::Stable);
+        let pattern =
+            make_causal_pattern("p1", "default", &["c1"], &["e1"], 0.80, CausalState::Stable);
         causal.patterns.insert("p1".into(), pattern);
 
         let report = engine.discover(&causal, &concept, &belief, &records);
         assert_eq!(report.hints_found, 1);
 
         let hint = engine.hints.values().next().unwrap();
-        assert_eq!(hint.action_kind, PolicyActionKind::Warn,
-            "neutral polarity should produce Warn");
+        assert_eq!(
+            hint.action_kind,
+            PolicyActionKind::Warn,
+            "neutral polarity should produce Warn"
+        );
+    }
+
+    #[test]
+    fn mixed_explicit_outcomes_do_not_produce_policy_hint() {
+        let mut engine = PolicyEngine::new();
+        let mut causal = CausalEngine::new();
+        let concept = ConceptEngine::new();
+        let mut belief = BeliefEngine::default();
+        inject_singleton_belief(&mut belief, "b_cause");
+
+        let mut records = HashMap::new();
+        records.insert(
+            "c1".into(),
+            make_record(
+                "c1",
+                "Changed deploy workflow rollout",
+                "default",
+                &["deploy", "workflow"],
+                "decision",
+            ),
+        );
+        records.insert(
+            "e1".into(),
+            make_record(
+                "e1",
+                "Release stability improved after rollout change",
+                "default",
+                &["deploy", "stability", "improvement"],
+                "fact",
+            ),
+        );
+        records.insert(
+            "e2".into(),
+            make_record(
+                "e2",
+                "Rollback frequency increased after rollout change",
+                "default",
+                &["deploy", "rollback", "regression"],
+                "fact",
+            ),
+        );
+        records.insert(
+            "e3".into(),
+            make_record(
+                "e3",
+                "Security review load increased after rollout change",
+                "default",
+                &["deploy", "security", "review"],
+                "fact",
+            ),
+        );
+
+        let mut pattern = make_causal_pattern_with_evidence(
+            "p1",
+            "default",
+            &["c1"],
+            &["e1", "e2", "e3"],
+            &["b_cause"],
+            &[],
+            0.90,
+            CausalState::Stable,
+            9,
+            9,
+            1,
+        );
+        pattern.effect_record_signature_variants = 3;
+        causal.patterns.insert("p1".into(), pattern);
+
+        let report = engine.discover(&causal, &concept, &belief, &records);
+        assert_eq!(report.seeds_found, 0);
+        assert_eq!(report.hints_found, 0);
     }
 
     // ── 6. Weak causal patterns are not seeded ──
@@ -1021,16 +1386,292 @@ mod tests {
         let records = HashMap::new();
 
         // Candidate with strength below MIN_CAUSAL_STRENGTH_FOR_SEED (0.65)
-        let pattern = make_causal_pattern("p1", "default", &["c1"], &["e1"], 0.40, CausalState::Candidate);
+        let pattern = make_causal_pattern(
+            "p1",
+            "default",
+            &["c1"],
+            &["e1"],
+            0.40,
+            CausalState::Candidate,
+        );
         causal.patterns.insert("p1".into(), pattern);
 
         // Rejected pattern
-        let pattern2 = make_causal_pattern("p2", "default", &["c2"], &["e2"], 0.30, CausalState::Rejected);
+        let pattern2 = make_causal_pattern(
+            "p2",
+            "default",
+            &["c2"],
+            &["e2"],
+            0.30,
+            CausalState::Rejected,
+        );
         causal.patterns.insert("p2".into(), pattern2);
 
         let report = engine.discover(&causal, &concept, &belief, &records);
-        assert_eq!(report.seeds_found, 0, "weak/rejected patterns should not be seeded");
+        assert_eq!(
+            report.seeds_found, 0,
+            "weak/rejected patterns should not be seeded"
+        );
         assert_eq!(report.hints_found, 0);
+    }
+
+    // ── 6b. Single-observation causal patterns are not seeded ──
+
+    #[test]
+    fn single_observation_causal_not_seeded() {
+        let mut engine = PolicyEngine::new();
+        let mut causal = CausalEngine::new();
+        let concept = ConceptEngine::new();
+        let mut belief = BeliefEngine::default();
+        inject_singleton_belief(&mut belief, "b_cause");
+
+        let mut pattern = make_causal_pattern(
+            "p1",
+            "default",
+            &["c1"],
+            &["e1", "e2"],
+            0.90,
+            CausalState::Stable,
+        );
+        pattern.support_count = 1;
+        causal.patterns.insert("p1".into(), pattern);
+
+        let report = engine.discover(&causal, &concept, &belief, &HashMap::new());
+        assert_eq!(
+            report.seeds_found, 0,
+            "single-observation causal patterns should not seed policy hints"
+        );
+        assert_eq!(report.hints_found, 0);
+    }
+
+    #[test]
+    fn strong_single_window_causal_not_seeded() {
+        let mut engine = PolicyEngine::new();
+        let mut causal = CausalEngine::new();
+        let concept = ConceptEngine::new();
+        let mut belief = BeliefEngine::default();
+        inject_singleton_belief(&mut belief, "b_cause");
+
+        let pattern = make_causal_pattern_with_evidence(
+            "p1",
+            "default",
+            &["c1"],
+            &["e1", "e2"],
+            &["b_cause"],
+            &[],
+            0.90,
+            CausalState::Stable,
+            3,
+            0,
+            1,
+        );
+        causal.patterns.insert("p1".into(), pattern);
+
+        let report = engine.discover(&causal, &concept, &belief, &HashMap::new());
+        assert_eq!(report.seeds_found, 0);
+        assert_eq!(report.hints_found, 0);
+    }
+
+    #[test]
+    fn repeated_window_causal_can_seed_policy() {
+        let mut engine = PolicyEngine::new();
+        let mut causal = CausalEngine::new();
+        let concept = ConceptEngine::new();
+        let mut belief = BeliefEngine::default();
+        inject_singleton_belief(&mut belief, "b_cause");
+
+        let mut records = HashMap::new();
+        records.insert(
+            "c1".into(),
+            make_record(
+                "c1",
+                "Enabled canary releases",
+                "default",
+                &["deploy"],
+                "decision",
+            ),
+        );
+        records.insert(
+            "e1".into(),
+            make_record(
+                "e1",
+                "Release stability improved after canary releases",
+                "default",
+                &["deploy", "improvement"],
+                "fact",
+            ),
+        );
+
+        let pattern = make_causal_pattern_with_evidence(
+            "p1",
+            "default",
+            &["c1"],
+            &["e1"],
+            &["b_cause"],
+            &[],
+            0.90,
+            CausalState::Stable,
+            3,
+            0,
+            2,
+        );
+        causal.patterns.insert("p1".into(), pattern);
+
+        let report = engine.discover(&causal, &concept, &belief, &records);
+        assert_eq!(report.seeds_found, 1);
+        assert_eq!(report.hints_found, 1);
+    }
+
+    #[test]
+    fn explicit_repeated_support_can_seed_policy() {
+        let mut engine = PolicyEngine::new();
+        let mut causal = CausalEngine::new();
+        let concept = ConceptEngine::new();
+        let mut belief = BeliefEngine::default();
+        inject_singleton_belief(&mut belief, "b_cause");
+
+        let mut records = HashMap::new();
+        records.insert(
+            "c1".into(),
+            make_record(
+                "c1",
+                "Enabled automated rollback gate",
+                "default",
+                &["rollback"],
+                "decision",
+            ),
+        );
+        records.insert(
+            "e1".into(),
+            make_record(
+                "e1",
+                "Recovery improved after automated rollback gate",
+                "default",
+                &["rollback", "improvement"],
+                "fact",
+            ),
+        );
+
+        let pattern = make_causal_pattern_with_evidence(
+            "p1",
+            "default",
+            &["c1"],
+            &["e1"],
+            &["b_cause"],
+            &[],
+            0.88,
+            CausalState::Stable,
+            3,
+            2,
+            1,
+        );
+        causal.patterns.insert("p1".into(), pattern);
+
+        let report = engine.discover(&causal, &concept, &belief, &records);
+        assert_eq!(report.seeds_found, 1);
+        assert_eq!(report.hints_found, 1);
+    }
+
+    #[test]
+    fn high_counterevidence_causal_not_seeded() {
+        let mut engine = PolicyEngine::new();
+        let mut causal = CausalEngine::new();
+        let concept = ConceptEngine::new();
+        let mut belief = BeliefEngine::default();
+        inject_singleton_belief(&mut belief, "b_cause");
+
+        let mut records = HashMap::new();
+        records.insert(
+            "c1".into(),
+            make_record(
+                "c1",
+                "Changed deploy workflow",
+                "default",
+                &["deploy"],
+                "decision",
+            ),
+        );
+        records.insert(
+            "e1".into(),
+            make_record(
+                "e1",
+                "Deploy stability improved after workflow change",
+                "default",
+                &["deploy", "improvement"],
+                "fact",
+            ),
+        );
+
+        let mut pattern = make_causal_pattern_with_evidence(
+            "p1",
+            "default",
+            &["c1"],
+            &["e1"],
+            &["b_cause"],
+            &[],
+            0.90,
+            CausalState::Stable,
+            3,
+            2,
+            2,
+        );
+        pattern.counterevidence = 4;
+        causal.patterns.insert("p1".into(), pattern);
+
+        let report = engine.discover(&causal, &concept, &belief, &records);
+        assert_eq!(report.seeds_found, 0);
+        assert_eq!(report.hints_found, 0);
+    }
+
+    #[test]
+    fn bounded_counterevidence_causal_can_seed_policy() {
+        let mut engine = PolicyEngine::new();
+        let mut causal = CausalEngine::new();
+        let concept = ConceptEngine::new();
+        let mut belief = BeliefEngine::default();
+        inject_singleton_belief(&mut belief, "b_cause");
+
+        let mut records = HashMap::new();
+        records.insert(
+            "c1".into(),
+            make_record(
+                "c1",
+                "Enabled canary workflow",
+                "default",
+                &["deploy", "canary"],
+                "decision",
+            ),
+        );
+        records.insert(
+            "e1".into(),
+            make_record(
+                "e1",
+                "Release stability improved after canary workflow",
+                "default",
+                &["deploy", "improvement"],
+                "fact",
+            ),
+        );
+
+        let mut pattern = make_causal_pattern_with_evidence(
+            "p1",
+            "default",
+            &["c1"],
+            &["e1"],
+            &["b_cause"],
+            &[],
+            0.90,
+            CausalState::Stable,
+            3,
+            2,
+            2,
+        );
+        pattern.counterevidence = 2;
+        causal.patterns.insert("p1".into(), pattern);
+
+        let report = engine.discover(&causal, &concept, &belief, &records);
+        assert_eq!(report.seeds_found, 1);
+        assert_eq!(report.hints_found, 1);
     }
 
     // ── 7. Full rebuild clears state ──
@@ -1044,11 +1685,39 @@ mod tests {
         inject_singleton_belief(&mut belief, "b_cause");
 
         let mut records = HashMap::new();
-        records.insert("c1".into(), make_record("c1", "Cause action", "default", &["ops"], "decision"));
-        records.insert("e1".into(), make_record("e1", "Effect with failure and crash", "default", &["ops"], "fact"));
-        records.insert("e2".into(), make_record("e2", "Another failure incident occurred", "default", &["ops"], "fact"));
+        records.insert(
+            "c1".into(),
+            make_record("c1", "Cause action", "default", &["ops"], "decision"),
+        );
+        records.insert(
+            "e1".into(),
+            make_record(
+                "e1",
+                "Effect with failure and crash",
+                "default",
+                &["ops"],
+                "fact",
+            ),
+        );
+        records.insert(
+            "e2".into(),
+            make_record(
+                "e2",
+                "Another failure incident occurred",
+                "default",
+                &["ops"],
+                "fact",
+            ),
+        );
 
-        let pattern = make_causal_pattern("p1", "default", &["c1"], &["e1", "e2"], 0.80, CausalState::Stable);
+        let pattern = make_causal_pattern(
+            "p1",
+            "default",
+            &["c1"],
+            &["e1", "e2"],
+            0.80,
+            CausalState::Stable,
+        );
         causal.patterns.insert("p1".into(), pattern);
         engine.discover(&causal, &concept, &belief, &records);
         assert!(!engine.hints.is_empty());
@@ -1056,7 +1725,10 @@ mod tests {
         // Second pass: empty causal
         let empty_causal = CausalEngine::new();
         let report = engine.discover(&empty_causal, &concept, &belief, &records);
-        assert!(engine.hints.is_empty(), "full rebuild should clear old hints");
+        assert!(
+            engine.hints.is_empty(),
+            "full rebuild should clear old hints"
+        );
         assert_eq!(report.hints_found, 0);
     }
 
@@ -1071,19 +1743,57 @@ mod tests {
         inject_singleton_belief(&mut belief, "b_cause");
 
         let mut records = HashMap::new();
-        records.insert("c1".into(), make_record("c1", "Root cause action", "default", &["ops"], "decision"));
-        records.insert("e1".into(), make_record("e1", "Effect with error and failure", "default", &["ops"], "fact"));
-        records.insert("e2".into(), make_record("e2", "Another incident with crash", "default", &["ops"], "fact"));
+        records.insert(
+            "c1".into(),
+            make_record("c1", "Root cause action", "default", &["ops"], "decision"),
+        );
+        records.insert(
+            "e1".into(),
+            make_record(
+                "e1",
+                "Effect with error and failure",
+                "default",
+                &["ops"],
+                "fact",
+            ),
+        );
+        records.insert(
+            "e2".into(),
+            make_record(
+                "e2",
+                "Another incident with crash",
+                "default",
+                &["ops"],
+                "fact",
+            ),
+        );
 
-        let pattern = make_causal_pattern("p1", "default", &["c1"], &["e1", "e2"], 0.80, CausalState::Stable);
+        let pattern = make_causal_pattern(
+            "p1",
+            "default",
+            &["c1"],
+            &["e1", "e2"],
+            0.80,
+            CausalState::Stable,
+        );
         causal.patterns.insert("p1".into(), pattern);
 
         engine.discover(&causal, &concept, &belief, &records);
 
         let hint = engine.hints.values().next().unwrap();
-        assert!(!hint.trigger_causal_ids.is_empty(), "causal provenance required");
-        assert!(!hint.supporting_record_ids.is_empty(), "record provenance required");
-        assert_eq!(hint.supporting_record_ids.len(), 3, "should have cause + effect records");
+        assert!(
+            !hint.trigger_causal_ids.is_empty(),
+            "causal provenance required"
+        );
+        assert!(
+            !hint.supporting_record_ids.is_empty(),
+            "record provenance required"
+        );
+        assert_eq!(
+            hint.supporting_record_ids.len(),
+            3,
+            "should have cause + effect records"
+        );
     }
 
     // ── 9. PolicyState defaults ──
@@ -1160,9 +1870,15 @@ mod tests {
     // ── Surface tests ──
 
     fn make_hint(
-        id: &str, key: &str, ns: &str, domain: &str,
-        action: PolicyActionKind, state: PolicyState,
-        strength: f32, confidence: f32, risk: f32,
+        id: &str,
+        key: &str,
+        ns: &str,
+        domain: &str,
+        action: PolicyActionKind,
+        state: PolicyState,
+        strength: f32,
+        confidence: f32,
+        risk: f32,
     ) -> PolicyHint {
         PolicyHint {
             id: id.to_string(),
@@ -1190,8 +1906,17 @@ mod tests {
     #[test]
     fn stable_hints_are_surfaced() {
         let mut engine = PolicyEngine::new();
-        let hint = make_hint("h1", "k1", "default", "deploy",
-            PolicyActionKind::Prefer, PolicyState::Stable, 0.80, 0.75, 0.0);
+        let hint = make_hint(
+            "h1",
+            "k1",
+            "default",
+            "deploy",
+            PolicyActionKind::Prefer,
+            PolicyState::Stable,
+            0.80,
+            0.75,
+            0.0,
+        );
         engine.hints.insert("h1".into(), hint);
 
         let surfaced = super::surface_policy_hints(&engine, None);
@@ -1205,8 +1930,17 @@ mod tests {
     #[test]
     fn strong_candidates_can_be_surfaced() {
         let mut engine = PolicyEngine::new();
-        let hint = make_hint("h1", "k1", "default", "deploy",
-            PolicyActionKind::Recommend, PolicyState::Candidate, 0.75, 0.60, 0.0);
+        let hint = make_hint(
+            "h1",
+            "k1",
+            "default",
+            "deploy",
+            PolicyActionKind::Recommend,
+            PolicyState::Candidate,
+            0.75,
+            0.60,
+            0.0,
+        );
         engine.hints.insert("h1".into(), hint);
 
         let surfaced = super::surface_policy_hints(&engine, None);
@@ -1219,12 +1953,24 @@ mod tests {
     #[test]
     fn suppressed_hints_are_not_surfaced() {
         let mut engine = PolicyEngine::new();
-        let hint = make_hint("h1", "k1", "default", "deploy",
-            PolicyActionKind::Avoid, PolicyState::Suppressed, 0.80, 0.75, 0.5);
+        let hint = make_hint(
+            "h1",
+            "k1",
+            "default",
+            "deploy",
+            PolicyActionKind::Avoid,
+            PolicyState::Suppressed,
+            0.80,
+            0.75,
+            0.5,
+        );
         engine.hints.insert("h1".into(), hint);
 
         let surfaced = super::surface_policy_hints(&engine, None);
-        assert!(surfaced.is_empty(), "suppressed hints should not be surfaced");
+        assert!(
+            surfaced.is_empty(),
+            "suppressed hints should not be surfaced"
+        );
     }
 
     // ── 19. Rejected hints are not surfaced ──
@@ -1232,8 +1978,17 @@ mod tests {
     #[test]
     fn rejected_hints_are_not_surfaced() {
         let mut engine = PolicyEngine::new();
-        let hint = make_hint("h1", "k1", "default", "deploy",
-            PolicyActionKind::Warn, PolicyState::Rejected, 0.30, 0.20, 0.1);
+        let hint = make_hint(
+            "h1",
+            "k1",
+            "default",
+            "deploy",
+            PolicyActionKind::Warn,
+            PolicyState::Rejected,
+            0.30,
+            0.20,
+            0.1,
+        );
         engine.hints.insert("h1".into(), hint);
 
         let surfaced = super::surface_policy_hints(&engine, None);
@@ -1245,13 +2000,25 @@ mod tests {
     #[test]
     fn hints_without_provenance_are_not_surfaced() {
         let mut engine = PolicyEngine::new();
-        let mut hint = make_hint("h1", "k1", "default", "deploy",
-            PolicyActionKind::Prefer, PolicyState::Stable, 0.80, 0.75, 0.0);
+        let mut hint = make_hint(
+            "h1",
+            "k1",
+            "default",
+            "deploy",
+            PolicyActionKind::Prefer,
+            PolicyState::Stable,
+            0.80,
+            0.75,
+            0.0,
+        );
         hint.trigger_causal_ids.clear(); // Remove provenance
         engine.hints.insert("h1".into(), hint);
 
         let surfaced = super::surface_policy_hints(&engine, None);
-        assert!(surfaced.is_empty(), "hints without causal provenance should not be surfaced");
+        assert!(
+            surfaced.is_empty(),
+            "hints without causal provenance should not be surfaced"
+        );
     }
 
     // ── 21. Surface sorting is deterministic ──
@@ -1259,12 +2026,48 @@ mod tests {
     #[test]
     fn surface_sorting_is_deterministic() {
         let mut engine = PolicyEngine::new();
-        engine.hints.insert("h1".into(), make_hint("h1", "k1", "default", "deploy",
-            PolicyActionKind::Prefer, PolicyState::Stable, 0.70, 0.60, 0.0));
-        engine.hints.insert("h2".into(), make_hint("h2", "k2", "default", "security",
-            PolicyActionKind::Avoid, PolicyState::Stable, 0.90, 0.80, 0.7));
-        engine.hints.insert("h3".into(), make_hint("h3", "k3", "default", "logging",
-            PolicyActionKind::Recommend, PolicyState::Stable, 0.80, 0.70, 0.0));
+        engine.hints.insert(
+            "h1".into(),
+            make_hint(
+                "h1",
+                "k1",
+                "default",
+                "deploy",
+                PolicyActionKind::Prefer,
+                PolicyState::Stable,
+                0.70,
+                0.60,
+                0.0,
+            ),
+        );
+        engine.hints.insert(
+            "h2".into(),
+            make_hint(
+                "h2",
+                "k2",
+                "default",
+                "security",
+                PolicyActionKind::Avoid,
+                PolicyState::Stable,
+                0.90,
+                0.80,
+                0.7,
+            ),
+        );
+        engine.hints.insert(
+            "h3".into(),
+            make_hint(
+                "h3",
+                "k3",
+                "default",
+                "logging",
+                PolicyActionKind::Recommend,
+                PolicyState::Stable,
+                0.80,
+                0.70,
+                0.0,
+            ),
+        );
 
         let s1 = super::surface_policy_hints(&engine, None);
         let s2 = super::surface_policy_hints(&engine, None);
@@ -1278,6 +2081,16 @@ mod tests {
         assert_eq!(s1[0].id, "h2", "highest strength should be first");
     }
 
+    #[test]
+    fn policy_hint_id_is_deterministic_from_key() {
+        let id1 = super::deterministic_id("default:prefer:default:cause→effect");
+        let id2 = super::deterministic_id("default:prefer:default:cause→effect");
+        let id3 = super::deterministic_id("default:avoid:default:cause→effect");
+
+        assert_eq!(id1, id2, "same policy key must yield same id");
+        assert_ne!(id1, id3, "different policy key must yield different id");
+    }
+
     // ── 22. Surface limit is enforced ──
 
     #[test]
@@ -1287,16 +2100,33 @@ mod tests {
             let domain = format!("domain_{}", i);
             engine.hints.insert(
                 format!("h{}", i),
-                make_hint(&format!("h{}", i), &format!("k{}", i), "default", &domain,
-                    PolicyActionKind::Prefer, PolicyState::Stable, 0.80, 0.70, 0.0),
+                make_hint(
+                    &format!("h{}", i),
+                    &format!("k{}", i),
+                    "default",
+                    &domain,
+                    PolicyActionKind::Prefer,
+                    PolicyState::Stable,
+                    0.80,
+                    0.70,
+                    0.0,
+                ),
             );
         }
 
         let surfaced = super::surface_policy_hints(&engine, None);
-        assert!(surfaced.len() <= 10, "should respect MAX_SURFACED_HINTS, got {}", surfaced.len());
+        assert!(
+            surfaced.len() <= 10,
+            "should respect MAX_SURFACED_HINTS, got {}",
+            surfaced.len()
+        );
 
         let surfaced_5 = super::surface_policy_hints(&engine, Some(5));
-        assert!(surfaced_5.len() <= 5, "should respect explicit limit, got {}", surfaced_5.len());
+        assert!(
+            surfaced_5.len() <= 5,
+            "should respect explicit limit, got {}",
+            surfaced_5.len()
+        );
     }
 
     // ── 23. Per-domain cap enforced ──
@@ -1307,14 +2137,26 @@ mod tests {
         for i in 0..6 {
             engine.hints.insert(
                 format!("h{}", i),
-                make_hint(&format!("h{}", i), &format!("k{}", i), "default", "deploy",
-                    PolicyActionKind::Prefer, PolicyState::Stable, 0.80 - i as f32 * 0.01, 0.70, 0.0),
+                make_hint(
+                    &format!("h{}", i),
+                    &format!("k{}", i),
+                    "default",
+                    "deploy",
+                    PolicyActionKind::Prefer,
+                    PolicyState::Stable,
+                    0.80 - i as f32 * 0.01,
+                    0.70,
+                    0.0,
+                ),
             );
         }
 
         let surfaced = super::surface_policy_hints(&engine, None);
-        assert!(surfaced.len() <= 3,
-            "should respect MAX_SURFACED_PER_DOMAIN=3, got {}", surfaced.len());
+        assert!(
+            surfaced.len() <= 3,
+            "should respect MAX_SURFACED_PER_DOMAIN=3, got {}",
+            surfaced.len()
+        );
     }
 
     // ── 24. Weak candidates not surfaced ──
@@ -1323,11 +2165,26 @@ mod tests {
     fn weak_candidates_not_surfaced() {
         let mut engine = PolicyEngine::new();
         // Candidate with strength below STRONG_CANDIDATE_THRESHOLD (0.70)
-        engine.hints.insert("h1".into(), make_hint("h1", "k1", "default", "deploy",
-            PolicyActionKind::Recommend, PolicyState::Candidate, 0.50, 0.60, 0.0));
+        engine.hints.insert(
+            "h1".into(),
+            make_hint(
+                "h1",
+                "k1",
+                "default",
+                "deploy",
+                PolicyActionKind::Recommend,
+                PolicyState::Candidate,
+                0.50,
+                0.60,
+                0.0,
+            ),
+        );
 
         let surfaced = super::surface_policy_hints(&engine, None);
-        assert!(surfaced.is_empty(), "weak candidates should not be surfaced");
+        assert!(
+            surfaced.is_empty(),
+            "weak candidates should not be surfaced"
+        );
     }
 
     // ── 25. Surfaced hints have full provenance ──
@@ -1335,13 +2192,31 @@ mod tests {
     #[test]
     fn surfaced_hints_have_full_provenance() {
         let mut engine = PolicyEngine::new();
-        engine.hints.insert("h1".into(), make_hint("h1", "k1", "default", "deploy",
-            PolicyActionKind::Prefer, PolicyState::Stable, 0.80, 0.75, 0.0));
+        engine.hints.insert(
+            "h1".into(),
+            make_hint(
+                "h1",
+                "k1",
+                "default",
+                "deploy",
+                PolicyActionKind::Prefer,
+                PolicyState::Stable,
+                0.80,
+                0.75,
+                0.0,
+            ),
+        );
 
         let surfaced = super::surface_policy_hints(&engine, None);
         assert_eq!(surfaced.len(), 1);
         let h = &surfaced[0];
-        assert!(!h.trigger_causal_ids.is_empty(), "must have causal provenance");
-        assert!(!h.supporting_record_ids.is_empty(), "must have record provenance");
+        assert!(
+            !h.trigger_causal_ids.is_empty(),
+            "must have causal provenance"
+        );
+        assert!(
+            !h.supporting_record_ids.is_empty(),
+            "must have record provenance"
+        );
     }
 }

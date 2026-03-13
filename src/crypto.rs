@@ -10,14 +10,14 @@ use anyhow::{anyhow, Result};
 use argon2::Argon2;
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
-    ChaCha20Poly1305, Nonce, Key,
+    ChaCha20Poly1305, Key, Nonce,
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use zeroize::ZeroizeOnDrop;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
+use zeroize::ZeroizeOnDrop;
 
 /// HMAC-SHA256 type alias
 type HmacSha256 = Hmac<Sha256>;
@@ -43,11 +43,9 @@ impl EncryptionKey {
 
         // Use raw hash for key derivation
         let mut key = [0u8; 32];
-        argon2.hash_password_into(
-            password.as_bytes(),
-            salt,
-            &mut key,
-        ).map_err(|e| anyhow!("Key derivation failed: {}", e))?;
+        argon2
+            .hash_password_into(password.as_bytes(), salt, &mut key)
+            .map_err(|e| anyhow!("Key derivation failed: {}", e))?;
 
         Ok(Self { key })
     }
@@ -150,8 +148,7 @@ pub fn decrypt_data(encrypted: &[u8], key: &EncryptionKey) -> Result<Vec<u8>> {
 
 /// Compute HMAC-SHA256 for data integrity
 pub fn compute_hmac(data: &[u8], key: &EncryptionKey) -> [u8; 32] {
-    let mut mac: HmacSha256 = Mac::new_from_slice(&key.key)
-        .expect("HMAC can take key of any size");
+    let mut mac: HmacSha256 = Mac::new_from_slice(&key.key).expect("HMAC can take key of any size");
     mac.update(data);
     let result = mac.finalize();
 
@@ -162,8 +159,7 @@ pub fn compute_hmac(data: &[u8], key: &EncryptionKey) -> [u8; 32] {
 
 /// Verify HMAC-SHA256
 pub fn verify_hmac(data: &[u8], expected_hmac: &[u8; 32], key: &EncryptionKey) -> bool {
-    let mut mac: HmacSha256 = Mac::new_from_slice(&key.key)
-        .expect("HMAC can take key of any size");
+    let mut mac: HmacSha256 = Mac::new_from_slice(&key.key).expect("HMAC can take key of any size");
     mac.update(data);
     mac.verify_slice(expected_hmac).is_ok()
 }
@@ -231,7 +227,9 @@ impl EncryptedStorage {
 
         // Verify integrity
         if !verify_hmac(&encrypted, &hmac, &self.key) {
-            return Err(anyhow!("Data integrity check failed - file may be corrupted or tampered"));
+            return Err(anyhow!(
+                "Data integrity check failed - file may be corrupted or tampered"
+            ));
         }
 
         decrypt_data(&encrypted, &self.key)
@@ -371,7 +369,9 @@ mod tests {
         let key_path = dir.path().join("master.key");
 
         let original_key = EncryptionKey::generate();
-        original_key.save_to_file(&key_path, "master_password").unwrap();
+        original_key
+            .save_to_file(&key_path, "master_password")
+            .unwrap();
 
         let loaded_key = EncryptionKey::load_from_file(&key_path, "master_password").unwrap();
         assert_eq!(original_key.as_bytes(), loaded_key.as_bytes());

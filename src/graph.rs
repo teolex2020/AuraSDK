@@ -6,9 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::record::Record;
-use crate::ngram::NGramIndex;
 use crate::cognitive_store::CognitiveStore;
+use crate::ngram::NGramIndex;
+use crate::record::Record;
 
 /// Maximum connections per record.
 pub const MAX_CONNECTIONS: usize = 50;
@@ -61,9 +61,7 @@ impl SessionTracker {
 
     /// Track that these record IDs were activated in a session.
     pub fn track_activation(&mut self, session_id: &str, record_ids: &[String]) {
-        let buf = self.sessions
-            .entry(session_id.to_string())
-            .or_default();
+        let buf = self.sessions.entry(session_id.to_string()).or_default();
 
         buf.record_ids.extend(record_ids.iter().cloned());
         buf.last_activity = now_secs();
@@ -119,11 +117,17 @@ impl SessionTracker {
                 // Set bidirectional with coactivation type
                 if let Some(rec_a) = records.get_mut(id_a) {
                     rec_a.connections.insert(id_b.clone(), boosted);
-                    rec_a.connection_types.entry(id_b.clone()).or_insert_with(|| "coactivation".to_string());
+                    rec_a
+                        .connection_types
+                        .entry(id_b.clone())
+                        .or_insert_with(|| "coactivation".to_string());
                 }
                 if let Some(rec_b) = records.get_mut(id_b) {
                     rec_b.connections.insert(id_a.clone(), boosted);
-                    rec_b.connection_types.entry(id_a.clone()).or_insert_with(|| "coactivation".to_string());
+                    rec_b
+                        .connection_types
+                        .entry(id_a.clone())
+                        .or_insert_with(|| "coactivation".to_string());
                 }
 
                 pairs_strengthened += 1;
@@ -139,7 +143,8 @@ impl SessionTracker {
     /// Remove stale sessions (inactive for > SESSION_TIMEOUT).
     pub fn cleanup_stale_sessions(&mut self, records: &mut HashMap<String, Record>) {
         let now = now_secs();
-        let stale: Vec<String> = self.sessions
+        let stale: Vec<String> = self
+            .sessions
             .iter()
             .filter(|(_, buf)| now - buf.last_activity > SESSION_TIMEOUT)
             .map(|(id, _)| id.clone())
@@ -259,7 +264,15 @@ pub fn merge_records(
     store: &CognitiveStore,
 ) {
     // Get data from the record being removed
-    let (remove_tags, remove_connections, remove_conn_types, remove_strength, remove_level, remove_activation, remove_source_type) = {
+    let (
+        remove_tags,
+        remove_connections,
+        remove_conn_types,
+        remove_strength,
+        remove_level,
+        remove_activation,
+        remove_source_type,
+    ) = {
         if let Some(remove) = records.get(remove_id) {
             (
                 remove.tags.clone(),
@@ -293,10 +306,13 @@ pub fn merge_records(
         for (conn_id, weight) in &remove_connections {
             if conn_id != keep_id && keep.connections.len() < MAX_CONNECTIONS {
                 let existing = keep.connections.get(conn_id).copied().unwrap_or(0.0);
-                keep.connections.insert(conn_id.clone(), existing.max(*weight));
+                keep.connections
+                    .insert(conn_id.clone(), existing.max(*weight));
                 // Preserve relationship type from removed record if keep doesn't have one
                 if let Some(rel_type) = remove_conn_types.get(conn_id) {
-                    keep.connection_types.entry(conn_id.clone()).or_insert_with(|| rel_type.clone());
+                    keep.connection_types
+                        .entry(conn_id.clone())
+                        .or_insert_with(|| rel_type.clone());
                 }
             }
         }
@@ -307,7 +323,12 @@ pub fn merge_records(
 
         // Preserve higher-authority source_type (recorded > retrieved > inferred > generated)
         let rank = |st: &str| -> u8 {
-            match st { "recorded" => 3, "retrieved" => 2, "inferred" => 1, _ => 0 }
+            match st {
+                "recorded" => 3,
+                "retrieved" => 2,
+                "inferred" => 1,
+                _ => 0,
+            }
         };
         if rank(&remove_source_type) > rank(&keep.source_type) {
             keep.source_type = remove_source_type;
@@ -315,7 +336,14 @@ pub fn merge_records(
     }
 
     // Delete the removed record
-    remove_record(remove_id, records, ngram_index, tag_index, aura_index, store);
+    remove_record(
+        remove_id,
+        records,
+        ngram_index,
+        tag_index,
+        aura_index,
+        store,
+    );
 
     // Persist the updated keep record
     if let Some(keep) = records.get(keep_id) {
@@ -366,7 +394,10 @@ mod tests {
         r1.tags = vec!["rust".into(), "code".into()];
         let id1 = r1.id.clone();
         for tag in &r1.tags {
-            tag_index.entry(tag.clone()).or_default().insert(id1.clone());
+            tag_index
+                .entry(tag.clone())
+                .or_default()
+                .insert(id1.clone());
         }
         records.insert(id1.clone(), r1);
 

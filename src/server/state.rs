@@ -1,5 +1,5 @@
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::aura::Aura;
@@ -19,7 +19,17 @@ pub(super) struct ServerState {
 }
 
 pub(super) const API_PATHS: &[&str] = &[
-    "/process", "/retrieve", "/delete", "/update", "/stats",
-    "/memories", "/analytics", "/batch-delete", "/ingest-batch",
-    "/predict", "/surprise", "/export-sdr", "/import-sdr",
+    "/process",
+    "/retrieve",
+    "/delete",
+    "/update",
+    "/stats",
+    "/memories",
+    "/analytics",
+    "/batch-delete",
+    "/ingest-batch",
+    "/predict",
+    "/surprise",
+    "/export-sdr",
+    "/import-sdr",
 ];

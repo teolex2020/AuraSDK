@@ -2,9 +2,9 @@
 //!
 //! Rewritten from brain_tools.py guard logic.
 
-use std::collections::HashSet;
-use regex::Regex;
 use once_cell::sync::Lazy;
+use regex::Regex;
+use std::collections::HashSet;
 
 use crate::trust::TagTaxonomy;
 
@@ -16,8 +16,7 @@ static PHONE_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 static EMAIL_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-        .expect("invalid EMAIL_RE regex")
+    Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").expect("invalid EMAIL_RE regex")
 });
 
 static WALLET_RE: Lazy<Regex> = Lazy::new(|| {
@@ -31,8 +30,7 @@ static API_KEY_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 static PASSWORD_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(?:password|passwd|пароль)[:\s=]+\S+")
-        .expect("invalid PASSWORD_RE regex")
+    Regex::new(r"(?i)(?:password|passwd|пароль)[:\s=]+\S+").expect("invalid PASSWORD_RE regex")
 });
 
 /// Result of running store guards.
@@ -61,9 +59,10 @@ pub fn auto_protect_tags(content: &str, tags: &mut Vec<String>) {
         tags.push("financial".to_string());
     }
     if (PASSWORD_RE.is_match(content) || API_KEY_RE.is_match(content))
-        && !tags.contains(&"credential".to_string()) {
-            tags.push("credential".to_string());
-        }
+        && !tags.contains(&"credential".to_string())
+    {
+        tags.push("credential".to_string());
+    }
 }
 
 /// Apply store guard — detect sensitive data and set actionable flag.
@@ -79,7 +78,10 @@ pub fn apply_store_guard(
     let is_interactive = matches!(channel, Some("desktop" | "telegram" | "voice"));
     let tag_set: HashSet<&str> = tags.iter().map(|s| s.as_str()).collect();
 
-    let has_sensitive_tags = taxonomy.sensitive_tags.iter().any(|t| tag_set.contains(t.as_str()));
+    let has_sensitive_tags = taxonomy
+        .sensitive_tags
+        .iter()
+        .any(|t| tag_set.contains(t.as_str()));
     let has_sensitive_content = EMAIL_RE.is_match(content)
         || WALLET_RE.is_match(content)
         || API_KEY_RE.is_match(content)
@@ -111,13 +113,19 @@ pub fn apply_store_guard(
 /// Check if content should be skipped from consolidation based on its tags.
 pub fn should_skip_consolidation(tags: &[String], taxonomy: &TagTaxonomy) -> bool {
     let tag_set: HashSet<&str> = tags.iter().map(|s| s.as_str()).collect();
-    taxonomy.consolidation_skip_tags.iter().any(|t| tag_set.contains(t.as_str()))
+    taxonomy
+        .consolidation_skip_tags
+        .iter()
+        .any(|t| tag_set.contains(t.as_str()))
 }
 
 /// Check if a record is protected from archival.
 pub fn is_archive_protected(tags: &[String], taxonomy: &TagTaxonomy) -> bool {
     let tag_set: HashSet<&str> = tags.iter().map(|s| s.as_str()).collect();
-    taxonomy.archive_protected_tags.iter().any(|t| tag_set.contains(t.as_str()))
+    taxonomy
+        .archive_protected_tags
+        .iter()
+        .any(|t| tag_set.contains(t.as_str()))
 }
 
 #[cfg(test)]
@@ -141,7 +149,10 @@ mod tests {
     #[test]
     fn test_auto_protect_wallet() {
         let mut tags = vec![];
-        auto_protect_tags("Send to 0x1234567890abcdef1234567890abcdef12345678", &mut tags);
+        auto_protect_tags(
+            "Send to 0x1234567890abcdef1234567890abcdef12345678",
+            &mut tags,
+        );
         assert!(tags.contains(&"financial".to_string()));
     }
 

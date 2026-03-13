@@ -13,15 +13,15 @@
 //!
 //! Raw memories NEVER leave the device.
 
+use anyhow::{anyhow, Result};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use anyhow::{anyhow, Result};
-use serde::{Serialize, Deserialize};
-use rand::Rng;
-#[cfg(feature = "sync")]
-use tokio::net::{TcpListener, TcpStream};
 #[cfg(feature = "sync")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "sync")]
+use tokio::net::{TcpListener, TcpStream};
 
 /// Differential privacy parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,8 +39,8 @@ pub struct PrivacyParams {
 impl Default for PrivacyParams {
     fn default() -> Self {
         Self {
-            epsilon: 1.0,  // Moderate privacy
-            delta: 1e-5,   // Very small failure probability
+            epsilon: 1.0, // Moderate privacy
+            delta: 1e-5,  // Very small failure probability
             sensitivity: 1.0,
             mechanism: NoiseMechanism::Laplace,
         }
@@ -418,7 +418,11 @@ impl FederatedClient {
 
     /// Get SDR bit importance from federation
     pub fn get_bit_importance(&self, bit: u32) -> f64 {
-        self.current_model.sdr_stats.get(&bit).copied().unwrap_or(0.0)
+        self.current_model
+            .sdr_stats
+            .get(&bit)
+            .copied()
+            .unwrap_or(0.0)
     }
 
     /// Compute a private gradient (noise applied) without submitting to a server
@@ -427,7 +431,9 @@ impl FederatedClient {
         sdr_frequencies: &HashMap<u32, u64>,
         total_records: u64,
     ) -> LocalGradient {
-        let mut gradient = self.trainer.compute_gradient(sdr_frequencies, total_records);
+        let mut gradient = self
+            .trainer
+            .compute_gradient(sdr_frequencies, total_records);
         self.trainer.privatize(&mut gradient);
         gradient
     }
@@ -439,7 +445,9 @@ impl FederatedClient {
         total_records: u64,
         server: &mut FederationServer,
     ) -> Result<()> {
-        let mut gradient = self.trainer.compute_gradient(sdr_frequencies, total_records);
+        let mut gradient = self
+            .trainer
+            .compute_gradient(sdr_frequencies, total_records);
         self.trainer.privatize(&mut gradient);
         server.receive_gradient(gradient)
     }
@@ -464,7 +472,10 @@ impl SecureAggregation {
             return Err(anyhow!("Threshold must be at least 2"));
         }
 
-        Ok(Self { threshold, n_parties })
+        Ok(Self {
+            threshold,
+            n_parties,
+        })
     }
 
     /// Check if aggregation can proceed
@@ -482,7 +493,7 @@ impl SecureAggregation {
             ));
         }
 
-    // In production, this would use cryptographic protocols
+        // In production, this would use cryptographic protocols
         // For now, just sum the values
         Ok(shares.iter().sum())
     }
@@ -491,8 +502,6 @@ impl SecureAggregation {
 // =========================================================================================
 //                                  NETWORKING LAYER (TCP Direct)
 // =========================================================================================
-
-
 
 #[cfg(feature = "sync")]
 pub struct SimpleTcpNode {
@@ -514,7 +523,7 @@ impl SimpleTcpNode {
         loop {
             let (mut socket, peer_addr) = listener.accept().await?;
             tracing::info!("Accepted connection from {}", peer_addr);
-            
+
             tokio::spawn(async move {
                 let mut buffer = [0u8; 4096]; // Larger buffer for gradients
                 loop {
@@ -524,13 +533,18 @@ impl SimpleTcpNode {
                             if msg.starts_with("GRADIENT_PUSH") {
                                 // Simple extraction for demo
                                 let json_part = msg.trim_start_matches("GRADIENT_PUSH ");
-                                if let Ok(gradient) = serde_json::from_str::<LocalGradient>(json_part) {
-                                    tracing::info!("Only-Private Gradient received from {}", gradient.device_id);
+                                if let Ok(gradient) =
+                                    serde_json::from_str::<LocalGradient>(json_part)
+                                {
+                                    tracing::info!(
+                                        "Only-Private Gradient received from {}",
+                                        gradient.device_id
+                                    );
                                     // In a real system, we'd aggregated this.
                                     // For demo, we just log it.
                                 }
                             }
-                            
+
                             if let Err(e) = socket.write_all(b"ACK").await {
                                 tracing::error!("Failed to send ACK: {}", e);
                                 break;
@@ -686,7 +700,7 @@ mod tests {
             sdr_deltas: HashMap::new(),
             salience_weights: SalienceGradient::default(),
             sample_count: 100,
-            is_private: false,  // Not private!
+            is_private: false, // Not private!
         };
 
         let result = server.receive_gradient(gradient);
@@ -731,7 +745,9 @@ mod tests {
         let mut frequencies = HashMap::new();
         frequencies.insert(50, 10);
 
-        client.submit_gradient(&frequencies, 10, &mut server).unwrap();
+        client
+            .submit_gradient(&frequencies, 10, &mut server)
+            .unwrap();
 
         assert!(server.ready_to_aggregate());
     }
@@ -760,7 +776,7 @@ mod tests {
 
         // Node B sending to 9001
         let node_b = SimpleTcpNode::new(9002, vec!["127.0.0.1:9001".to_string()]);
-        
+
         let gradient = LocalGradient {
             device_id: "NodeB".to_string(),
             timestamp: 12345,

@@ -9,13 +9,13 @@
 //! - Optional HMAC signing for integrity
 //! - Automatic log rotation
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write, BufRead, BufReader};
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Serialize, Deserialize};
 use anyhow::Result;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Types of auditable operations
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -26,7 +26,10 @@ pub enum AuditAction {
     /// New memory stored
     Store { id: String, text_preview: String },
     /// Memory retrieved
-    Retrieve { query_preview: String, results_count: usize },
+    Retrieve {
+        query_preview: String,
+        results_count: usize,
+    },
     /// Memory deleted
     Delete { id: String },
     /// Memory updated
@@ -34,7 +37,10 @@ pub enum AuditAction {
     /// Anchor crystallized
     Crystallize { id: String, trigger: String },
     /// Synthesis performed
-    Synthesize { source_ids: Vec<String>, result_id: String },
+    Synthesize {
+        source_ids: Vec<String>,
+        result_id: String,
+    },
     /// Data flushed to disk
     Flush,
     /// Memory closed
@@ -104,7 +110,8 @@ impl AuditLog {
     /// Create a new audit log
     pub fn new(storage_path: &Path) -> Result<Self> {
         let path = storage_path.join("brain.audit");
-        let session_id = format!("session_{}",
+        let session_id = format!(
+            "session_{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -112,10 +119,7 @@ impl AuditLog {
         );
 
         // Open file in append mode
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         let writer = BufWriter::new(file);
 
@@ -169,42 +173,52 @@ impl AuditLog {
     /// Log a store operation
     pub fn log_store(&self, id: &str, text: &str) -> Result<()> {
         let preview: String = text.chars().take(50).collect();
-        self.log(AuditAction::Store {
-            id: id.to_string(),
-            text_preview: preview,
-        }, None)
+        self.log(
+            AuditAction::Store {
+                id: id.to_string(),
+                text_preview: preview,
+            },
+            None,
+        )
     }
 
     /// Log a retrieve operation
     pub fn log_retrieve(&self, query: &str, results_count: usize) -> Result<()> {
         let preview: String = query.chars().take(50).collect();
-        self.log(AuditAction::Retrieve {
-            query_preview: preview,
-            results_count,
-        }, None)
+        self.log(
+            AuditAction::Retrieve {
+                query_preview: preview,
+                results_count,
+            },
+            None,
+        )
     }
 
     /// Log a delete operation
     pub fn log_delete(&self, id: &str) -> Result<()> {
-        self.log(AuditAction::Delete {
-            id: id.to_string(),
-        }, None)
+        self.log(AuditAction::Delete { id: id.to_string() }, None)
     }
 
     /// Log a crystallization
     pub fn log_crystallize(&self, id: &str, trigger: &str) -> Result<()> {
-        self.log(AuditAction::Crystallize {
-            id: id.to_string(),
-            trigger: trigger.to_string(),
-        }, None)
+        self.log(
+            AuditAction::Crystallize {
+                id: id.to_string(),
+                trigger: trigger.to_string(),
+            },
+            None,
+        )
     }
 
     /// Log a synthesis
     pub fn log_synthesize(&self, source_ids: Vec<String>, result_id: &str) -> Result<()> {
-        self.log(AuditAction::Synthesize {
-            source_ids,
-            result_id: result_id.to_string(),
-        }, None)
+        self.log(
+            AuditAction::Synthesize {
+                source_ids,
+                result_id: result_id.to_string(),
+            },
+            None,
+        )
     }
 
     /// Rotate log file if it exceeds max size
@@ -265,7 +279,10 @@ impl AuditLog {
     /// Read entries for a specific session
     pub fn read_session(&self, session_id: &str) -> Result<Vec<AuditEntry>> {
         let all = self.read_all()?;
-        Ok(all.into_iter().filter(|e| e.session_id == session_id).collect())
+        Ok(all
+            .into_iter()
+            .filter(|e| e.session_id == session_id)
+            .collect())
     }
 
     /// Export audit log to JSON file

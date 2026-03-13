@@ -6,14 +6,14 @@
 //! - Incremental backups (delta only)
 //! - Integrity verification
 
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{Read, Write, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use anyhow::{anyhow, Result};
-use serde::{Serialize, Deserialize};
 
-use crate::crypto::{EncryptionKey, encrypt_data, decrypt_data};
+use crate::crypto::{decrypt_data, encrypt_data, EncryptionKey};
 
 /// Backup file magic bytes: "AURA" in hex
 const BACKUP_MAGIC: [u8; 4] = [0x41, 0x55, 0x52, 0x41]; // "AURA"
@@ -246,7 +246,9 @@ impl BackupManager {
 
         // Decrypt if needed
         let decrypted_payload = if is_encrypted {
-            let key = self.encryption_key.as_ref()
+            let key = self
+                .encryption_key
+                .as_ref()
                 .ok_or_else(|| anyhow!("Backup is encrypted but no decryption key provided"))?;
             decrypt_data(&payload, key)?
         } else {
@@ -335,7 +337,9 @@ impl BackupManager {
         let is_encrypted = enc_flag[0] == 1;
 
         if is_encrypted {
-            return Err(anyhow!("Cannot inspect encrypted backup without decryption key"));
+            return Err(anyhow!(
+                "Cannot inspect encrypted backup without decryption key"
+            ));
         }
 
         // Read header length
@@ -352,7 +356,10 @@ impl BackupManager {
     }
 
     /// Inspect encrypted backup with key
-    pub fn inspect_encrypted<P: AsRef<Path>>(backup_path: P, key: &EncryptionKey) -> Result<BackupHeader> {
+    pub fn inspect_encrypted<P: AsRef<Path>>(
+        backup_path: P,
+        key: &EncryptionKey,
+    ) -> Result<BackupHeader> {
         let backup_path = backup_path.as_ref();
         let mut file = File::open(backup_path)?;
 
@@ -402,7 +409,9 @@ impl BackupManager {
     }
 
     /// List all backups in a directory
-    pub fn list_backups<P: AsRef<Path>>(backup_dir: P) -> Result<Vec<(PathBuf, Option<BackupHeader>)>> {
+    pub fn list_backups<P: AsRef<Path>>(
+        backup_dir: P,
+    ) -> Result<Vec<(PathBuf, Option<BackupHeader>)>> {
         let backup_dir = backup_dir.as_ref();
         let mut backups = Vec::new();
 
@@ -513,7 +522,7 @@ impl BackupManager {
         let mut offset = 0;
 
         while offset + 4 <= data.len() {
-            let len_bytes: [u8; 4] = data[offset..offset+4].try_into().unwrap_or([0; 4]);
+            let len_bytes: [u8; 4] = data[offset..offset + 4].try_into().unwrap_or([0; 4]);
             let record_len = u32::from_le_bytes(len_bytes) as usize;
 
             if record_len == 0 || offset + 4 + record_len > data.len() {
@@ -687,8 +696,12 @@ mod tests {
         let manager = BackupManager::new(source_dir.path());
 
         // Create multiple backups
-        manager.create_backup(backup_dir.path().join("backup1.aura.bak")).unwrap();
-        manager.create_backup(backup_dir.path().join("backup2.aura.bak")).unwrap();
+        manager
+            .create_backup(backup_dir.path().join("backup1.aura.bak"))
+            .unwrap();
+        manager
+            .create_backup(backup_dir.path().join("backup2.aura.bak"))
+            .unwrap();
 
         let backups = BackupManager::list_backups(backup_dir.path()).unwrap();
         assert_eq!(backups.len(), 2);

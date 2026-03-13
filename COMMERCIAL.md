@@ -1,28 +1,28 @@
 # Commercial Licensing
 
-AuraSDK is available as an open-source SDK under the MIT license, but the core cognitive architecture and related implementation concepts are part of an active commercialization strategy.
+AuraSDK is available as an open-source SDK under the MIT license.
 
-If you want to:
+Current commercial focus is the production-ready memory product surface:
 
-- embed Aura into a commercial product,
-- license the architecture for internal enterprise use,
-- discuss partnership, acquisition, or private deployment,
-- or build on top of Aura beyond standard open-source usage,
+- deterministic local memory for agents
+- bounded belief-aware recall ranking
+- offline / on-device deployment
+- enterprise integration, packaging, and support
 
-please reach out directly for commercial terms.
+Advisory cognitive layers may be visible in the SDK, but they are not currently sold as default production intelligence or automatic decision control.
 
 ## Commercial Model
 
-Aura follows an `open-core + commercial extensions` strategy:
+Aura follows a pragmatic `open SDK + commercial deployment/support` model:
 
-- public SDK and core developer surface remain visible for adoption
-- advanced tuning, premium cognitive workflows, enterprise packaging, and commercial support remain monetizable
+- public SDK surface remains available for adoption
+- enterprise integration, deployment support, packaging, and custom hardening remain commercial
+- advisory cognitive overlays remain available for evaluation, but are not the primary commercial promise
 
 See also:
 
-- [MONETIZATION.md](MONETIZATION.md)
-- [V2_POSITIONING.md](V2_POSITIONING.md)
 - [CHANGELOG.md](CHANGELOG.md)
+- [README.md](README.md)
 
 ## Contact
 
@@ -33,6 +33,6 @@ Open a private inquiry through the repository owner contact listed on GitHub, or
 
 ## Notes
 
-- Public documentation covers the user-facing SDK surface.
-- Internal premium tuning, commercialization materials, and selected implementation details may remain intentionally unpublished or commercially licensed.
+- Public documentation covers the supported SDK surface.
+- Internal tuning, private evaluation artifacts, and selected commercialization materials may remain intentionally unpublished.
 - Patent notice and intellectual property details remain in [PATENT](PATENT) and [README.md](README.md).

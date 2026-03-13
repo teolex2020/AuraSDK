@@ -4,8 +4,8 @@
 //! Agent-specific features (Telegram, file cleanup, knowledge sync) are NOT included.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use parking_lot::RwLock;
@@ -36,7 +36,11 @@ pub struct ArchivalRule {
 impl ArchivalRule {
     #[new]
     fn py_new(tag: String, max_age_days: u32, keep_recent: usize) -> Self {
-        Self { tag, max_age_days, keep_recent }
+        Self {
+            tag,
+            max_age_days,
+            keep_recent,
+        }
     }
 }
 
@@ -93,20 +97,66 @@ impl Default for MaintenanceConfig {
             level_fix_interval: 10,
             max_clusters_per_run: 3,
             archival_rules: vec![
-                ArchivalRule { tag: "web-search-cache".into(), max_age_days: 1, keep_recent: 0 },
-                ArchivalRule { tag: "autonomous-outcome".into(), max_age_days: 7, keep_recent: 50 },
-                ArchivalRule { tag: "session-summary".into(), max_age_days: 14, keep_recent: 20 },
-                ArchivalRule { tag: "proactive-session".into(), max_age_days: 7, keep_recent: 20 },
-                ArchivalRule { tag: "action-plan".into(), max_age_days: 14, keep_recent: 10 },
-                ArchivalRule { tag: "session-reflection".into(), max_age_days: 30, keep_recent: 50 },
-                ArchivalRule { tag: "research-finding".into(), max_age_days: 30, keep_recent: 100 },
-                ArchivalRule { tag: "consolidated-meta".into(), max_age_days: 90, keep_recent: 200 },
-                ArchivalRule { tag: "research-project".into(), max_age_days: 90, keep_recent: 50 },
-                ArchivalRule { tag: "feedback-signal".into(), max_age_days: 14, keep_recent: 50 },
+                ArchivalRule {
+                    tag: "web-search-cache".into(),
+                    max_age_days: 1,
+                    keep_recent: 0,
+                },
+                ArchivalRule {
+                    tag: "autonomous-outcome".into(),
+                    max_age_days: 7,
+                    keep_recent: 50,
+                },
+                ArchivalRule {
+                    tag: "session-summary".into(),
+                    max_age_days: 14,
+                    keep_recent: 20,
+                },
+                ArchivalRule {
+                    tag: "proactive-session".into(),
+                    max_age_days: 7,
+                    keep_recent: 20,
+                },
+                ArchivalRule {
+                    tag: "action-plan".into(),
+                    max_age_days: 14,
+                    keep_recent: 10,
+                },
+                ArchivalRule {
+                    tag: "session-reflection".into(),
+                    max_age_days: 30,
+                    keep_recent: 50,
+                },
+                ArchivalRule {
+                    tag: "research-finding".into(),
+                    max_age_days: 30,
+                    keep_recent: 100,
+                },
+                ArchivalRule {
+                    tag: "consolidated-meta".into(),
+                    max_age_days: 90,
+                    keep_recent: 200,
+                },
+                ArchivalRule {
+                    tag: "research-project".into(),
+                    max_age_days: 90,
+                    keep_recent: 50,
+                },
+                ArchivalRule {
+                    tag: "feedback-signal".into(),
+                    max_age_days: 14,
+                    keep_recent: 50,
+                },
             ],
             completed_archival_rules: vec![
-                CompletedArchivalRule { tag: "todo-item".into(), max_age_days: 30 },
-                CompletedArchivalRule { tag: "scheduled-task".into(), max_age_days: 30 },
+                CompletedArchivalRule {
+                    tag: "todo-item".into(),
+                    max_age_days: 30,
+                },
+                CompletedArchivalRule {
+                    tag: "scheduled-task".into(),
+                    max_age_days: 30,
+                },
             ],
             task_tag: "scheduled-task".into(),
         }
@@ -205,6 +255,14 @@ pub struct ConceptPhaseReport {
     pub centroids_built: usize,
     /// Partitions with >= 2 seeds.
     pub partitions_with_multiple_seeds: usize,
+    /// Sizes of partitions with >= 2 seeds.
+    pub multi_seed_partition_sizes: Vec<usize>,
+    /// Sizes of clusters emitted by union-find clustering.
+    pub cluster_sizes: Vec<usize>,
+    /// Number of clusters with >= 2 beliefs.
+    pub clusters_with_multiple_beliefs: usize,
+    /// Largest cluster size observed this cycle.
+    pub largest_cluster_size: usize,
     /// Total pairwise centroid comparisons.
     pub pairwise_comparisons: usize,
     /// Pairs above similarity threshold.
@@ -225,8 +283,32 @@ pub struct ConceptPhaseReport {
 pub struct CausalPhaseReport {
     /// Number of raw record-level causal edges found.
     pub edges_found: usize,
+    /// Number of explicit record-level causal edges found.
+    pub explicit_edges_found: usize,
+    /// Number of temporal record-level causal edges found.
+    pub temporal_edges_found: usize,
+    /// Namespaces scanned for temporal edge extraction.
+    pub temporal_namespaces_scanned: usize,
+    /// Pairwise temporal checks considered.
+    pub temporal_pairs_considered: usize,
+    /// Pairwise temporal checks skipped by the budgeting policy.
+    pub temporal_pairs_skipped_by_budget: usize,
+    /// Temporal edges skipped due to cap pressure.
+    pub temporal_edges_capped: usize,
+    /// Namespaces that hit the temporal edge cap.
+    pub temporal_namespaces_hit_cap: usize,
     /// Total causal pattern candidates after aggregation.
     pub candidates_found: usize,
+    /// Patterns that pass the minimum support gate.
+    pub patterns_meeting_support_gate: usize,
+    /// Patterns that pass the repeated-evidence gate.
+    pub patterns_meeting_repeated_window_gate: usize,
+    /// Patterns that pass the counterfactual-ratio gate.
+    pub patterns_meeting_counterfactual_gate: usize,
+    /// Patterns blocked by evidence gates before state promotion.
+    pub patterns_blocked_by_evidence_gates: usize,
+    /// Patterns blocked by counterfactual pressure before state promotion.
+    pub patterns_blocked_by_counterfactual_gate: usize,
     /// Patterns that reached Stable state.
     pub stable_count: usize,
     /// Patterns that were Rejected.
@@ -321,6 +403,84 @@ pub struct LayerStability {
     pub policy_churn: f32,
 }
 
+/// Maintenance hot-spot accounting for scalability visibility.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default)]
+pub struct MaintenanceHotspots {
+    /// Records present at cycle start.
+    pub records_before_cycle: usize,
+    /// Records present after archival/consolidation finishes.
+    pub records_after_cycle: usize,
+    /// Number of records cloned into the belief/concept/causal snapshot.
+    pub belief_snapshot_records: usize,
+    /// Total source text bytes processed during SDR rebuild.
+    pub sdr_source_bytes: usize,
+    /// Number of SDR vectors built this cycle.
+    pub sdr_vectors_built: usize,
+    /// Number of SDR vectors computed from scratch this cycle.
+    pub sdr_vectors_computed: usize,
+    /// Number of SDR vectors reused from cache this cycle.
+    pub sdr_vectors_reused: usize,
+    /// Active beliefs after the belief phase.
+    pub belief_total_beliefs: usize,
+    /// Active hypotheses after the belief phase.
+    pub belief_total_hypotheses: usize,
+    /// Concept pairwise centroid comparisons this cycle.
+    pub concept_pairwise_comparisons: usize,
+    /// Concept partitions with multiple seeds.
+    pub concept_partitions_with_multiple_seeds: usize,
+    /// Causal record-level edges evaluated this cycle.
+    pub causal_edges_found: usize,
+    /// Explicit causal edges found this cycle.
+    pub causal_explicit_edges_found: usize,
+    /// Temporal causal edges found this cycle.
+    pub causal_temporal_edges_found: usize,
+    /// Namespaces scanned for temporal causal extraction.
+    pub causal_temporal_namespaces_scanned: usize,
+    /// Pairwise temporal causal checks considered.
+    pub causal_temporal_pairs_considered: usize,
+    /// Pairwise temporal causal checks skipped by budget.
+    pub causal_temporal_pairs_skipped_by_budget: usize,
+    /// Temporal causal edges suppressed by per-namespace cap.
+    pub causal_temporal_edges_capped: usize,
+    /// Namespaces that hit the temporal causal cap.
+    pub causal_temporal_namespaces_hit_cap: usize,
+    /// Policy seeds considered this cycle.
+    pub policy_seeds_found: usize,
+    /// Cross-connections discovered this cycle.
+    pub cross_connections_found: usize,
+    /// Scheduled task reminders emitted this cycle.
+    pub task_reminders_found: usize,
+    /// Name of the dominant timing phase in this cycle.
+    pub dominant_phase: String,
+    /// Time spent in the dominant phase.
+    pub dominant_phase_ms: f64,
+    /// Share of total cycle time spent in the dominant phase.
+    pub dominant_phase_share: f64,
+}
+
+/// Runtime telemetry for the bounded concept inspection surface.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default)]
+pub struct ConceptSurfaceTelemetry {
+    /// Current runtime surface mode: Off, Inspect, or Limited.
+    pub mode: String,
+    /// Number of surfaced concepts currently eligible for inspection.
+    pub surfaced_concepts_available: usize,
+    /// Number of namespaces represented in the current surfaced concept set.
+    pub surfaced_namespaces: usize,
+    /// Global surfaced-concept API calls observed since the previous maintenance cycle.
+    pub global_calls_since_last_cycle: u64,
+    /// Namespace-scoped surfaced-concept API calls observed since the previous maintenance cycle.
+    pub namespace_calls_since_last_cycle: u64,
+    /// Per-record annotation API calls observed since the previous maintenance cycle.
+    pub record_calls_since_last_cycle: u64,
+    /// Total surfaced concepts returned across all surface APIs since the previous maintenance cycle.
+    pub concepts_returned_since_last_cycle: u64,
+    /// Total per-record concept annotations returned since the previous maintenance cycle.
+    pub record_annotations_returned_since_last_cycle: u64,
+}
+
 /// Full maintenance cycle report.
 #[cfg_attr(feature = "python", pyclass(get_all))]
 #[derive(Debug, Clone)]
@@ -343,6 +503,10 @@ pub struct MaintenanceReport {
     pub timings: PhaseTimings,
     /// Cross-cycle identity stability.
     pub stability: LayerStability,
+    /// Audit/telemetry for the bounded concept inspection surface.
+    pub concept_surface: ConceptSurfaceTelemetry,
+    /// Scalability-oriented load and hot-spot accounting.
+    pub hotspots: MaintenanceHotspots,
 }
 
 // ── Phase Implementations ──
@@ -357,7 +521,8 @@ pub fn fix_memory_levels(
     stats.insert("downgraded".into(), 0);
     stats.insert("kept".into(), 0);
 
-    let identity_ids: Vec<String> = records.values()
+    let identity_ids: Vec<String> = records
+        .values()
         .filter(|r| r.level == Level::Identity)
         .map(|r| r.id.clone())
         .collect();
@@ -373,13 +538,21 @@ pub fn fix_memory_levels(
         let rec_tags: HashSet<&str> = rec.tags.iter().map(|s| s.as_str()).collect();
 
         // Keep if has identity-specific tags
-        if taxonomy.identity_tags.iter().any(|t| rec_tags.contains(t.as_str())) {
+        if taxonomy
+            .identity_tags
+            .iter()
+            .any(|t| rec_tags.contains(t.as_str()))
+        {
             *stats.get_mut("kept").unwrap() += 1;
             continue;
         }
 
         // Downgrade if has non-identity tags
-        if taxonomy.non_identity_tags.iter().any(|t| rec_tags.contains(t.as_str())) {
+        if taxonomy
+            .non_identity_tags
+            .iter()
+            .any(|t| rec_tags.contains(t.as_str()))
+        {
             rec.level = Level::Domain;
             *stats.get_mut("downgraded").unwrap() += 1;
             continue;
@@ -405,7 +578,8 @@ pub fn fix_memory_levels(
 /// - supporting neighbors: same namespace, semantically aligned, and connected or strongly tag-overlapping
 /// - conflicting neighbors: explicit contradiction markers, conflict-like relations, or WORKING/IDENTITY tag clashes
 pub fn update_epistemic_state(records: &mut HashMap<String, Record>) -> EpistemicPhaseReport {
-    let live_ids: Vec<String> = records.values()
+    let live_ids: Vec<String> = records
+        .values()
         .filter(|r| r.is_alive())
         .map(|r| r.id.clone())
         .collect();
@@ -413,7 +587,10 @@ pub fn update_epistemic_state(records: &mut HashMap<String, Record>) -> Epistemi
     let mut tag_groups: HashMap<String, Vec<String>> = HashMap::new();
     for rec in records.values().filter(|r| r.is_alive()) {
         for tag in &rec.tags {
-            tag_groups.entry(tag.clone()).or_default().push(rec.id.clone());
+            tag_groups
+                .entry(tag.clone())
+                .or_default()
+                .push(rec.id.clone());
         }
     }
 
@@ -454,9 +631,12 @@ pub fn update_epistemic_state(records: &mut HashMap<String, Record>) -> Epistemi
 
             let other_tags: HashSet<&str> = other.tags.iter().map(|t| t.as_str()).collect();
             let shared_tags = rec_tags.intersection(&other_tags).count();
-            let relation = rec.connection_type(&nid)
+            let relation = rec
+                .connection_type(&nid)
                 .or_else(|| other.connection_type(&rid));
-            let connection_weight = rec.connections.get(&nid)
+            let connection_weight = rec
+                .connections
+                .get(&nid)
                 .copied()
                 .or_else(|| other.connections.get(&rid).copied())
                 .unwrap_or(0.0);
@@ -466,16 +646,15 @@ pub fn update_epistemic_state(records: &mut HashMap<String, Record>) -> Epistemi
                 continue;
             }
 
-            let explicit_conflict_relation = relation.is_some_and(|rel| {
-                rel.contains("conflict") || rel.contains("contradict")
-            });
+            let explicit_conflict_relation =
+                relation.is_some_and(|rel| rel.contains("conflict") || rel.contains("contradict"));
             // Contradiction propagation requires strong evidence:
             // at least 2 shared tags. Auto-connections alone are too noisy
             // (a record sharing 1 tag like "safety" shouldn't be pulled
             // into conflict with an unrelated contradiction).
-            let contradiction_pair =
-                (semantic_type == "contradiction" || other.semantic_type == "contradiction")
-                    && shared_tags >= 2;
+            let contradiction_pair = (semantic_type == "contradiction"
+                || other.semantic_type == "contradiction")
+                && shared_tags >= 2;
             let level_conflict = shared_tags > 0
                 && matches!(
                     (level, other.level),
@@ -487,7 +666,8 @@ pub fn update_epistemic_state(records: &mut HashMap<String, Record>) -> Epistemi
                 continue;
             }
 
-            let reinforcing_relation = matches!(relation, Some("causal" | "associative" | "coactivation"));
+            let reinforcing_relation =
+                matches!(relation, Some("causal" | "associative" | "coactivation"));
             let shared_semantic = semantic_type == other.semantic_type;
             if (shared_semantic && shared_tags > 0)
                 || (reinforcing_relation && connected)
@@ -533,14 +713,16 @@ pub fn guarded_reflect(
     _taxonomy: &TagTaxonomy,
 ) -> ReflectReport {
     // Save original levels for non-IDENTITY records
-    let original_levels: HashMap<String, Level> = records.iter()
+    let original_levels: HashMap<String, Level> = records
+        .iter()
         .filter(|(_, r)| r.level != Level::Identity)
         .map(|(id, r)| (id.clone(), r.level))
         .collect();
 
     // Run reflect logic: promote candidates
     let mut promoted: usize = 0;
-    let promotable: Vec<String> = records.values()
+    let promotable: Vec<String> = records
+        .values()
         .filter(|r| r.can_promote())
         .map(|r| r.id.clone())
         .collect();
@@ -554,7 +736,8 @@ pub fn guarded_reflect(
     }
 
     // Archive dead
-    let dead: Vec<String> = records.values()
+    let dead: Vec<String> = records
+        .values()
         .filter(|r| !r.is_alive())
         .map(|r| r.id.clone())
         .collect();
@@ -588,7 +771,10 @@ pub fn guarded_reflect(
         tracing::info!(restored, "Overpromotion guard: restored records");
     }
 
-    ReflectReport { promoted: promoted.saturating_sub(restored), archived }
+    ReflectReport {
+        promoted: promoted.saturating_sub(restored),
+        archived,
+    }
 }
 
 /// Truncate a string to at most `max_bytes` on a valid UTF-8 char boundary.
@@ -611,7 +797,8 @@ pub fn discover_cross_connections(
     let mut discoveries = Vec::new();
 
     // Sample connected records
-    let sample: Vec<&Record> = records.values()
+    let sample: Vec<&Record> = records
+        .values()
         .filter(|r| !r.connections.is_empty() && r.is_alive())
         .take(10)
         .collect();
@@ -656,10 +843,7 @@ pub fn discover_cross_connections(
 }
 
 /// Phase 6: Scheduled task check — find tasks due today or tomorrow.
-pub fn check_scheduled_tasks(
-    records: &HashMap<String, Record>,
-    task_tag: &str,
-) -> Vec<String> {
+pub fn check_scheduled_tasks(records: &HashMap<String, Record>, task_tag: &str) -> Vec<String> {
     let now = chrono::Utc::now();
     let tomorrow = now + chrono::Duration::days(1);
     let mut reminders = Vec::new();
@@ -684,10 +868,7 @@ pub fn check_scheduled_tasks(
             Err(_) => {
                 // Try ISO date without timezone
                 match chrono::NaiveDate::parse_from_str(due_str, "%Y-%m-%d") {
-                    Ok(d) => d.and_hms_opt(0, 0, 0)
-                        .unwrap()
-                        .and_utc()
-                        .fixed_offset(),
+                    Ok(d) => d.and_hms_opt(0, 0, 0).unwrap().and_utc().fixed_offset(),
                     Err(_) => continue,
                 }
             }
@@ -701,8 +882,7 @@ pub fn check_scheduled_tasks(
             continue;
         }
 
-        let description = rec.metadata.get("description")
-            .unwrap_or(&rec.content);
+        let description = rec.metadata.get("description").unwrap_or(&rec.content);
 
         if due_naive == now_naive {
             reminders.push(format!("Due today: {}", description));
@@ -727,10 +907,13 @@ pub fn archive_old_records(
 
     // Strategy 1: Age-based deletion
     for rule in &config.archival_rules {
-        let mut matching: Vec<(String, String)> = records.values()
+        let mut matching: Vec<(String, String)> = records
+            .values()
             .filter(|r| r.tags.contains(&rule.tag) && r.is_alive())
             .map(|r| {
-                let ts = r.metadata.get("timestamp")
+                let ts = r
+                    .metadata
+                    .get("timestamp")
                     .or_else(|| r.metadata.get("created_at"))
                     .cloned()
                     .unwrap_or_default();
@@ -745,8 +928,7 @@ pub fn archive_old_records(
         // Sort by timestamp descending (newest first)
         matching.sort_by(|a, b| b.1.cmp(&a.1));
 
-        let cutoff = (now - chrono::Duration::days(rule.max_age_days as i64))
-            .to_rfc3339();
+        let cutoff = (now - chrono::Duration::days(rule.max_age_days as i64)).to_rfc3339();
 
         // Skip keep_recent newest records
         let candidates = &matching[rule.keep_recent..];
@@ -765,10 +947,10 @@ pub fn archive_old_records(
 
     // Strategy 2: Completion-based deletion
     for rule in &config.completed_archival_rules {
-        let cutoff = (now - chrono::Duration::days(rule.max_age_days as i64))
-            .to_rfc3339();
+        let cutoff = (now - chrono::Duration::days(rule.max_age_days as i64)).to_rfc3339();
 
-        let to_delete: Vec<String> = records.values()
+        let to_delete: Vec<String> = records
+            .values()
             .filter(|r| {
                 r.tags.contains(&rule.tag)
                     && matches!(
@@ -777,7 +959,9 @@ pub fn archive_old_records(
                     )
             })
             .filter(|r| {
-                let completed_at = r.metadata.get("completed_at")
+                let completed_at = r
+                    .metadata
+                    .get("completed_at")
                     .or_else(|| r.metadata.get("timestamp"))
                     .or_else(|| r.metadata.get("created_at"))
                     .map(|s| s.as_str())
@@ -906,7 +1090,8 @@ mod tests {
         // Create an old cache record
         let mut r = Record::new("cached result".into(), Level::Working);
         r.tags.push("web-search-cache".into());
-        r.metadata.insert("timestamp".into(), "2020-01-01T00:00:00Z".into());
+        r.metadata
+            .insert("timestamp".into(), "2020-01-01T00:00:00Z".into());
         records.insert(r.id.clone(), r);
 
         let archived = archive_old_records(&mut records, &config, &taxonomy);
@@ -962,7 +1147,10 @@ mod tests {
     fn test_update_epistemic_state_tracks_volatility_on_change() {
         let mut records = HashMap::new();
 
-        let mut r1 = Record::new("User prefers dark mode in the editor".into(), Level::Identity);
+        let mut r1 = Record::new(
+            "User prefers dark mode in the editor".into(),
+            Level::Identity,
+        );
         r1.tags = vec!["ui".into(), "theme".into()];
         r1.semantic_type = "preference".into();
 
@@ -978,7 +1166,10 @@ mod tests {
         let _ = update_epistemic_state(&mut records);
         let first_vol = records.get(&id1).unwrap().volatility;
 
-        let mut r3 = Record::new("User rejects dark mode in the editor".into(), Level::Working);
+        let mut r3 = Record::new(
+            "User rejects dark mode in the editor".into(),
+            Level::Working,
+        );
         r3.tags = vec!["ui".into(), "theme".into()];
         r3.semantic_type = "contradiction".into();
         let id3 = r3.id.clone();
@@ -998,7 +1189,7 @@ mod tests {
         // Cyrillic (2 bytes per char) — cut inside char
         let cyrillic = "Обговорено"; // 10 chars × 2 bytes = 20 bytes
         assert_eq!(truncate_utf8(cyrillic, 5), "Об"); // 5 → backs up to 4 (2 full chars)
-        // Short string — returned as-is
+                                                      // Short string — returned as-is
         assert_eq!(truncate_utf8("hi", 50), "hi");
         // Empty
         assert_eq!(truncate_utf8("", 10), "");
@@ -1011,8 +1202,14 @@ mod tests {
 
         let long_ukr = "Обговорено та заплановано триденне SEO-дослідження для проєкту. До пам'яті збережено графік завдань.";
         let mut r1 = Record::new(long_ukr.into(), Level::Domain);
-        let mut r2 = Record::new("Зв'язаний запис із кириличним текстом номер два".into(), Level::Domain);
-        let mut r3 = Record::new("Третій запис — ще один кириличний текст для тесту".into(), Level::Domain);
+        let mut r2 = Record::new(
+            "Зв'язаний запис із кириличним текстом номер два".into(),
+            Level::Domain,
+        );
+        let mut r3 = Record::new(
+            "Третій запис — ще один кириличний текст для тесту".into(),
+            Level::Domain,
+        );
 
         let id1 = r1.id.clone();
         let id2 = r2.id.clone();

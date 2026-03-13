@@ -2,9 +2,9 @@
 //!
 //! Rewritten from brain_tools.py cache logic.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::time::Instant;
-use parking_lot::Mutex;
 
 /// In-memory recall cache entry.
 struct CacheEntry {
@@ -67,10 +67,13 @@ impl RecallCache {
             }
         }
 
-        entries.insert(key, CacheEntry {
-            result,
-            inserted_at: Instant::now(),
-        });
+        entries.insert(
+            key,
+            CacheEntry {
+                result,
+                inserted_at: Instant::now(),
+            },
+        );
     }
 
     /// Clear the entire cache. Called on store/update/delete to prevent stale data.
@@ -127,7 +130,12 @@ impl StructuredRecallCache {
         }
     }
 
-    fn make_key(query: &str, top_k: usize, min_strength: f32, namespaces: Option<&[&str]>) -> String {
+    fn make_key(
+        query: &str,
+        top_k: usize,
+        min_strength: f32,
+        namespaces: Option<&[&str]>,
+    ) -> String {
         let q = query.to_lowercase();
         let q = q.trim();
         match namespaces {
@@ -137,7 +145,13 @@ impl StructuredRecallCache {
     }
 
     /// Get cached structured recall result.
-    pub fn get(&self, query: &str, top_k: usize, min_strength: f32, namespaces: Option<&[&str]>) -> Option<Vec<(f32, Record)>> {
+    pub fn get(
+        &self,
+        query: &str,
+        top_k: usize,
+        min_strength: f32,
+        namespaces: Option<&[&str]>,
+    ) -> Option<Vec<(f32, Record)>> {
         let key = Self::make_key(query, top_k, min_strength, namespaces);
         let mut entries = self.entries.lock();
 
@@ -151,7 +165,14 @@ impl StructuredRecallCache {
     }
 
     /// Store structured recall result.
-    pub fn put(&self, query: &str, top_k: usize, min_strength: f32, namespaces: Option<&[&str]>, result: Vec<(f32, Record)>) {
+    pub fn put(
+        &self,
+        query: &str,
+        top_k: usize,
+        min_strength: f32,
+        namespaces: Option<&[&str]>,
+        result: Vec<(f32, Record)>,
+    ) {
         let key = Self::make_key(query, top_k, min_strength, namespaces);
         let mut entries = self.entries.lock();
 
@@ -165,10 +186,13 @@ impl StructuredRecallCache {
             }
         }
 
-        entries.insert(key, StructuredCacheEntry {
-            result,
-            inserted_at: Instant::now(),
-        });
+        entries.insert(
+            key,
+            StructuredCacheEntry {
+                result,
+                inserted_at: Instant::now(),
+            },
+        );
     }
 
     /// Clear the cache.

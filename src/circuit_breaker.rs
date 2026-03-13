@@ -2,9 +2,9 @@
 //!
 //! Rewritten from brain_tools.py ToolHealth class.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use parking_lot::Mutex;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -68,10 +68,12 @@ impl CircuitBreaker {
         let window = Duration::from_secs(self.config.failure_window_secs);
         let mut tools = self.tools.lock();
 
-        let state = tools.entry(tool_name.to_string()).or_insert_with(|| ToolState {
-            failures: Vec::new(),
-            circuit_open_until: None,
-        });
+        let state = tools
+            .entry(tool_name.to_string())
+            .or_insert_with(|| ToolState {
+                failures: Vec::new(),
+                circuit_open_until: None,
+            });
 
         // Keep only recent failures
         state.failures.retain(|t| now.duration_since(*t) < window);
@@ -118,7 +120,9 @@ impl CircuitBreaker {
         let mut report = HashMap::new();
 
         for (name, state) in tools.iter() {
-            let recent_failures = state.failures.iter()
+            let recent_failures = state
+                .failures
+                .iter()
                 .filter(|t| now.duration_since(**t) < window)
                 .count();
 
@@ -127,7 +131,10 @@ impl CircuitBreaker {
                     let remaining = (open_until - now).as_secs();
                     report.insert(
                         name.clone(),
-                        format!("UNAVAILABLE ({}s cooldown, {} failures)", remaining, recent_failures),
+                        format!(
+                            "UNAVAILABLE ({}s cooldown, {} failures)",
+                            remaining, recent_failures
+                        ),
                     );
                     continue;
                 }

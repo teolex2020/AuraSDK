@@ -5,47 +5,51 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
 use anyhow::Result;
+use parking_lot::RwLock;
 use tracing::instrument;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
+use crate::audit::AuditLog;
+use crate::canonical::CanonicalProjector;
+use crate::cognitive_store::CognitiveStore;
+use crate::consolidation;
+use crate::cortex::ActiveCortex;
+use crate::crypto::EncryptionKey;
+use crate::embedding::EmbeddingStore;
+use crate::graph::SessionTracker;
+use crate::index::InvertedIndex;
+use crate::insights;
 use crate::levels::Level;
+use crate::ngram::NGramIndex;
+use crate::recall;
 use crate::record::Record;
 use crate::sdr::SDRInterpreter;
-use crate::storage::AuraStorage;
-use crate::index::InvertedIndex;
-use crate::cortex::ActiveCortex;
-use crate::cognitive_store::CognitiveStore;
-use crate::ngram::NGramIndex;
-use crate::synonym::SynonymRing;
-use crate::graph::SessionTracker;
-use crate::canonical::CanonicalProjector;
-use crate::crypto::EncryptionKey;
-use crate::audit::AuditLog;
-use crate::recall;
-use crate::consolidation;
-use crate::insights;
 use crate::semantic_learner::SemanticLearnerEngine;
-use crate::embedding::EmbeddingStore;
+use crate::storage::AuraStorage;
+use crate::synonym::SynonymRing;
 
 // SDK Wrapper modules
-use crate::trust::{self, TagTaxonomy, TrustConfig};
-use crate::guards;
-use crate::cache::{RecallCache, StructuredRecallCache};
-use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use crate::research::{ResearchEngine, ResearchProject};
-use crate::identity::{self, AgentPersona};
 use crate::background_brain::{self, BackgroundBrain, MaintenanceConfig, MaintenanceReport};
 use crate::belief::{BeliefEngine, BeliefStore, CoarseKeyMode, SdrLookup};
-use crate::concept::{ConceptEngine, ConceptSeedMode, ConceptSimilarityMode, ConceptStore};
-use crate::causal::{CausalEngine, CausalStore};
+use crate::cache::{RecallCache, StructuredRecallCache};
+use crate::causal::{CausalEngine, CausalEvidenceMode, CausalStore, TemporalEdgeBudgetMode};
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use crate::concept::{
+    ConceptEngine, ConceptPartitionMode, ConceptSeedMode, ConceptSimilarityMode, ConceptStore,
+    ConceptSurfaceMode,
+};
+use crate::guards;
+use crate::identity::{self, AgentPersona};
 use crate::policy::{PolicyEngine, PolicyStore};
+use crate::research::{ResearchEngine, ResearchProject};
 use crate::storage::StoredRecord;
+use crate::trust::{self, TagTaxonomy, TrustConfig};
 
 /// Maximum content size (100KB).
 const MAX_CONTENT_SIZE: usize = 100 * 1024;
@@ -87,6 +91,7 @@ pub struct Aura {
     trust_config: RwLock<TrustConfig>,
     recall_cache: RecallCache,
     structured_recall_cache: StructuredRecallCache,
+    sdr_lookup_cache: RwLock<HashMap<String, Vec<u16>>>,
     circuit_breaker: CircuitBreaker,
     research_engine: ResearchEngine,
     maintenance_config: RwLock<MaintenanceConfig>,
@@ -121,6 +126,12 @@ pub struct Aura {
 
     // ── Belief Reranking (Phase 4 — tri-state: Off/Shadow/Limited) ──
     belief_rerank_mode: std::sync::atomic::AtomicU8,
+    concept_surface_mode: std::sync::atomic::AtomicU8,
+    concept_surface_global_calls: AtomicU64,
+    concept_surface_namespace_calls: AtomicU64,
+    concept_surface_record_calls: AtomicU64,
+    concept_surface_results_returned: AtomicU64,
+    concept_surface_record_results_returned: AtomicU64,
 
     // ── Config ──
     #[allow(dead_code)]
@@ -169,9 +180,7 @@ impl Aura {
         for rec in loaded_records.values_mut() {
             let expected = Record::default_confidence_for_source(&rec.source_type);
             // Only fix if confidence is at the default 0.90 and source_type disagrees
-            if (rec.confidence - 0.90).abs() < 0.001
-                && (expected - 0.90).abs() > 0.001
-            {
+            if (rec.confidence - 0.90).abs() < 0.001 && (expected - 0.90).abs() > 0.001 {
                 rec.confidence = expected;
                 migrated_ids.push(rec.id.clone());
             }
@@ -183,7 +192,10 @@ impl Aura {
                     let _ = cognitive_store.append_update(rec);
                 }
             }
-            tracing::info!(count = migrated_ids.len(), "Migrated legacy record confidence values");
+            tracing::info!(
+                count = migrated_ids.len(),
+                "Migrated legacy record confidence values"
+            );
         }
 
         // Build indexes from loaded records
@@ -250,6 +262,7 @@ impl Aura {
             trust_config: RwLock::new(TrustConfig::default()),
             recall_cache: RecallCache::default(),
             structured_recall_cache: StructuredRecallCache::default(),
+            sdr_lookup_cache: RwLock::new(HashMap::new()),
             circuit_breaker: CircuitBreaker::default(),
             research_engine: ResearchEngine::new(),
             maintenance_config: RwLock::new(MaintenanceConfig::default()),
@@ -275,7 +288,15 @@ impl Aura {
             embedding_store: EmbeddingStore::new(),
             #[cfg(feature = "python")]
             embedding_fn: RwLock::new(None),
-            belief_rerank_mode: std::sync::atomic::AtomicU8::new(recall::BeliefRerankMode::Off as u8),
+            belief_rerank_mode: std::sync::atomic::AtomicU8::new(
+                recall::BeliefRerankMode::Off as u8,
+            ),
+            concept_surface_mode: std::sync::atomic::AtomicU8::new(ConceptSurfaceMode::Off as u8),
+            concept_surface_global_calls: AtomicU64::new(0),
+            concept_surface_namespace_calls: AtomicU64::new(0),
+            concept_surface_record_calls: AtomicU64::new(0),
+            concept_surface_results_returned: AtomicU64::new(0),
+            concept_surface_record_results_returned: AtomicU64::new(0),
             path: path_buf,
         })
     }
@@ -297,7 +318,21 @@ impl Aura {
         namespace: Option<&str>,
         semantic_type: Option<&str>,
     ) -> Result<Record> {
-        self.store_with_channel(content, level, tags, pin, content_type, source_type, metadata, deduplicate, caused_by_id, None, None, namespace, semantic_type)
+        self.store_with_channel(
+            content,
+            level,
+            tags,
+            pin,
+            content_type,
+            source_type,
+            metadata,
+            deduplicate,
+            caused_by_id,
+            None,
+            None,
+            namespace,
+            semantic_type,
+        )
     }
 
     /// Store with explicit channel for provenance stamping.
@@ -336,8 +371,7 @@ impl Aura {
         let pin = pin.unwrap_or(false);
         let content_type = content_type.unwrap_or("text");
         let source_type = source_type.unwrap_or(crate::record::DEFAULT_SOURCE_TYPE);
-        crate::record::Record::validate_source_type(source_type)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        crate::record::Record::validate_source_type(source_type).map_err(|e| anyhow::anyhow!(e))?;
         let deduplicate = deduplicate.unwrap_or(true);
         let semantic_type = semantic_type.unwrap_or(crate::record::DEFAULT_SEMANTIC_TYPE);
         crate::record::Record::validate_semantic_type(semantic_type)
@@ -345,8 +379,7 @@ impl Aura {
 
         // ── Namespace resolution & validation ──
         let ns = namespace.unwrap_or(crate::record::DEFAULT_NAMESPACE);
-        crate::record::Record::validate_namespace(ns)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        crate::record::Record::validate_namespace(ns).map_err(|e| anyhow::anyhow!(e))?;
 
         // ── Guard: Auto-protect tags (detect sensitive content) ──
         guards::auto_protect_tags(content, &mut tags);
@@ -375,7 +408,7 @@ impl Aura {
                             self.cognitive_store.append_update(existing)?;
                             // Invalidate recall cache on write
                             self.recall_cache.clear();
-        self.structured_recall_cache.clear();
+                            self.structured_recall_cache.clear();
                             return Ok(existing.clone());
                         }
                     }
@@ -419,12 +452,20 @@ impl Aura {
         // ── Guard: Stamp provenance ──
         {
             let trust_config = self.trust_config.read();
-            trust::stamp_provenance(&mut rec.metadata, channel, &rec.tags, &taxonomy, &trust_config);
+            trust::stamp_provenance(
+                &mut rec.metadata,
+                channel,
+                &rec.tags,
+                &taxonomy,
+                &trust_config,
+            );
         }
 
         // ── Guard: Apply guard result metadata ──
         for (key, value) in &guard_result.extra_metadata {
-            rec.metadata.entry(key.clone()).or_insert_with(|| value.clone());
+            rec.metadata
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
         }
         for extra_tag in &guard_result.extra_tags {
             if !rec.tags.contains(extra_tag) {
@@ -466,7 +507,10 @@ impl Aura {
         {
             let mut tag_idx = self.tag_index.write();
             for tag in &rec.tags {
-                tag_idx.entry(tag.clone()).or_default().insert(rec.id.clone());
+                tag_idx
+                    .entry(tag.clone())
+                    .or_default()
+                    .insert(rec.id.clone());
             }
         }
 
@@ -499,6 +543,10 @@ impl Aura {
         {
             let mut records = self.records.write();
             records.insert(rec.id.clone(), rec.clone());
+        }
+        {
+            let mut sdr_cache = self.sdr_lookup_cache.write();
+            sdr_cache.insert(rec.id.clone(), self.sdr.text_to_sdr(content, false));
         }
 
         // Cortex insert for anchors
@@ -573,11 +621,7 @@ impl Aura {
         )?;
 
         let records = self.records.read();
-        let preamble = recall::format_preamble(
-            &scored,
-            token_budget.unwrap_or(2048),
-            &records,
-        );
+        let preamble = recall::format_preamble(&scored, token_budget.unwrap_or(2048), &records);
 
         // Cache the result
         self.recall_cache.put(&cache_key, preamble.clone());
@@ -600,7 +644,10 @@ impl Aura {
         let min_str = min_strength.unwrap_or(0.1);
 
         // Check structured recall cache
-        if let Some(cached) = self.structured_recall_cache.get(query, top, min_str, namespaces) {
+        if let Some(cached) = self
+            .structured_recall_cache
+            .get(query, top, min_str, namespaces)
+        {
             return Ok(cached);
         }
 
@@ -614,7 +661,8 @@ impl Aura {
         )?;
 
         // Cache the result
-        self.structured_recall_cache.put(query, top, min_str, namespaces, scored.clone());
+        self.structured_recall_cache
+            .put(query, top, min_str, namespaces, scored.clone());
 
         Ok(scored)
     }
@@ -704,9 +752,18 @@ impl Aura {
         info.insert("strength".into(), format!("{:.4}", rec.strength));
         info.insert("activation_count".into(), rec.activation_count.to_string());
         info.insert("created_at".into(), format!("{:.3}", rec.created_at));
-        info.insert("last_activated".into(), format!("{:.3}", rec.last_activated));
-        info.insert("age_days".into(), format!("{:.2}", (now - rec.created_at) / 86400.0));
-        info.insert("days_since_activation".into(), format!("{:.2}", (now - rec.last_activated) / 86400.0));
+        info.insert(
+            "last_activated".into(),
+            format!("{:.3}", rec.last_activated),
+        );
+        info.insert(
+            "age_days".into(),
+            format!("{:.2}", (now - rec.created_at) / 86400.0),
+        );
+        info.insert(
+            "days_since_activation".into(),
+            format!("{:.2}", (now - rec.last_activated) / 86400.0),
+        );
         info.insert("namespace".into(), rec.namespace.clone());
         info.insert("source_type".into(), rec.source_type.clone());
         info.insert("tags".into(), rec.tags.join(", "));
@@ -788,10 +845,7 @@ impl Aura {
                         .split_whitespace()
                         .filter(|w| w.len() > 3)
                         .collect();
-                    if query_words
-                        .iter()
-                        .any(|w| content_lower.contains(w))
-                    {
+                    if query_words.iter().any(|w| content_lower.contains(w)) {
                         scored.push((0.8, rec.clone()));
                     }
                 }
@@ -799,10 +853,7 @@ impl Aura {
         }
 
         // Re-sort by score desc, truncate
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(top_k + 15);
 
         Ok(scored)
@@ -845,7 +896,11 @@ impl Aura {
             dna: rec.level.to_dna().to_string(),
             timestamp: rec.created_at,
             intensity: rec.strength,
-            stability: if rec.level == Level::Identity { 100.0 } else { 1.0 },
+            stability: if rec.level == Level::Identity {
+                100.0
+            } else {
+                1.0
+            },
             decay_velocity: 0.0,
             entropy: 0.0,
             sdr_indices: Vec::new(),
@@ -923,12 +978,7 @@ impl Aura {
     }
 
     /// Post-recall side effects: activate records and log audit.
-    fn recall_finalize(
-        &self,
-        scored: &[(f32, Record)],
-        query: &str,
-        session_id: Option<&str>,
-    ) {
+    fn recall_finalize(&self, scored: &[(f32, Record)], query: &str, session_id: Option<&str>) {
         {
             let mut records = self.records.write();
             let mut tracker = self.session_tracker.write();
@@ -950,11 +1000,13 @@ impl Aura {
         session_id: Option<&str>,
         namespaces: Option<&[&str]>,
     ) -> Result<Vec<(f32, Record)>> {
-        let mut scored = self.recall_raw(query, top_k, min_strength, expand_connections, namespaces);
+        let mut scored =
+            self.recall_raw(query, top_k, min_strength, expand_connections, namespaces);
 
         // Phase 4: belief-aware reranking (only in Limited mode)
         let rerank_mode = recall::BeliefRerankMode::from_u8(
-            self.belief_rerank_mode.load(std::sync::atomic::Ordering::Relaxed)
+            self.belief_rerank_mode
+                .load(std::sync::atomic::Ordering::Relaxed),
         );
         if rerank_mode == recall::BeliefRerankMode::Limited {
             let belief_eng = self.belief_engine.read();
@@ -983,7 +1035,11 @@ impl Aura {
         let min_str = min_strength.unwrap_or(0.1);
 
         let scored = self.recall_raw(
-            query, top, min_str, expand_connections.unwrap_or(true), namespaces,
+            query,
+            top,
+            min_str,
+            expand_connections.unwrap_or(true),
+            namespaces,
         );
 
         // Shadow scoring on raw baseline
@@ -1012,7 +1068,11 @@ impl Aura {
         let min_str = min_strength.unwrap_or(0.1);
 
         let mut scored = self.recall_raw(
-            query, top, min_str, expand_connections.unwrap_or(true), namespaces,
+            query,
+            top,
+            min_str,
+            expand_connections.unwrap_or(true),
+            namespaces,
         );
 
         let belief_eng = self.belief_engine.read();
@@ -1080,7 +1140,11 @@ impl Aura {
             .cloned()
             .collect();
 
-        results.sort_by(|a, b| b.importance().partial_cmp(&a.importance()).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.importance()
+                .partial_cmp(&a.importance())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         results
     }
@@ -1102,8 +1166,7 @@ impl Aura {
         source_type: Option<&str>,
     ) -> Result<Option<Record>> {
         if let Some(st) = source_type {
-            crate::record::Record::validate_source_type(st)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            crate::record::Record::validate_source_type(st).map_err(|e| anyhow::anyhow!(e))?;
         }
         let mut records = self.records.write();
         let rec = match records.get_mut(record_id) {
@@ -1166,6 +1229,7 @@ impl Aura {
         self.storage.delete(record_id);
         self.index.remove(record_id);
         self.embedding_store.remove(record_id);
+        self.sdr_lookup_cache.write().remove(record_id);
 
         // Invalidate recall cache on write
         self.recall_cache.clear();
@@ -1198,7 +1262,9 @@ impl Aura {
         match (&ns_a, &ns_b) {
             (Some(a), Some(b)) if a != b => {
                 return Err(anyhow::anyhow!(
-                    "Cannot connect records across namespaces ('{}' vs '{}')", a, b
+                    "Cannot connect records across namespaces ('{}' vs '{}')",
+                    a,
+                    b
                 ));
             }
             (None, _) => return Err(anyhow::anyhow!("Record {} not found", id_a)),
@@ -1325,7 +1391,8 @@ impl Aura {
         let semantic_promotable: Vec<String> = records
             .values()
             .filter(|r| {
-                let is_valuable_type = matches!(r.semantic_type.as_str(), "decision" | "preference");
+                let is_valuable_type =
+                    matches!(r.semantic_type.as_str(), "decision" | "preference");
                 is_valuable_type
                     && r.activation_count >= 3  // Lower than standard 5
                     && r.strength >= 0.5        // Lower than standard 0.7
@@ -1416,28 +1483,37 @@ impl Aura {
         stats.insert("total_records".into(), records.len());
         stats.insert(
             "working".into(),
-            records.values().filter(|r| r.level == Level::Working).count(),
+            records
+                .values()
+                .filter(|r| r.level == Level::Working)
+                .count(),
         );
         stats.insert(
             "decisions".into(),
-            records.values().filter(|r| r.level == Level::Decisions).count(),
+            records
+                .values()
+                .filter(|r| r.level == Level::Decisions)
+                .count(),
         );
         stats.insert(
             "domain".into(),
-            records.values().filter(|r| r.level == Level::Domain).count(),
+            records
+                .values()
+                .filter(|r| r.level == Level::Domain)
+                .count(),
         );
         stats.insert(
             "identity".into(),
-            records.values().filter(|r| r.level == Level::Identity).count(),
+            records
+                .values()
+                .filter(|r| r.level == Level::Identity)
+                .count(),
         );
         stats.insert(
             "total_connections".into(),
             records.values().map(|r| r.connections.len()).sum(),
         );
-        stats.insert(
-            "total_tags".into(),
-            self.tag_index.read().len(),
-        );
+        stats.insert("total_tags".into(), self.tag_index.read().len());
 
         stats
     }
@@ -1563,10 +1639,22 @@ impl Aura {
     pub fn tier_stats(&self) -> HashMap<String, usize> {
         let records = self.records.read();
 
-        let working = records.values().filter(|r| r.level == Level::Working).count();
-        let decisions = records.values().filter(|r| r.level == Level::Decisions).count();
-        let domain = records.values().filter(|r| r.level == Level::Domain).count();
-        let identity = records.values().filter(|r| r.level == Level::Identity).count();
+        let working = records
+            .values()
+            .filter(|r| r.level == Level::Working)
+            .count();
+        let decisions = records
+            .values()
+            .filter(|r| r.level == Level::Decisions)
+            .count();
+        let domain = records
+            .values()
+            .filter(|r| r.level == Level::Domain)
+            .count();
+        let identity = records
+            .values()
+            .filter(|r| r.level == Level::Identity)
+            .count();
 
         let mut stats = HashMap::new();
         stats.insert("cognitive_total".into(), working + decisions);
@@ -1600,21 +1688,17 @@ impl Aura {
         let mut candidates: Vec<Record> = records
             .values()
             .filter(|r| {
-                r.level.is_cognitive()
-                    && r.activation_count >= min_act
-                    && r.strength >= min_str
+                r.level.is_cognitive() && r.activation_count >= min_act && r.strength >= min_str
             })
             .cloned()
             .collect();
 
         candidates.sort_by(|a, b| {
-            b.activation_count
-                .cmp(&a.activation_count)
-                .then_with(|| {
-                    b.strength
-                        .partial_cmp(&a.strength)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+            b.activation_count.cmp(&a.activation_count).then_with(|| {
+                b.strength
+                    .partial_cmp(&a.strength)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
         candidates
     }
@@ -1630,7 +1714,7 @@ impl Aura {
                 // Persist the change
                 let _ = self.cognitive_store.append_update(rec);
                 self.recall_cache.clear();
-        self.structured_recall_cache.clear();
+                self.structured_recall_cache.clear();
                 Some(rec.level)
             } else {
                 None
@@ -1790,12 +1874,14 @@ impl Aura {
 
         let cycle_start = Instant::now();
         let mut timings = background_brain::PhaseTimings::default();
+        let mut hotspots = background_brain::MaintenanceHotspots::default();
 
         let config = self.maintenance_config.read().clone();
         let taxonomy = self.taxonomy.read().clone();
 
         let mut records = self.records.write();
         let total_records = records.len();
+        hotspots.records_before_cycle = total_records;
 
         // Get cycle count from background brain or use 0
         let cycle = {
@@ -1826,7 +1912,9 @@ impl Aura {
 
             // Decay connections
             for rec in records.values_mut() {
-                let weak: Vec<String> = rec.connections.iter()
+                let weak: Vec<String> = rec
+                    .connections
+                    .iter()
                     .filter(|(_, w)| **w < 0.05)
                     .map(|(id, _)| id.clone())
                     .collect();
@@ -1878,9 +1966,12 @@ impl Aura {
         // Phase 3.5: Belief update (read-only — builds beliefs, does not affect recall)
         // Take a read-only snapshot of record refs to avoid holding write lock during
         // belief computation and disk persistence.
-        let belief_snapshot: HashMap<String, Record> = records.iter()
+        let belief_snapshot: HashMap<String, Record> = records
+            .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        hotspots.belief_snapshot_records = belief_snapshot.len();
+        hotspots.sdr_source_bytes = belief_snapshot.values().map(|rec| rec.content.len()).sum();
         // Release records lock before belief work (Phase 4 will re-acquire)
         drop(records);
 
@@ -1891,12 +1982,29 @@ impl Aura {
         // would give Tanimoto ≈ 0 across range boundaries.
         // Shared by belief phase (3.5) and concept phase (3.7).
         let t_sdr = Instant::now();
-        let sdr_lookup: SdrLookup = belief_snapshot.iter()
-            .map(|(rid, rec)| {
-                let sdr_vec = self.sdr.text_to_sdr(&rec.content, false);
-                (rid.clone(), sdr_vec)
-            })
-            .collect();
+        let mut computed = 0usize;
+        let mut reused = 0usize;
+        let sdr_lookup: SdrLookup = {
+            let mut cache = self.sdr_lookup_cache.write();
+            cache.retain(|rid, _| belief_snapshot.contains_key(rid));
+
+            let mut lookup = HashMap::with_capacity(belief_snapshot.len());
+            for (rid, rec) in &belief_snapshot {
+                if let Some(existing) = cache.get(rid) {
+                    lookup.insert(rid.clone(), existing.clone());
+                    reused += 1;
+                } else {
+                    let sdr_vec = self.sdr.text_to_sdr(&rec.content, false);
+                    cache.insert(rid.clone(), sdr_vec.clone());
+                    lookup.insert(rid.clone(), sdr_vec);
+                    computed += 1;
+                }
+            }
+            lookup
+        };
+        hotspots.sdr_vectors_built = sdr_lookup.len();
+        hotspots.sdr_vectors_computed = computed;
+        hotspots.sdr_vectors_reused = reused;
         timings.sdr_build_ms = t_sdr.elapsed().as_secs_f64() * 1000.0;
 
         let t35 = Instant::now();
@@ -1916,6 +2024,8 @@ impl Aura {
                 churn_rate: br.churn_rate,
             }
         };
+        hotspots.belief_total_beliefs = belief_phase_report.total_beliefs;
+        hotspots.belief_total_hypotheses = belief_phase_report.total_hypotheses;
         timings.belief_ms = t35.elapsed().as_secs_f64() * 1000.0;
 
         // Phase 3.7: Concept discovery (read-only — finds stable abstractions over beliefs)
@@ -1934,6 +2044,10 @@ impl Aura {
                 avg_abstraction_score: cr.avg_abstraction_score,
                 centroids_built: cr.centroids_built,
                 partitions_with_multiple_seeds: cr.partitions_with_multiple_seeds,
+                multi_seed_partition_sizes: cr.multi_seed_partition_sizes,
+                cluster_sizes: cr.cluster_sizes,
+                clusters_with_multiple_beliefs: cr.clusters_with_multiple_beliefs,
+                largest_cluster_size: cr.largest_cluster_size,
                 pairwise_comparisons: cr.pairwise_comparisons,
                 pairwise_above_threshold: cr.pairwise_above_threshold,
                 tanimoto_min: cr.tanimoto_min,
@@ -1942,6 +2056,9 @@ impl Aura {
                 avg_centroid_size: cr.avg_centroid_size,
             }
         };
+        hotspots.concept_pairwise_comparisons = concept_phase_report.pairwise_comparisons;
+        hotspots.concept_partitions_with_multiple_seeds =
+            concept_phase_report.partitions_with_multiple_seeds;
         timings.concept_ms = t37.elapsed().as_secs_f64() * 1000.0;
 
         // Phase 3.8: Causal pattern discovery (read-only — finds candidate causal relations)
@@ -1954,12 +2071,35 @@ impl Aura {
             let _ = self.causal_store.save(&causal_eng);
             background_brain::CausalPhaseReport {
                 edges_found: cr.edges_found,
+                explicit_edges_found: cr.explicit_edges_found,
+                temporal_edges_found: cr.temporal_edges_found,
+                temporal_namespaces_scanned: cr.temporal_namespaces_scanned,
+                temporal_pairs_considered: cr.temporal_pairs_considered,
+                temporal_pairs_skipped_by_budget: cr.temporal_pairs_skipped_by_budget,
+                temporal_edges_capped: cr.temporal_edges_capped,
+                temporal_namespaces_hit_cap: cr.temporal_namespaces_hit_cap,
                 candidates_found: cr.candidates_found,
+                patterns_meeting_support_gate: cr.patterns_meeting_support_gate,
+                patterns_meeting_repeated_window_gate: cr.patterns_meeting_repeated_window_gate,
+                patterns_meeting_counterfactual_gate: cr.patterns_meeting_counterfactual_gate,
+                patterns_blocked_by_evidence_gates: cr.patterns_blocked_by_evidence_gates,
+                patterns_blocked_by_counterfactual_gate: cr.patterns_blocked_by_counterfactual_gate,
                 stable_count: cr.stable_count,
                 rejected_count: cr.rejected_count,
                 avg_causal_strength: cr.avg_causal_strength,
             }
         };
+        hotspots.causal_edges_found = causal_phase_report.edges_found;
+        hotspots.causal_explicit_edges_found = causal_phase_report.explicit_edges_found;
+        hotspots.causal_temporal_edges_found = causal_phase_report.temporal_edges_found;
+        hotspots.causal_temporal_namespaces_scanned =
+            causal_phase_report.temporal_namespaces_scanned;
+        hotspots.causal_temporal_pairs_considered = causal_phase_report.temporal_pairs_considered;
+        hotspots.causal_temporal_pairs_skipped_by_budget =
+            causal_phase_report.temporal_pairs_skipped_by_budget;
+        hotspots.causal_temporal_edges_capped = causal_phase_report.temporal_edges_capped;
+        hotspots.causal_temporal_namespaces_hit_cap =
+            causal_phase_report.temporal_namespaces_hit_cap;
         timings.causal_ms = t38.elapsed().as_secs_f64() * 1000.0;
 
         // Phase 3.9: Policy hint discovery (read-only — advisory hints from causal patterns)
@@ -1981,6 +2121,7 @@ impl Aura {
                 avg_policy_strength: pr.avg_policy_strength,
             }
         };
+        hotspots.policy_seeds_found = policy_phase_report.seeds_found;
         timings.policy_ms = t39.elapsed().as_secs_f64() * 1000.0;
 
         // ── Compute cross-cycle identity stability ──
@@ -2100,20 +2241,20 @@ impl Aura {
         } else {
             0
         };
+        hotspots.cross_connections_found = cross_connections;
         timings.cross_connections_ms = t5.elapsed().as_secs_f64() * 1000.0;
 
         // Phase 6: Scheduled tasks + Phase 7: Archival
         let t67 = Instant::now();
-        let task_reminders = background_brain::check_scheduled_tasks(
-            &records,
-            &config.task_tag,
-        );
+        let task_reminders = background_brain::check_scheduled_tasks(&records, &config.task_tag);
+        hotspots.task_reminders_found = task_reminders.len();
 
         let records_archived = if config.archival_enabled {
             background_brain::archive_old_records(&mut records, &config, &taxonomy)
         } else {
             0
         };
+        hotspots.records_after_cycle = records.len();
         timings.tasks_archival_ms = t67.elapsed().as_secs_f64() * 1000.0;
 
         // Persist changes
@@ -2125,6 +2266,68 @@ impl Aura {
         self.structured_recall_cache.clear();
 
         timings.total_ms = cycle_start.elapsed().as_secs_f64() * 1000.0;
+        let phase_candidates = [
+            ("level_fix", timings.level_fix_ms),
+            ("decay", timings.decay_ms),
+            ("reflect", timings.reflect_ms),
+            ("epistemic", timings.epistemic_ms),
+            ("insights", timings.insights_ms),
+            ("sdr_build", timings.sdr_build_ms),
+            ("belief", timings.belief_ms),
+            ("concept", timings.concept_ms),
+            ("causal", timings.causal_ms),
+            ("policy", timings.policy_ms),
+            ("consolidation", timings.consolidation_ms),
+            ("cross_connections", timings.cross_connections_ms),
+            ("tasks_archival", timings.tasks_archival_ms),
+        ];
+        if let Some((name, ms)) = phase_candidates
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            hotspots.dominant_phase = (*name).to_string();
+            hotspots.dominant_phase_ms = *ms;
+            hotspots.dominant_phase_share = if timings.total_ms > 0.0 {
+                *ms / timings.total_ms
+            } else {
+                0.0
+            };
+        }
+
+        let concept_surface = {
+            let mode = self.get_concept_surface_mode();
+            let (surfaced_concepts_available, surfaced_namespaces) =
+                if mode == ConceptSurfaceMode::Inspect {
+                    let concept_eng = self.concept_engine.read();
+                    let surfaced = crate::concept::surface_concepts(&concept_eng, None);
+                    let namespaces: HashSet<String> =
+                        surfaced.iter().map(|c| c.namespace.clone()).collect();
+                    (surfaced.len(), namespaces.len())
+                } else {
+                    (0, 0)
+                };
+
+            background_brain::ConceptSurfaceTelemetry {
+                mode: format!("{mode:?}"),
+                surfaced_concepts_available,
+                surfaced_namespaces,
+                global_calls_since_last_cycle: self
+                    .concept_surface_global_calls
+                    .swap(0, Ordering::Relaxed),
+                namespace_calls_since_last_cycle: self
+                    .concept_surface_namespace_calls
+                    .swap(0, Ordering::Relaxed),
+                record_calls_since_last_cycle: self
+                    .concept_surface_record_calls
+                    .swap(0, Ordering::Relaxed),
+                concepts_returned_since_last_cycle: self
+                    .concept_surface_results_returned
+                    .swap(0, Ordering::Relaxed),
+                record_annotations_returned_since_last_cycle: self
+                    .concept_surface_record_results_returned
+                    .swap(0, Ordering::Relaxed),
+            }
+        };
 
         MaintenanceReport {
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -2143,6 +2346,8 @@ impl Aura {
             total_records,
             timings,
             stability,
+            concept_surface,
+            hotspots,
         }
     }
 
@@ -2180,43 +2385,83 @@ impl Aura {
     /// Optional filter by state: "resolved", "unresolved", "singleton", "empty".
     pub fn get_beliefs(&self, state_filter: Option<&str>) -> Vec<crate::belief::Belief> {
         let engine = self.belief_engine.read();
-        engine.beliefs.values()
-            .filter(|b| {
-                match state_filter {
-                    Some("resolved") => b.state == crate::belief::BeliefState::Resolved,
-                    Some("unresolved") => b.state == crate::belief::BeliefState::Unresolved,
-                    Some("singleton") => b.state == crate::belief::BeliefState::Singleton,
-                    Some("empty") => b.state == crate::belief::BeliefState::Empty,
-                    _ => true,
-                }
+        engine
+            .beliefs
+            .values()
+            .filter(|b| match state_filter {
+                Some("resolved") => b.state == crate::belief::BeliefState::Resolved,
+                Some("unresolved") => b.state == crate::belief::BeliefState::Unresolved,
+                Some("singleton") => b.state == crate::belief::BeliefState::Singleton,
+                Some("empty") => b.state == crate::belief::BeliefState::Empty,
+                _ => true,
             })
             .cloned()
             .collect()
     }
 
+    /// Return the belief that currently owns a record, if any.
+    pub fn get_belief_for_record(&self, record_id: &str) -> Option<crate::belief::Belief> {
+        let engine = self.belief_engine.read();
+        engine.belief_for_record(record_id).cloned()
+    }
+
     /// Return a snapshot of all current concepts (cloned).
     /// Optional filter by state: "stable", "candidate", "rejected".
-    pub fn get_concepts(&self, state_filter: Option<&str>) -> Vec<crate::concept::ConceptCandidate> {
+    pub fn get_concepts(
+        &self,
+        state_filter: Option<&str>,
+    ) -> Vec<crate::concept::ConceptCandidate> {
         let engine = self.concept_engine.read();
-        engine.concepts.values()
-            .filter(|c| {
-                match state_filter {
-                    Some("stable") => c.state == crate::concept::ConceptState::Stable,
-                    Some("candidate") => c.state == crate::concept::ConceptState::Candidate,
-                    Some("rejected") => c.state == crate::concept::ConceptState::Rejected,
-                    _ => true,
-                }
+        engine
+            .concepts
+            .values()
+            .filter(|c| match state_filter {
+                Some("stable") => c.state == crate::concept::ConceptState::Stable,
+                Some("candidate") => c.state == crate::concept::ConceptState::Candidate,
+                Some("rejected") => c.state == crate::concept::ConceptState::Rejected,
+                _ => true,
             })
             .cloned()
             .collect()
+    }
+
+    fn track_global_concept_surface_call(&self, returned: usize) {
+        self.concept_surface_global_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.concept_surface_results_returned
+            .fetch_add(returned as u64, Ordering::Relaxed);
+    }
+
+    fn track_namespace_concept_surface_call(&self, returned: usize) {
+        self.concept_surface_namespace_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.concept_surface_results_returned
+            .fetch_add(returned as u64, Ordering::Relaxed);
+    }
+
+    fn track_record_concept_surface_call(&self, returned: usize) {
+        self.concept_surface_record_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.concept_surface_results_returned
+            .fetch_add(returned as u64, Ordering::Relaxed);
+        self.concept_surface_record_results_returned
+            .fetch_add(returned as u64, Ordering::Relaxed);
     }
 
     /// Return surfaced concepts for external inspection.
     /// Returns bounded, sorted, provenance-checked concepts suitable for public consumption.
     /// This is inspection-only — surfaced concepts do not affect recall, compression, or behavior.
-    pub fn get_surfaced_concepts(&self, limit: Option<usize>) -> Vec<crate::concept::SurfacedConcept> {
+    pub fn get_surfaced_concepts(
+        &self,
+        limit: Option<usize>,
+    ) -> Vec<crate::concept::SurfacedConcept> {
+        if self.get_concept_surface_mode() != ConceptSurfaceMode::Inspect {
+            return Vec::new();
+        }
         let engine = self.concept_engine.read();
-        crate::concept::surface_concepts(&engine, limit)
+        let surfaced = crate::concept::surface_concepts(&engine, limit);
+        self.track_global_concept_surface_call(surfaced.len());
+        surfaced
     }
 
     /// Return surfaced concepts for a specific namespace.
@@ -2225,22 +2470,53 @@ impl Aura {
         namespace: &str,
         limit: Option<usize>,
     ) -> Vec<crate::concept::SurfacedConcept> {
+        if self.get_concept_surface_mode() != ConceptSurfaceMode::Inspect {
+            return Vec::new();
+        }
         let engine = self.concept_engine.read();
-        crate::concept::surface_concepts_filtered(&engine, limit, Some(namespace))
+        let surfaced = crate::concept::surface_concepts_filtered(&engine, limit, Some(namespace));
+        self.track_namespace_concept_surface_call(surfaced.len());
+        surfaced
+    }
+
+    /// Return surfaced concepts that contain the given record ID.
+    ///
+    /// This remains bounded and inspection-only, and follows the same runtime
+    /// rollout gate as other surfaced concept APIs.
+    pub fn get_surfaced_concepts_for_record(
+        &self,
+        record_id: &str,
+        limit: Option<usize>,
+    ) -> Vec<crate::concept::SurfacedConcept> {
+        if self.get_concept_surface_mode() != ConceptSurfaceMode::Inspect {
+            return Vec::new();
+        }
+        let max = limit.unwrap_or(3).min(3);
+        let engine = self.concept_engine.read();
+        let surfaced: Vec<_> = crate::concept::surface_concepts(&engine, None)
+            .into_iter()
+            .filter(|c| c.record_ids.iter().any(|rid| rid == record_id))
+            .take(max)
+            .collect();
+        self.track_record_concept_surface_call(surfaced.len());
+        surfaced
     }
 
     /// Return a snapshot of all current causal patterns (cloned).
     /// Optional filter by state: "stable", "candidate", "rejected".
-    pub fn get_causal_patterns(&self, state_filter: Option<&str>) -> Vec<crate::causal::CausalPattern> {
+    pub fn get_causal_patterns(
+        &self,
+        state_filter: Option<&str>,
+    ) -> Vec<crate::causal::CausalPattern> {
         let engine = self.causal_engine.read();
-        engine.patterns.values()
-            .filter(|p| {
-                match state_filter {
-                    Some("stable") => p.state == crate::causal::CausalState::Stable,
-                    Some("candidate") => p.state == crate::causal::CausalState::Candidate,
-                    Some("rejected") => p.state == crate::causal::CausalState::Rejected,
-                    _ => true,
-                }
+        engine
+            .patterns
+            .values()
+            .filter(|p| match state_filter {
+                Some("stable") => p.state == crate::causal::CausalState::Stable,
+                Some("candidate") => p.state == crate::causal::CausalState::Candidate,
+                Some("rejected") => p.state == crate::causal::CausalState::Rejected,
+                _ => true,
             })
             .cloned()
             .collect()
@@ -2250,15 +2526,15 @@ impl Aura {
     /// Optional filter by state: "stable", "candidate", "suppressed", "rejected".
     pub fn get_policy_hints(&self, state_filter: Option<&str>) -> Vec<crate::policy::PolicyHint> {
         let engine = self.policy_engine.read();
-        engine.hints.values()
-            .filter(|h| {
-                match state_filter {
-                    Some("stable") => h.state == crate::policy::PolicyState::Stable,
-                    Some("candidate") => h.state == crate::policy::PolicyState::Candidate,
-                    Some("suppressed") => h.state == crate::policy::PolicyState::Suppressed,
-                    Some("rejected") => h.state == crate::policy::PolicyState::Rejected,
-                    _ => true,
-                }
+        engine
+            .hints
+            .values()
+            .filter(|h| match state_filter {
+                Some("stable") => h.state == crate::policy::PolicyState::Stable,
+                Some("candidate") => h.state == crate::policy::PolicyState::Candidate,
+                Some("suppressed") => h.state == crate::policy::PolicyState::Suppressed,
+                Some("rejected") => h.state == crate::policy::PolicyState::Rejected,
+                _ => true,
             })
             .cloned()
             .collect()
@@ -2272,7 +2548,10 @@ impl Aura {
     /// Only surfaces Stable hints and strong Candidates (policy_strength >= 0.70,
     /// confidence >= 0.55) with complete provenance. Bounded to 10 global,
     /// 3 per domain.
-    pub fn get_surfaced_policy_hints(&self, limit: Option<usize>) -> Vec<crate::policy::SurfacedPolicyHint> {
+    pub fn get_surfaced_policy_hints(
+        &self,
+        limit: Option<usize>,
+    ) -> Vec<crate::policy::SurfacedPolicyHint> {
         let engine = self.policy_engine.read();
         crate::policy::surface_policy_hints(&engine, limit)
     }
@@ -2295,13 +2574,15 @@ impl Aura {
     /// - `Shadow`: compute shadow scores for logging, do not alter ranking
     /// - `Limited`: apply bounded reranking (±5% score cap, ±2 position cap)
     pub fn set_belief_rerank_mode(&self, mode: recall::BeliefRerankMode) {
-        self.belief_rerank_mode.store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+        self.belief_rerank_mode
+            .store(mode as u8, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get current belief reranking mode.
     pub fn get_belief_rerank_mode(&self) -> recall::BeliefRerankMode {
         recall::BeliefRerankMode::from_u8(
-            self.belief_rerank_mode.load(std::sync::atomic::Ordering::Relaxed)
+            self.belief_rerank_mode
+                .load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 
@@ -2366,6 +2647,80 @@ impl Aura {
         engine.similarity_mode
     }
 
+    /// Set the concept partition mode (Standard or NamespaceOnly).
+    /// Takes effect on the next `run_maintenance()` call.
+    pub fn set_concept_partition_mode(&self, mode: ConceptPartitionMode) {
+        let mut engine = self.concept_engine.write();
+        engine.partition_mode = mode;
+    }
+
+    /// Get current concept partition mode.
+    pub fn get_concept_partition_mode(&self) -> ConceptPartitionMode {
+        let engine = self.concept_engine.read();
+        engine.partition_mode
+    }
+
+    /// Set the concept union relaxation mode.
+    /// Takes effect on the next `run_maintenance()` call.
+    pub fn set_concept_union_mode(&self, mode: crate::concept::ConceptUnionMode) {
+        let mut engine = self.concept_engine.write();
+        engine.union_mode = mode;
+    }
+
+    /// Get current concept union relaxation mode.
+    pub fn get_concept_union_mode(&self) -> crate::concept::ConceptUnionMode {
+        let engine = self.concept_engine.read();
+        engine.union_mode
+    }
+
+    /// Set the concept surfaced output rollout mode.
+    ///
+    /// - `Off`: no surfaced concept output (default)
+    /// - `Inspect`: bounded inspection-only surfaced concepts
+    /// - `Limited`: reserved for future controlled promotion work
+    pub fn set_concept_surface_mode(&self, mode: ConceptSurfaceMode) {
+        self.concept_surface_mode
+            .store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Get current concept surfaced output rollout mode.
+    pub fn get_concept_surface_mode(&self) -> ConceptSurfaceMode {
+        match self
+            .concept_surface_mode
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            1 => ConceptSurfaceMode::Inspect,
+            2 => ConceptSurfaceMode::Limited,
+            _ => ConceptSurfaceMode::Off,
+        }
+    }
+
+    /// Set the temporal causal edge budgeting mode.
+    /// Takes effect on the next `run_maintenance()` call.
+    pub fn set_causal_temporal_budget_mode(&self, mode: TemporalEdgeBudgetMode) {
+        let mut engine = self.causal_engine.write();
+        engine.temporal_budget_mode = mode;
+    }
+
+    /// Get current temporal causal edge budgeting mode.
+    pub fn get_causal_temporal_budget_mode(&self) -> TemporalEdgeBudgetMode {
+        let engine = self.causal_engine.read();
+        engine.temporal_budget_mode
+    }
+
+    /// Set the causal evidence gating mode.
+    /// Takes effect on the next `run_maintenance()` call.
+    pub fn set_causal_evidence_mode(&self, mode: CausalEvidenceMode) {
+        let mut engine = self.causal_engine.write();
+        engine.evidence_mode = mode;
+    }
+
+    /// Get current causal evidence gating mode.
+    pub fn get_causal_evidence_mode(&self) -> CausalEvidenceMode {
+        let engine = self.causal_engine.read();
+        engine.evidence_mode
+    }
+
     // ── SDK Wrapper: Research Orchestrator ──
 
     /// Start a new research project.
@@ -2381,27 +2736,32 @@ impl Aura {
         result: &str,
         url: Option<&str>,
     ) -> Result<()> {
-        self.research_engine.add_finding(project_id, query, result, url)
+        self.research_engine
+            .add_finding(project_id, query, result, url)
             .map_err(|e| anyhow::anyhow!(e))
     }
 
     /// Complete a research project and store as a record.
-    pub fn complete_research(
-        &self,
-        project_id: &str,
-        synthesis: Option<String>,
-    ) -> Result<Record> {
-        let project = self.research_engine.complete_research(project_id, synthesis)
+    pub fn complete_research(&self, project_id: &str, synthesis: Option<String>) -> Result<Record> {
+        let project = self
+            .research_engine
+            .complete_research(project_id, synthesis)
             .map_err(|e| anyhow::anyhow!(e))?;
 
         // Build content from project
         let content = if let Some(ref syn) = project.synthesis {
             format!("Research: {}\n\n{}", project.topic, syn)
         } else {
-            let findings: Vec<String> = project.findings.iter()
+            let findings: Vec<String> = project
+                .findings
+                .iter()
                 .map(|f| format!("- {}: {}", f.query, f.result))
                 .collect();
-            format!("Research: {}\n\nFindings:\n{}", project.topic, findings.join("\n"))
+            format!(
+                "Research: {}\n\nFindings:\n{}",
+                project.topic,
+                findings.join("\n")
+            )
         };
 
         // Store as a record
@@ -2461,7 +2821,8 @@ impl Aura {
                 Some(merged),
                 None,
             )?;
-            return self.get(&existing_rec.id)
+            return self
+                .get(&existing_rec.id)
                 .ok_or_else(|| anyhow::anyhow!("Profile record disappeared"));
         }
 
@@ -2526,7 +2887,8 @@ impl Aura {
                 Some(metadata),
                 None,
             )?;
-            return self.get(&existing_rec.id)
+            return self
+                .get(&existing_rec.id)
                 .ok_or_else(|| anyhow::anyhow!("Persona record disappeared"));
         }
 
@@ -2558,7 +2920,8 @@ impl Aura {
             None,
         );
         results.first().and_then(|r| {
-            r.metadata.get("persona_json")
+            r.metadata
+                .get("persona_json")
                 .and_then(|json| serde_json::from_str(json).ok())
         })
     }
@@ -2724,14 +3087,20 @@ impl Aura {
         rec.metadata.insert(last_key.into(), format!("{:.3}", now));
 
         if useful {
-            let prev: u32 = rec.metadata.get(pos_key)
-                .and_then(|v| v.parse().ok()).unwrap_or(0);
+            let prev: u32 = rec
+                .metadata
+                .get(pos_key)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             rec.metadata.insert(pos_key.into(), (prev + 1).to_string());
             // Positive: boost strength (like an activation, but weaker)
             rec.strength = (rec.strength + 0.1).min(1.0);
         } else {
-            let prev: u32 = rec.metadata.get(neg_key)
-                .and_then(|v| v.parse().ok()).unwrap_or(0);
+            let prev: u32 = rec
+                .metadata
+                .get(neg_key)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             rec.metadata.insert(neg_key.into(), (prev + 1).to_string());
             // Negative: weaken strength
             rec.strength = (rec.strength - 0.15).max(0.0);
@@ -2752,10 +3121,16 @@ impl Aura {
         let records = self.records.read();
         let rec = records.get(record_id)?;
 
-        let pos: u32 = rec.metadata.get("feedback_positive")
-            .and_then(|v| v.parse().ok()).unwrap_or(0);
-        let neg: u32 = rec.metadata.get("feedback_negative")
-            .and_then(|v| v.parse().ok()).unwrap_or(0);
+        let pos: u32 = rec
+            .metadata
+            .get("feedback_positive")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let neg: u32 = rec
+            .metadata
+            .get("feedback_negative")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
 
         Some((pos, neg, pos as i32 - neg as i32))
     }
@@ -2780,11 +3155,14 @@ impl Aura {
         // Validate old record exists
         {
             let mut records = self.records.write();
-            let old_rec = records.get_mut(old_id)
+            let old_rec = records
+                .get_mut(old_id)
                 .ok_or_else(|| anyhow::anyhow!("Record '{}' not found", old_id))?;
 
             // Mark as superseded
-            old_rec.metadata.insert("superseded_by".into(), "pending".into());
+            old_rec
+                .metadata
+                .insert("superseded_by".into(), "pending".into());
             old_rec.strength *= 0.5; // Halve strength — still findable but de-ranked
             self.cognitive_store.append_update(old_rec)?;
         }
@@ -2820,7 +3198,9 @@ impl Aura {
         {
             let mut records = self.records.write();
             if let Some(old_rec) = records.get_mut(old_id) {
-                old_rec.metadata.insert("superseded_by".into(), new_rec.id.clone());
+                old_rec
+                    .metadata
+                    .insert("superseded_by".into(), new_rec.id.clone());
                 let _ = self.cognitive_store.append_update(old_rec);
             }
         }
@@ -2835,7 +3215,8 @@ impl Aura {
     /// Returns `Some(new_record_id)` if superseded, `None` otherwise.
     pub fn superseded_by(&self, record_id: &str) -> Option<String> {
         let records = self.records.read();
-        records.get(record_id)
+        records
+            .get(record_id)
             .and_then(|r| r.metadata.get("superseded_by"))
             .filter(|v| !v.is_empty() && *v != "pending")
             .cloned()
@@ -2909,8 +3290,13 @@ impl Aura {
             return Err(anyhow::anyhow!("Label must be 1-64 characters"));
         }
         // Only allow safe chars in label (alphanumeric, dash, underscore)
-        if !label.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
-            return Err(anyhow::anyhow!("Label must contain only alphanumeric, dash, or underscore characters"));
+        if !label
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(anyhow::anyhow!(
+                "Label must contain only alphanumeric, dash, or underscore characters"
+            ));
         }
 
         // Flush pending writes
@@ -2958,7 +3344,10 @@ impl Aura {
         for rec in imported {
             ngram.add(&rec.id, &rec.content);
             for tag in &rec.tags {
-                tag_idx.entry(tag.clone()).or_default().insert(rec.id.clone());
+                tag_idx
+                    .entry(tag.clone())
+                    .or_default()
+                    .insert(rec.id.clone());
             }
             if let Some(ref aid) = rec.aura_id {
                 aura_idx.insert(aid.clone(), rec.id.clone());
@@ -2991,7 +3380,8 @@ impl Aura {
 
         let added: Vec<String> = keys_b.difference(&keys_a).map(|s| (*s).clone()).collect();
         let removed: Vec<String> = keys_a.difference(&keys_b).map(|s| (*s).clone()).collect();
-        let modified: Vec<String> = keys_a.intersection(&keys_b)
+        let modified: Vec<String> = keys_a
+            .intersection(&keys_b)
             .filter(|id| {
                 let a = &snap_a[**id];
                 let b = &snap_b[**id];
@@ -3010,10 +3400,10 @@ impl Aura {
     /// List available snapshot labels.
     pub fn list_snapshots(&self) -> Vec<String> {
         let dir = self.path.parent().unwrap_or(Path::new("."));
-        let prefix = format!("{}_snapshot_",
-            self.path.file_stem()
-                .unwrap_or_default()
-                .to_string_lossy());
+        let prefix = format!(
+            "{}_snapshot_",
+            self.path.file_stem().unwrap_or_default().to_string_lossy()
+        );
 
         let mut labels = Vec::new();
         if let Ok(entries) = std::fs::read_dir(dir) {
@@ -3036,9 +3426,7 @@ impl Aura {
 
     /// Helper: build snapshot file path.
     fn snapshot_path(&self, label: &str) -> PathBuf {
-        let stem = self.path.file_stem()
-            .unwrap_or_default()
-            .to_string_lossy();
+        let stem = self.path.file_stem().unwrap_or_default().to_string_lossy();
         let dir = self.path.parent().unwrap_or(Path::new("."));
         dir.join(format!("{}_snapshot_{}.json", stem, label))
     }
@@ -3057,35 +3445,33 @@ impl Aura {
         top_k: Option<usize>,
         namespaces: Option<&[&str]>,
     ) -> Result<String> {
-        let results = self.recall_structured(
-            query,
-            top_k,
-            None,
-            None,
-            None,
-            namespaces,
-        )?;
+        let results = self.recall_structured(query, top_k, None, None, None, namespaces)?;
 
         // Build portable fragment with provenance
-        let fragment: Vec<serde_json::Value> = results.iter().map(|(score, rec)| {
-            let mut meta = rec.metadata.clone();
-            meta.insert("shared_score".into(), format!("{:.4}", score));
-            meta.insert("shared_from".into(),
-                self.path.to_string_lossy().to_string());
+        let fragment: Vec<serde_json::Value> = results
+            .iter()
+            .map(|(score, rec)| {
+                let mut meta = rec.metadata.clone();
+                meta.insert("shared_score".into(), format!("{:.4}", score));
+                meta.insert(
+                    "shared_from".into(),
+                    self.path.to_string_lossy().to_string(),
+                );
 
-            serde_json::json!({
-                "id": rec.id,
-                "content": rec.content,
-                "level": rec.level.name(),
-                "strength": rec.strength,
-                "tags": rec.tags,
-                "created_at": rec.created_at,
-                "source_type": rec.source_type,
-                "content_type": rec.content_type,
-                "metadata": meta,
-                "namespace": rec.namespace,
+                serde_json::json!({
+                    "id": rec.id,
+                    "content": rec.content,
+                    "level": rec.level.name(),
+                    "strength": rec.strength,
+                    "tags": rec.tags,
+                    "created_at": rec.created_at,
+                    "source_type": rec.source_type,
+                    "content_type": rec.content_type,
+                    "metadata": meta,
+                    "namespace": rec.namespace,
+                })
             })
-        }).collect();
+            .collect();
 
         let envelope = serde_json::json!({
             "version": "1.0",
@@ -3107,25 +3493,33 @@ impl Aura {
     pub fn import_context(&self, fragment_json: &str) -> Result<usize> {
         let envelope: serde_json::Value = serde_json::from_str(fragment_json)?;
 
-        let format = envelope.get("format")
+        let format = envelope
+            .get("format")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if format != "aura_context" {
-            return Err(anyhow::anyhow!("Unknown format: '{}'. Expected 'aura_context'", format));
+            return Err(anyhow::anyhow!(
+                "Unknown format: '{}'. Expected 'aura_context'",
+                format
+            ));
         }
 
-        let records_val = envelope.get("records")
+        let records_val = envelope
+            .get("records")
             .ok_or_else(|| anyhow::anyhow!("Missing 'records' field"))?;
-        let records_arr = records_val.as_array()
+        let records_arr = records_val
+            .as_array()
             .ok_or_else(|| anyhow::anyhow!("'records' must be an array"))?;
 
         let mut imported = 0;
         for item in records_arr {
-            let content = item.get("content")
+            let content = item
+                .get("content")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Record missing 'content'"))?;
 
-            let level_str = item.get("level")
+            let level_str = item
+                .get("level")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Working");
             let level = match level_str.to_uppercase().as_str() {
@@ -3136,14 +3530,16 @@ impl Aura {
                 _ => Level::Working,
             };
 
-            let mut tags: Vec<String> = item.get("tags")
+            let mut tags: Vec<String> = item
+                .get("tags")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
             if !tags.contains(&"shared".to_string()) {
                 tags.push("shared".into());
             }
 
-            let mut metadata: HashMap<String, String> = item.get("metadata")
+            let mut metadata: HashMap<String, String> = item
+                .get("metadata")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
             metadata.insert("trust_external".into(), "true".into());
@@ -3201,7 +3597,10 @@ impl Aura {
         for rec in imported {
             ngram.add(&rec.id, &rec.content);
             for tag in &rec.tags {
-                tag_idx.entry(tag.clone()).or_default().insert(rec.id.clone());
+                tag_idx
+                    .entry(tag.clone())
+                    .or_default()
+                    .insert(rec.id.clone());
             }
             self.cognitive_store.append_store(&rec)?;
             records.insert(rec.id.clone(), rec);
@@ -3232,7 +3631,10 @@ impl Aura {
             None,
             None,
         )?;
-        Ok(format!("Stored record {} (level={})", result.id, result.level))
+        Ok(format!(
+            "Stored record {} (level={})",
+            result.id, result.level
+        ))
     }
 
     /// Legacy-compatible delete helper for server mode.
@@ -3266,10 +3668,16 @@ impl Aura {
     }
 
     /// Paginated memory listing for server mode.
-    pub fn list_memories(&self, offset: usize, limit: usize, filter_dna: Option<&str>) -> (Vec<StoredRecord>, usize) {
+    pub fn list_memories(
+        &self,
+        offset: usize,
+        limit: usize,
+        filter_dna: Option<&str>,
+    ) -> (Vec<StoredRecord>, usize) {
         let cache = self.storage.header_cache.read();
 
-        let mut entries: Vec<_> = cache.values()
+        let mut entries: Vec<_> = cache
+            .values()
             .filter(|h| match filter_dna {
                 Some(dna) if dna == "phantom" => h.dna == "phantom",
                 Some(dna) if dna != "all" => h.dna == dna,
@@ -3349,25 +3757,30 @@ impl Aura {
 
     /// O(1) sequence prediction based on temporal links.
     pub fn retrieve_prediction(&self, current_id: &str) -> Result<Option<StoredRecord>> {
-        Ok(self.storage.get_prediction(current_id).map(|next| StoredRecord {
-            id: next.id.clone(),
-            dna: next.dna.clone(),
-            timestamp: next.timestamp(),
-            intensity: next.intensity(),
-            stability: next.stability(),
-            decay_velocity: next.decay_velocity(),
-            entropy: next.entropy(),
-            sdr_indices: next.sdr_indices.clone(),
-            text: next.text.clone(),
-            offset: 0,
-        }))
+        Ok(self
+            .storage
+            .get_prediction(current_id)
+            .map(|next| StoredRecord {
+                id: next.id.clone(),
+                dna: next.dna.clone(),
+                timestamp: next.timestamp(),
+                intensity: next.intensity(),
+                stability: next.stability(),
+                decay_velocity: next.decay_velocity(),
+                entropy: next.entropy(),
+                sdr_indices: next.sdr_indices.clone(),
+                text: next.text.clone(),
+                offset: 0,
+            }))
     }
 
     /// Surprise metric: 1 - Tanimoto(predicted, actual).
     pub fn surprise(&self, predicted_id: &str, actual_text: &str) -> Result<f32> {
         let actual_sdr = self.sdr.text_to_sdr(actual_text, false);
         if let Some(predicted) = self.storage.get_header(predicted_id) {
-            let similarity = self.sdr.tanimoto_sparse(&predicted.sdr_indices, &actual_sdr);
+            let similarity = self
+                .sdr
+                .tanimoto_sparse(&predicted.sdr_indices, &actual_sdr);
             Ok(1.0 - similarity)
         } else {
             Ok(1.0)
@@ -3420,7 +3833,8 @@ impl Aura {
     /// List all distinct namespaces present in the brain.
     pub fn list_namespaces(&self) -> Vec<String> {
         let records = self.records.read();
-        let mut ns_set: std::collections::HashSet<String> = records.values().map(|r| r.namespace.clone()).collect();
+        let mut ns_set: std::collections::HashSet<String> =
+            records.values().map(|r| r.namespace.clone()).collect();
         ns_set.insert(crate::record::DEFAULT_NAMESPACE.to_string());
         let mut sorted: Vec<String> = ns_set.into_iter().collect();
         sorted.sort();
@@ -3446,9 +3860,11 @@ impl Aura {
         rec.namespace = new_namespace.to_string();
 
         // 3. Determine which outgoing connections are now cross-namespace
-        let cross_ns_ids: Vec<String> = outgoing_keys.into_iter()
+        let cross_ns_ids: Vec<String> = outgoing_keys
+            .into_iter()
             .filter(|cid| {
-                records.get(cid.as_str())
+                records
+                    .get(cid.as_str())
                     .map(|r| r.namespace != new_namespace)
                     .unwrap_or(false)
             })
@@ -3462,8 +3878,13 @@ impl Aura {
         }
 
         // 5. Prune incoming connections from old-namespace records pointing to this one
-        let peers_to_clean: Vec<String> = records.iter()
-            .filter(|(id, r)| *id != record_id && r.namespace == old_namespace && r.connections.contains_key(record_id))
+        let peers_to_clean: Vec<String> = records
+            .iter()
+            .filter(|(id, r)| {
+                *id != record_id
+                    && r.namespace == old_namespace
+                    && r.connections.contains_key(record_id)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for pid in &peers_to_clean {
@@ -3472,7 +3893,9 @@ impl Aura {
             }
         }
 
-        let _ = self.cognitive_store.append_update(records.get(record_id).unwrap());
+        let _ = self
+            .cognitive_store
+            .append_update(records.get(record_id).unwrap());
         self.recall_cache.clear();
         self.structured_recall_cache.clear();
         Some(records.get(record_id).unwrap().clone())
@@ -3497,7 +3920,9 @@ impl Aura {
 /// - `"sandbox"` → `Some(vec!["sandbox"])`
 /// - `["default", "sandbox"]` → `Some(vec!["default", "sandbox"])`
 #[cfg(feature = "python")]
-fn extract_namespaces(ns: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>) -> PyResult<Option<Vec<String>>> {
+fn extract_namespaces(
+    ns: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>,
+) -> PyResult<Option<Vec<String>>> {
     use pyo3::prelude::*;
     match ns {
         None => Ok(None),
@@ -3511,7 +3936,7 @@ fn extract_namespaces(ns: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>) -> PyRes
                 return Ok(Some(list));
             }
             Err(pyo3::exceptions::PyTypeError::new_err(
-                "namespace must be a str, list[str], or None"
+                "namespace must be a str, list[str], or None",
             ))
         }
     }
@@ -3551,9 +3976,25 @@ impl Aura {
         namespace: Option<&str>,
         semantic_type: Option<&str>,
     ) -> PyResult<String> {
-        let rec = py.allow_threads(|| {
-            self.store_with_channel(content, level, tags, pin, content_type, source_type, metadata, deduplicate, caused_by_id, channel, auto_promote, namespace, semantic_type)
-        }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let rec = py
+            .allow_threads(|| {
+                self.store_with_channel(
+                    content,
+                    level,
+                    tags,
+                    pin,
+                    content_type,
+                    source_type,
+                    metadata,
+                    deduplicate,
+                    caused_by_id,
+                    channel,
+                    auto_promote,
+                    namespace,
+                    semantic_type,
+                )
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(rec.id.clone())
     }
 
@@ -3569,11 +4010,21 @@ impl Aura {
         namespace: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>,
     ) -> PyResult<String> {
         let ns_vec = extract_namespaces(namespace)?;
-        let ns_refs: Option<Vec<&str>> = ns_vec.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+        let ns_refs: Option<Vec<&str>> = ns_vec
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
         let ns_slice: Option<&[&str]> = ns_refs.as_deref();
         py.allow_threads(|| {
-            self.recall(query, token_budget, min_strength, expand_connections, session_id, ns_slice)
-        }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            self.recall(
+                query,
+                token_budget,
+                min_strength,
+                expand_connections,
+                session_id,
+                ns_slice,
+            )
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     #[pyo3(name = "recall_structured", signature = (query, top_k=None, min_strength=None, expand_connections=None, session_id=None, namespace=None))]
@@ -3588,11 +4039,22 @@ impl Aura {
         namespace: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>,
     ) -> PyResult<Vec<PyObject>> {
         let ns_vec = extract_namespaces(namespace)?;
-        let ns_refs: Option<Vec<&str>> = ns_vec.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+        let ns_refs: Option<Vec<&str>> = ns_vec
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
         let ns_slice: Option<&[&str]> = ns_refs.as_deref();
-        let results = py.allow_threads(|| {
-            self.recall_structured(query, top_k, min_strength, expand_connections, session_id, ns_slice)
-        }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let results = py
+            .allow_threads(|| {
+                self.recall_structured(
+                    query,
+                    top_k,
+                    min_strength,
+                    expand_connections,
+                    session_id,
+                    ns_slice,
+                )
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         let mut py_results = Vec::new();
         for (score, rec) in results {
@@ -3610,6 +4072,27 @@ impl Aura {
             }
             if let Some(source) = rec.metadata.get("source") {
                 dict.set_item("source", source)?;
+            }
+            if self.get_concept_surface_mode() == ConceptSurfaceMode::Inspect {
+                let concepts = self.get_surfaced_concepts_for_record(&rec.id, Some(3));
+                if !concepts.is_empty() {
+                    let py_concepts = pyo3::types::PyList::empty_bound(py);
+                    for concept in concepts {
+                        let cdict = pyo3::types::PyDict::new_bound(py);
+                        cdict.set_item("id", concept.id)?;
+                        cdict.set_item("key", concept.key)?;
+                        cdict.set_item("state", concept.state)?;
+                        cdict.set_item("namespace", concept.namespace)?;
+                        cdict.set_item("semantic_type", concept.semantic_type)?;
+                        cdict.set_item("core_terms", concept.core_terms)?;
+                        cdict.set_item("tags", concept.tags)?;
+                        cdict.set_item("abstraction_score", concept.abstraction_score)?;
+                        cdict.set_item("confidence", concept.confidence)?;
+                        cdict.set_item("cluster_size", concept.cluster_size)?;
+                        py_concepts.append(cdict)?;
+                    }
+                    dict.set_item("concepts", py_concepts)?;
+                }
             }
             py_results.push(dict.unbind().into_any());
         }
@@ -3630,11 +4113,23 @@ impl Aura {
         namespace: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>,
     ) -> PyResult<Vec<PyObject>> {
         let ns_vec = extract_namespaces(namespace)?;
-        let ns_refs: Option<Vec<&str>> = ns_vec.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+        let ns_refs: Option<Vec<&str>> = ns_vec
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
         let ns_slice: Option<&[&str]> = ns_refs.as_deref();
-        let results = py.allow_threads(|| {
-            self.recall_at(query, timestamp, top_k, min_strength, expand_connections, session_id, ns_slice)
-        }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let results = py
+            .allow_threads(|| {
+                self.recall_at(
+                    query,
+                    timestamp,
+                    top_k,
+                    min_strength,
+                    expand_connections,
+                    session_id,
+                    ns_slice,
+                )
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         let mut py_results = Vec::new();
         for (score, rec) in results {
@@ -3650,6 +4145,27 @@ impl Aura {
             if let Some(trust) = rec.metadata.get("trust_score") {
                 dict.set_item("trust", trust)?;
             }
+            if self.get_concept_surface_mode() == ConceptSurfaceMode::Inspect {
+                let concepts = self.get_surfaced_concepts_for_record(&rec.id, Some(3));
+                if !concepts.is_empty() {
+                    let py_concepts = pyo3::types::PyList::empty_bound(py);
+                    for concept in concepts {
+                        let cdict = pyo3::types::PyDict::new_bound(py);
+                        cdict.set_item("id", concept.id)?;
+                        cdict.set_item("key", concept.key)?;
+                        cdict.set_item("state", concept.state)?;
+                        cdict.set_item("namespace", concept.namespace)?;
+                        cdict.set_item("semantic_type", concept.semantic_type)?;
+                        cdict.set_item("core_terms", concept.core_terms)?;
+                        cdict.set_item("tags", concept.tags)?;
+                        cdict.set_item("abstraction_score", concept.abstraction_score)?;
+                        cdict.set_item("confidence", concept.confidence)?;
+                        cdict.set_item("cluster_size", concept.cluster_size)?;
+                        py_concepts.append(cdict)?;
+                    }
+                    dict.set_item("concepts", py_concepts)?;
+                }
+            }
             py_results.push(dict.unbind().into_any());
         }
         Ok(py_results)
@@ -3658,9 +4174,9 @@ impl Aura {
     /// Return access/strength timeline snapshot for a single record.
     #[pyo3(name = "history")]
     fn py_history(&self, py: Python<'_>, record_id: &str) -> PyResult<PyObject> {
-        let info = py.allow_threads(|| {
-            self.history(record_id)
-        }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let info = py
+            .allow_threads(|| self.history(record_id))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         let dict = pyo3::types::PyDict::new_bound(py);
         for (k, v) in &info {
@@ -3682,11 +4198,23 @@ impl Aura {
         namespace: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>,
     ) -> PyResult<Vec<PyObject>> {
         let ns_vec = extract_namespaces(namespace)?;
-        let ns_refs: Option<Vec<&str>> = ns_vec.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+        let ns_refs: Option<Vec<&str>> = ns_vec
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
         let ns_slice: Option<&[&str]> = ns_refs.as_deref();
-        let results = py.allow_threads(|| {
-            self.recall_full(query, top_k, include_failures, min_strength, expand_connections, session_id, ns_slice)
-        }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let results = py
+            .allow_threads(|| {
+                self.recall_full(
+                    query,
+                    top_k,
+                    include_failures,
+                    min_strength,
+                    expand_connections,
+                    session_id,
+                    ns_slice,
+                )
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         let mut py_results = Vec::new();
         for (score, rec) in results {
@@ -3704,6 +4232,27 @@ impl Aura {
             }
             if let Some(source) = rec.metadata.get("source") {
                 dict.set_item("source", source)?;
+            }
+            if self.get_concept_surface_mode() == ConceptSurfaceMode::Inspect {
+                let concepts = self.get_surfaced_concepts_for_record(&rec.id, Some(3));
+                if !concepts.is_empty() {
+                    let py_concepts = pyo3::types::PyList::empty_bound(py);
+                    for concept in concepts {
+                        let cdict = pyo3::types::PyDict::new_bound(py);
+                        cdict.set_item("id", concept.id)?;
+                        cdict.set_item("key", concept.key)?;
+                        cdict.set_item("state", concept.state)?;
+                        cdict.set_item("namespace", concept.namespace)?;
+                        cdict.set_item("semantic_type", concept.semantic_type)?;
+                        cdict.set_item("core_terms", concept.core_terms)?;
+                        cdict.set_item("tags", concept.tags)?;
+                        cdict.set_item("abstraction_score", concept.abstraction_score)?;
+                        cdict.set_item("confidence", concept.confidence)?;
+                        cdict.set_item("cluster_size", concept.cluster_size)?;
+                        py_concepts.append(cdict)?;
+                    }
+                    dict.set_item("concepts", py_concepts)?;
+                }
             }
             py_results.push(dict.unbind().into_any());
         }
@@ -3724,9 +4273,22 @@ impl Aura {
         semantic_type: Option<&str>,
     ) -> PyResult<Vec<Record>> {
         let ns_vec = extract_namespaces(namespace)?;
-        let ns_refs: Option<Vec<&str>> = ns_vec.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+        let ns_refs: Option<Vec<&str>> = ns_vec
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
         let ns_slice: Option<&[&str]> = ns_refs.as_deref();
-        Ok(py.allow_threads(|| self.search(query, level, tags, limit, content_type, source_type, ns_slice, semantic_type)))
+        Ok(py.allow_threads(|| {
+            self.search(
+                query,
+                level,
+                tags,
+                limit,
+                content_type,
+                source_type,
+                ns_slice,
+                semantic_type,
+            )
+        }))
     }
 
     #[pyo3(name = "get")]
@@ -3751,12 +4313,26 @@ impl Aura {
         metadata: Option<HashMap<String, String>>,
         source_type: Option<&str>,
     ) -> PyResult<Option<Record>> {
-        self.update(record_id, content, level, tags, strength, metadata, source_type)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        self.update(
+            record_id,
+            content,
+            level,
+            tags,
+            strength,
+            metadata,
+            source_type,
+        )
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     #[pyo3(name = "connect", signature = (id_a, id_b, weight=None, relationship=None))]
-    fn py_connect(&self, id_a: &str, id_b: &str, weight: Option<f32>, relationship: Option<&str>) -> PyResult<()> {
+    fn py_connect(
+        &self,
+        id_a: &str,
+        id_b: &str,
+        weight: Option<f32>,
+        relationship: Option<&str>,
+    ) -> PyResult<()> {
         self.connect(id_a, id_b, weight, relationship)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
@@ -3794,9 +4370,12 @@ impl Aura {
             Some(1) => crate::insights::detect_phase1(&records),
             Some(2) => crate::insights::detect_phase2(&records),
             None => crate::insights::detect_all(&records),
-            Some(p) => return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Invalid phase {}. Must be 0, 1, or 2.", p),
-            )),
+            Some(p) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid phase {}. Must be 0, 1, or 2.",
+                    p
+                )))
+            }
         };
 
         let results: Vec<PyObject> = raw
@@ -3805,11 +4384,14 @@ impl Aura {
                 let dict = pyo3::types::PyDict::new_bound(py);
                 let _ = dict.set_item("insight_type", &insight.insight_type);
                 let _ = dict.set_item("severity", format!("{:?}", insight.severity));
-                let _ = dict.set_item("phase", match insight.phase {
-                    crate::insights::Phase::RecordHealth => "record_health",
-                    crate::insights::Phase::Relationships => "relationships",
-                    crate::insights::Phase::CrossDomain => "cross_domain",
-                });
+                let _ = dict.set_item(
+                    "phase",
+                    match insight.phase {
+                        crate::insights::Phase::RecordHealth => "record_health",
+                        crate::insights::Phase::Relationships => "relationships",
+                        crate::insights::Phase::CrossDomain => "cross_domain",
+                    },
+                );
                 let _ = dict.set_item("record_ids", &insight.record_ids);
                 let _ = dict.set_item("description", &insight.description);
                 let evidence_dict = pyo3::types::PyDict::new_bound(py);
@@ -3862,7 +4444,10 @@ impl Aura {
     }
 
     #[pyo3(name = "get_surfaced_concepts", signature = (limit=None))]
-    fn py_get_surfaced_concepts(&self, limit: Option<usize>) -> Vec<crate::concept::SurfacedConcept> {
+    fn py_get_surfaced_concepts(
+        &self,
+        limit: Option<usize>,
+    ) -> Vec<crate::concept::SurfacedConcept> {
         self.get_surfaced_concepts(limit)
     }
 
@@ -3876,7 +4461,10 @@ impl Aura {
     }
 
     #[pyo3(name = "get_surfaced_policy_hints", signature = (limit=None))]
-    fn py_get_surfaced_policy_hints(&self, limit: Option<usize>) -> Vec<crate::policy::SurfacedPolicyHint> {
+    fn py_get_surfaced_policy_hints(
+        &self,
+        limit: Option<usize>,
+    ) -> Vec<crate::policy::SurfacedPolicyHint> {
         self.get_surfaced_policy_hints(limit)
     }
 
@@ -3905,7 +4493,12 @@ impl Aura {
     }
 
     #[pyo3(name = "start_research", signature = (topic, depth=None))]
-    fn py_start_research(&self, py: Python<'_>, topic: &str, depth: Option<&str>) -> PyResult<PyObject> {
+    fn py_start_research(
+        &self,
+        py: Python<'_>,
+        topic: &str,
+        depth: Option<&str>,
+    ) -> PyResult<PyObject> {
         let project = self.start_research(topic, depth);
         let dict = pyo3::types::PyDict::new_bound(py);
         dict.set_item("id", &project.id)?;
@@ -3928,15 +4521,21 @@ impl Aura {
     }
 
     #[pyo3(name = "complete_research", signature = (project_id, synthesis=None))]
-    fn py_complete_research(&self, project_id: &str, synthesis: Option<String>) -> PyResult<String> {
-        let rec = self.complete_research(project_id, synthesis)
+    fn py_complete_research(
+        &self,
+        project_id: &str,
+        synthesis: Option<String>,
+    ) -> PyResult<String> {
+        let rec = self
+            .complete_research(project_id, synthesis)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(rec.id.clone())
     }
 
     #[pyo3(name = "store_user_profile")]
     fn py_store_user_profile(&self, fields: HashMap<String, String>) -> PyResult<String> {
-        let rec = self.store_user_profile(fields)
+        let rec = self
+            .store_user_profile(fields)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(rec.id.clone())
     }
@@ -3954,7 +4553,8 @@ impl Aura {
 
     #[pyo3(name = "set_persona")]
     fn py_set_persona(&self, persona: AgentPersona) -> PyResult<String> {
-        let rec = self.set_persona(persona)
+        let rec = self
+            .set_persona(persona)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(rec.id.clone())
     }
@@ -4071,7 +4671,10 @@ impl Aura {
     ) -> PyResult<String> {
         let ns_vec: Vec<&str>;
         let ns_slice = match namespace {
-            Some(ns) => { ns_vec = vec![ns]; Some(ns_vec.as_slice()) }
+            Some(ns) => {
+                ns_vec = vec![ns];
+                Some(ns_vec.as_slice())
+            }
             None => None,
         };
         self.export_context(query, top_k, ns_slice)
@@ -4212,17 +4815,33 @@ impl Aura {
     // ── Two-Tier API PyO3 Bindings ──
 
     #[pyo3(name = "recall_cognitive", signature = (query=None, limit=None, namespace=None))]
-    fn py_recall_cognitive(&self, py: Python<'_>, query: Option<&str>, limit: Option<usize>, namespace: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>) -> PyResult<Vec<Record>> {
+    fn py_recall_cognitive(
+        &self,
+        py: Python<'_>,
+        query: Option<&str>,
+        limit: Option<usize>,
+        namespace: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>,
+    ) -> PyResult<Vec<Record>> {
         let ns_vec = extract_namespaces(namespace)?;
-        let ns_refs: Option<Vec<&str>> = ns_vec.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+        let ns_refs: Option<Vec<&str>> = ns_vec
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
         let ns_slice: Option<&[&str]> = ns_refs.as_deref();
         Ok(py.allow_threads(|| self.recall_cognitive(query, limit, ns_slice)))
     }
 
     #[pyo3(name = "recall_core_tier", signature = (query=None, limit=None, namespace=None))]
-    fn py_recall_core_tier(&self, py: Python<'_>, query: Option<&str>, limit: Option<usize>, namespace: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>) -> PyResult<Vec<Record>> {
+    fn py_recall_core_tier(
+        &self,
+        py: Python<'_>,
+        query: Option<&str>,
+        limit: Option<usize>,
+        namespace: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>,
+    ) -> PyResult<Vec<Record>> {
         let ns_vec = extract_namespaces(namespace)?;
-        let ns_refs: Option<Vec<&str>> = ns_vec.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+        let ns_refs: Option<Vec<&str>> = ns_vec
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
         let ns_slice: Option<&[&str]> = ns_refs.as_deref();
         Ok(py.allow_threads(|| self.recall_core_tier(query, limit, ns_slice)))
     }
@@ -4287,7 +4906,14 @@ mod tests {
             "Teo loves Rust",
             Some(Level::Identity),
             Some(vec!["person".into()]),
-            None, None, None, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )?;
 
         assert_eq!(rec.content, "Teo loves Rust");
@@ -4305,8 +4931,32 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("The quick brown fox jumps over the lazy dog", None, None, None, None, None, None, None, None, None, None)?;
-        aura.store("The quick brown fox jumps over the lazy dog", None, None, None, None, None, None, None, None, None, None)?;
+        aura.store(
+            "The quick brown fox jumps over the lazy dog",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        aura.store(
+            "The quick brown fox jumps over the lazy dog",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
 
         // Should be deduplicated to 1 record
         assert_eq!(aura.count(None), 1);
@@ -4319,8 +4969,32 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("test1", Some(Level::Working), None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store("test2", Some(Level::Identity), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store(
+            "test1",
+            Some(Level::Working),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store(
+            "test2",
+            Some(Level::Identity),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
 
         let stats = aura.stats();
         assert_eq!(stats["total_records"], 2);
@@ -4339,7 +5013,14 @@ mod tests {
             "My phone is +380991234567",
             None,
             Some(vec!["personal".into()]),
-            None, None, None, None, Some(false), None, None, None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
         )?;
 
         // Should have auto-added "contact" tag
@@ -4356,7 +5037,12 @@ mod tests {
             "User said hello",
             None,
             None,
-            None, None, None, None, Some(false), None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
             Some("telegram"),
             None,
             None,
@@ -4373,7 +5059,19 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("Teo loves Rust programming", Some(Level::Identity), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store(
+            "Teo loves Rust programming",
+            Some(Level::Identity),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
 
         // First recall — cache miss
         let r1 = aura.recall("Who is Teo?", None, None, None, None, None)?;
@@ -4382,7 +5080,19 @@ mod tests {
         assert_eq!(r1, r2);
 
         // Store invalidates cache
-        aura.store("Teo is 25 years old", None, None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store(
+            "Teo is 25 years old",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
 
         Ok(())
     }
@@ -4397,7 +5107,14 @@ mod tests {
             "Teo loves Rust programming",
             Some(Level::Domain),
             Some(vec!["fact".into()]),
-            None, None, None, None, Some(false), None, None, None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
         )?;
 
         // Store a failure record
@@ -4405,20 +5122,44 @@ mod tests {
             "Failed to register on site X: captcha required",
             Some(Level::Decisions),
             Some(vec!["outcome-failure".into()]),
-            None, None, None, None, Some(false), None, None, None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
         )?;
 
         // recall_full should find records matching "Teo Rust"
         let results = aura.recall_full("Teo Rust", None, Some(true), None, None, None, None)?;
-        assert!(!results.is_empty(), "recall_full should find at least one record");
+        assert!(
+            !results.is_empty(),
+            "recall_full should find at least one record"
+        );
 
         // recall_full with include_failures=true should find failure records
-        let results_fail = aura.recall_full("register site captcha", None, Some(true), None, None, None, None)?;
-        let has_failure = results_fail.iter().any(|(_, r)| r.tags.contains(&"outcome-failure".to_string()));
-        assert!(has_failure, "recall_full with include_failures=true should find failure records");
+        let results_fail = aura.recall_full(
+            "register site captcha",
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+        )?;
+        let has_failure = results_fail
+            .iter()
+            .any(|(_, r)| r.tags.contains(&"outcome-failure".to_string()));
+        assert!(
+            has_failure,
+            "recall_full with include_failures=true should find failure records"
+        );
 
         // recall_full with include_failures=false should still work
-        let results_no_fail = aura.recall_full("register site", None, Some(false), None, None, None, None)?;
+        let results_no_fail =
+            aura.recall_full("register site", None, Some(false), None, None, None, None)?;
         // Should not crash — just verify it returns
         drop(results_no_fail);
 
@@ -4444,11 +5185,35 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("test record", None, None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store(
+            "test record",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
 
         let report = aura.run_maintenance();
         assert!(report.total_records > 0);
         assert!(!report.timestamp.is_empty());
+        assert!(report.hotspots.records_before_cycle > 0);
+        assert_eq!(
+            report.hotspots.belief_snapshot_records,
+            report.hotspots.sdr_vectors_built
+        );
+        assert_eq!(
+            report.hotspots.sdr_vectors_built,
+            report.hotspots.sdr_vectors_computed + report.hotspots.sdr_vectors_reused
+        );
+        assert!(!report.hotspots.dominant_phase.is_empty());
+        assert!(report.hotspots.dominant_phase_ms >= 0.0);
+        assert!(report.hotspots.dominant_phase_share >= 0.0);
 
         Ok(())
     }
@@ -4458,45 +5223,51 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        let id1 = aura.store(
-            "Deploy to staging before production deploys",
-            Some(Level::Domain),
-            Some(vec!["deploy".into(), "safety".into()]),
-            None,
-            None,
-            None,
-            None,
-            Some(false),
-            None,
-            None,
-            Some("decision"),
-        )?.id;
-        let _id2 = aura.store(
-            "Always use staging for safe production deploys",
-            Some(Level::Domain),
-            Some(vec!["deploy".into(), "safety".into()]),
-            None,
-            None,
-            None,
-            None,
-            Some(false),
-            None,
-            None,
-            Some("decision"),
-        )?.id;
-        let _id3 = aura.store(
-            "Skip staging when shipping directly to production",
-            Some(Level::Working),
-            Some(vec!["deploy".into(), "safety".into()]),
-            None,
-            None,
-            None,
-            None,
-            Some(false),
-            None,
-            None,
-            Some("contradiction"),
-        )?.id;
+        let id1 = aura
+            .store(
+                "Deploy to staging before production deploys",
+                Some(Level::Domain),
+                Some(vec!["deploy".into(), "safety".into()]),
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                None,
+                Some("decision"),
+            )?
+            .id;
+        let _id2 = aura
+            .store(
+                "Always use staging for safe production deploys",
+                Some(Level::Domain),
+                Some(vec!["deploy".into(), "safety".into()]),
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                None,
+                Some("decision"),
+            )?
+            .id;
+        let _id3 = aura
+            .store(
+                "Skip staging when shipping directly to production",
+                Some(Level::Working),
+                Some(vec!["deploy".into(), "safety".into()]),
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                None,
+                Some("contradiction"),
+            )?
+            .id;
 
         let report = aura.run_maintenance();
         let rec = aura.get(&id1).unwrap();
@@ -4572,7 +5343,10 @@ mod tests {
             Some("https://arxiv.org/paper/123"),
         )?;
 
-        let rec = aura.complete_research(&project.id, Some("GRPO is a group-relative optimization...".into()))?;
+        let rec = aura.complete_research(
+            &project.id,
+            Some("GRPO is a group-relative optimization...".into()),
+        )?;
         assert!(rec.content.contains("GRPO"));
         assert!(rec.tags.contains(&"research-report".to_string()));
 
@@ -4620,10 +5394,58 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("session note about testing", Some(Level::Working), None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store("recent decision on architecture", Some(Level::Decisions), None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store("domain fact about Rust language", Some(Level::Domain), None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store("core identity preferences", Some(Level::Identity), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store(
+            "session note about testing",
+            Some(Level::Working),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store(
+            "recent decision on architecture",
+            Some(Level::Decisions),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store(
+            "domain fact about Rust language",
+            Some(Level::Domain),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store(
+            "core identity preferences",
+            Some(Level::Identity),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
 
         // No query — returns all cognitive records
         let cognitive = aura.recall_cognitive(None, None, None);
@@ -4645,10 +5467,58 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("session note about testing", Some(Level::Working), None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store("recent decision on architecture", Some(Level::Decisions), None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store("domain fact about Rust language", Some(Level::Domain), None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store("core identity preferences", Some(Level::Identity), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store(
+            "session note about testing",
+            Some(Level::Working),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store(
+            "recent decision on architecture",
+            Some(Level::Decisions),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store(
+            "domain fact about Rust language",
+            Some(Level::Domain),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store(
+            "core identity preferences",
+            Some(Level::Identity),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
 
         // No query — returns all core records
         let core = aura.recall_core_tier(None, None, None);
@@ -4670,12 +5540,84 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("w1", Some(Level::Working), None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store("w2", Some(Level::Working), None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store("d1", Some(Level::Decisions), None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store("dom1", Some(Level::Domain), None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store("id1", Some(Level::Identity), None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store("id2", Some(Level::Identity), None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store(
+            "w1",
+            Some(Level::Working),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store(
+            "w2",
+            Some(Level::Working),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store(
+            "d1",
+            Some(Level::Decisions),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store(
+            "dom1",
+            Some(Level::Domain),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store(
+            "id1",
+            Some(Level::Identity),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store(
+            "id2",
+            Some(Level::Identity),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
 
         let ts = aura.tier_stats();
         assert_eq!(ts["cognitive_total"], 3);
@@ -4695,7 +5637,19 @@ mod tests {
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
         // Store a working-level record
-        let rec = aura.store("frequently recalled fact", Some(Level::Working), None, None, None, None, None, Some(false), None, None, None)?;
+        let rec = aura.store(
+            "frequently recalled fact",
+            Some(Level::Working),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
 
         // Simulate frequent recalls to bump activation_count
         {
@@ -4722,7 +5676,19 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        let rec = aura.store("promotable", Some(Level::Working), None, None, None, None, None, Some(false), None, None, None)?;
+        let rec = aura.store(
+            "promotable",
+            Some(Level::Working),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
         assert_eq!(rec.level, Level::Working);
 
         let new_level = aura.promote_record(&rec.id);
@@ -4753,15 +5719,43 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("User is 25 years old", Some(Level::Identity), Some(vec!["user".into()]), None, None, None, None, Some(false), None, None, None)?;
-        aura.store_with_channel("Test case: user is 30 years old", Some(Level::Identity), Some(vec!["user".into()]), None, None, None, None, Some(false), None, None, None, Some("test-data"), None)?;
+        aura.store(
+            "User is 25 years old",
+            Some(Level::Identity),
+            Some(vec!["user".into()]),
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store_with_channel(
+            "Test case: user is 30 years old",
+            Some(Level::Identity),
+            Some(vec!["user".into()]),
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            Some("test-data"),
+            None,
+        )?;
 
-        let results = aura.recall_structured("user age", None, None, None, None, Some(&["default"]))?;
+        let results =
+            aura.recall_structured("user age", None, None, None, None, Some(&["default"]))?;
         assert!(results.iter().all(|(_, r)| r.namespace == "default"));
         assert!(results.iter().any(|(_, r)| r.content.contains("25")));
         assert!(!results.iter().any(|(_, r)| r.content.contains("30")));
 
-        let results = aura.recall_structured("user age", None, None, None, None, Some(&["test-data"]))?;
+        let results =
+            aura.recall_structured("user age", None, None, None, None, Some(&["test-data"]))?;
         assert!(results.iter().all(|(_, r)| r.namespace == "test-data"));
 
         Ok(())
@@ -4772,14 +5766,58 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("Real data about cats", None, Some(vec!["animal".into()]), None, None, None, None, Some(false), None, None, None)?;
-        aura.store_with_channel("Test data about cats", None, Some(vec!["animal".into()]), None, None, None, None, Some(false), None, None, None, Some("sandbox"), None)?;
+        aura.store(
+            "Real data about cats",
+            None,
+            Some(vec!["animal".into()]),
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store_with_channel(
+            "Test data about cats",
+            None,
+            Some(vec!["animal".into()]),
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            Some("sandbox"),
+            None,
+        )?;
 
-        let results = aura.search(None, None, Some(vec!["animal".into()]), None, None, None, Some(&["default"]), None);
+        let results = aura.search(
+            None,
+            None,
+            Some(vec!["animal".into()]),
+            None,
+            None,
+            None,
+            Some(&["default"]),
+            None,
+        );
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("Real"));
 
-        let results = aura.search(None, None, Some(vec!["animal".into()]), None, None, None, Some(&["sandbox"]), None);
+        let results = aura.search(
+            None,
+            None,
+            Some(vec!["animal".into()]),
+            None,
+            None,
+            None,
+            Some(&["sandbox"]),
+            None,
+        );
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("Test"));
 
@@ -4791,8 +5829,34 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("A", None, None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store_with_channel("B", None, None, None, None, None, None, Some(false), None, None, None, Some("project-x"), None)?;
+        aura.store(
+            "A",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store_with_channel(
+            "B",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            Some("project-x"),
+            None,
+        )?;
 
         let ns = aura.list_namespaces();
         assert!(ns.contains(&"default".to_string()));
@@ -4806,16 +5870,46 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        let rec = aura.store("Moveable record content here", None, None, None, None, None, None, Some(false), None, None, None)?;
+        let rec = aura.store(
+            "Moveable record content here",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
         assert_eq!(rec.namespace, "default");
 
         let moved = aura.move_record(&rec.id, "archive").unwrap();
         assert_eq!(moved.namespace, "archive");
 
-        let results = aura.search(Some("Moveable"), None, None, None, None, None, Some(&["default"]), None);
+        let results = aura.search(
+            Some("Moveable"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&["default"]),
+            None,
+        );
         assert!(results.is_empty());
 
-        let results = aura.search(Some("Moveable"), None, None, None, None, None, Some(&["archive"]), None);
+        let results = aura.search(
+            Some("Moveable"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&["archive"]),
+            None,
+        );
         assert_eq!(results.len(), 1);
 
         Ok(())
@@ -4826,9 +5920,47 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("A", None, None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store("B", None, None, None, None, None, None, Some(false), None, None, None)?;
-        aura.store_with_channel("C", None, None, None, None, None, None, Some(false), None, None, None, Some("sandbox"), None)?;
+        aura.store(
+            "A",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store(
+            "B",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store_with_channel(
+            "C",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            Some("sandbox"),
+            None,
+        )?;
 
         let stats = aura.namespace_stats();
         assert_eq!(*stats.get("default").unwrap_or(&0), 2);
@@ -4842,8 +5974,34 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("The quick brown fox jumps over the lazy dog repeatedly", None, None, None, None, None, None, None, None, None, None)?;
-        aura.store_with_channel("The quick brown fox jumps over the lazy dog repeatedly", None, None, None, None, None, None, None, None, None, None, Some("sandbox"), None)?;
+        aura.store(
+            "The quick brown fox jumps over the lazy dog repeatedly",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        aura.store_with_channel(
+            "The quick brown fox jumps over the lazy dog repeatedly",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("sandbox"),
+            None,
+        )?;
 
         let stats = aura.namespace_stats();
         assert_eq!(*stats.get("default").unwrap_or(&0), 1);
@@ -4857,11 +6015,32 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        let rec = aura.store("No namespace specified here", None, None, None, None, None, None, Some(false), None, None, None)?;
+        let rec = aura.store(
+            "No namespace specified here",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
         assert_eq!(rec.namespace, "default");
 
         // Search without namespace (None defaults to "default")
-        let results = aura.search(Some("No namespace"), None, None, None, None, None, None, None);
+        let results = aura.search(
+            Some("No namespace"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(results.len(), 1);
 
         Ok(())
@@ -4874,17 +6053,72 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("User health data about blood pressure monitoring", None, Some(vec!["health".into()]), None, None, None, None, Some(false), None, None, None)?;
-        aura.store_with_channel("Test case health scenario about blood pressure", None, Some(vec!["health".into()]), None, None, None, None, Some(false), None, None, None, Some("sandbox"), None)?;
-        aura.store_with_channel("Project health metrics dashboard", None, Some(vec!["health".into()]), None, None, None, None, Some(false), None, None, None, Some("project-x"), None)?;
+        aura.store(
+            "User health data about blood pressure monitoring",
+            None,
+            Some(vec!["health".into()]),
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store_with_channel(
+            "Test case health scenario about blood pressure",
+            None,
+            Some(vec!["health".into()]),
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            Some("sandbox"),
+            None,
+        )?;
+        aura.store_with_channel(
+            "Project health metrics dashboard",
+            None,
+            Some(vec!["health".into()]),
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            Some("project-x"),
+            None,
+        )?;
 
         // Single namespace — only default
-        let results = aura.recall_structured("health blood pressure", None, None, None, None, Some(&["default"]))?;
+        let results = aura.recall_structured(
+            "health blood pressure",
+            None,
+            None,
+            None,
+            None,
+            Some(&["default"]),
+        )?;
         assert!(results.iter().all(|(_, r)| r.namespace == "default"));
 
         // Multi-namespace — default + sandbox
-        let results = aura.recall_structured("health blood pressure", None, None, None, None, Some(&["default", "sandbox"]))?;
-        let found_ns: std::collections::HashSet<String> = results.iter().map(|(_, r)| r.namespace.clone()).collect();
+        let results = aura.recall_structured(
+            "health blood pressure",
+            None,
+            None,
+            None,
+            None,
+            Some(&["default", "sandbox"]),
+        )?;
+        let found_ns: std::collections::HashSet<String> =
+            results.iter().map(|(_, r)| r.namespace.clone()).collect();
         assert!(found_ns.contains("default") || found_ns.contains("sandbox"));
         // project-x should NOT be in results
         assert!(!results.iter().any(|(_, r)| r.namespace == "project-x"));
@@ -4897,20 +6131,79 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("Record A in default", None, Some(vec!["multi".into()]), None, None, None, None, Some(false), None, None, None)?;
-        aura.store_with_channel("Record B in sandbox", None, Some(vec!["multi".into()]), None, None, None, None, Some(false), None, None, None, Some("sandbox"), None)?;
-        aura.store_with_channel("Record C in project", None, Some(vec!["multi".into()]), None, None, None, None, Some(false), None, None, None, Some("project-x"), None)?;
+        aura.store(
+            "Record A in default",
+            None,
+            Some(vec!["multi".into()]),
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
+        aura.store_with_channel(
+            "Record B in sandbox",
+            None,
+            Some(vec!["multi".into()]),
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            Some("sandbox"),
+            None,
+        )?;
+        aura.store_with_channel(
+            "Record C in project",
+            None,
+            Some(vec!["multi".into()]),
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            Some("project-x"),
+            None,
+        )?;
 
         // Search across 2 namespaces
-        let results = aura.search(None, None, Some(vec!["multi".into()]), None, None, None, Some(&["default", "sandbox"]), None);
+        let results = aura.search(
+            None,
+            None,
+            Some(vec!["multi".into()]),
+            None,
+            None,
+            None,
+            Some(&["default", "sandbox"]),
+            None,
+        );
         assert_eq!(results.len(), 2);
-        let found_ns: std::collections::HashSet<String> = results.iter().map(|r| r.namespace.clone()).collect();
+        let found_ns: std::collections::HashSet<String> =
+            results.iter().map(|r| r.namespace.clone()).collect();
         assert!(found_ns.contains("default"));
         assert!(found_ns.contains("sandbox"));
         assert!(!found_ns.contains("project-x"));
 
         // Search across all 3
-        let results = aura.search(None, None, Some(vec!["multi".into()]), None, None, None, Some(&["default", "sandbox", "project-x"]), None);
+        let results = aura.search(
+            None,
+            None,
+            Some(vec!["multi".into()]),
+            None,
+            None,
+            None,
+            Some(&["default", "sandbox", "project-x"]),
+            None,
+        );
         assert_eq!(results.len(), 3);
 
         Ok(())
@@ -4921,14 +6214,44 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
 
-        aura.store("Only in default ns content here", None, None, None, None, None, None, Some(false), None, None, None)?;
+        aura.store(
+            "Only in default ns content here",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+        )?;
 
         // Single-element slice should behave same as old Option<&str>
-        let results = aura.search(Some("Only in default"), None, None, None, None, None, Some(&["default"]), None);
+        let results = aura.search(
+            Some("Only in default"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&["default"]),
+            None,
+        );
         assert_eq!(results.len(), 1);
 
         // None should also work (defaults to ["default"])
-        let results = aura.search(Some("Only in default"), None, None, None, None, None, None, None);
+        let results = aura.search(
+            Some("Only in default"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(results.len(), 1);
 
         Ok(())

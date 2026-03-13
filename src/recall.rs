@@ -10,16 +10,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing::instrument;
 
-use crate::record::Record;
+use crate::belief::{BeliefEngine, BeliefState};
+use crate::graph::SessionTracker;
+use crate::index::InvertedIndex;
 use crate::levels::Level;
 use crate::ngram::NGramIndex;
-use crate::sdr::SDRInterpreter;
-use crate::index::InvertedIndex;
-use crate::storage::AuraStorage;
-use crate::graph::SessionTracker;
+use crate::record::Record;
 use crate::record::DEFAULT_NAMESPACE;
+use crate::sdr::SDRInterpreter;
+use crate::storage::AuraStorage;
 use crate::trust::{self, TrustConfig};
-use crate::belief::{BeliefEngine, BeliefState};
 
 /// RRF constant (higher = more weight to top ranks).
 pub const RRF_K: usize = 60;
@@ -118,7 +118,9 @@ pub fn collect_ngram(
         .query(query, top_k * 4)
         .into_iter()
         .filter(|(_, rid)| {
-            records.get(rid).is_some_and(|r| in_namespace(r, namespaces))
+            records
+                .get(rid)
+                .is_some_and(|r| in_namespace(r, namespaces))
         })
         .take(top_k)
         .map(|(sim, rid)| (rid, sim))
@@ -135,10 +137,7 @@ pub fn collect_tags(
     namespaces: &[&str],
 ) -> Vec<(String, f32)> {
     // Parse query words as potential tags
-    let query_tags: HashSet<String> = query
-        .split_whitespace()
-        .map(|w| w.to_lowercase())
-        .collect();
+    let query_tags: HashSet<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
 
     if query_tags.is_empty() {
         return vec![];
@@ -369,9 +368,8 @@ pub fn apply_recency_scoring(
     let config = trust_config.unwrap_or(&default_config);
 
     for (score, rec) in matched.iter_mut() {
-        let effective_trust = trust::compute_effective_trust(
-            &rec.metadata, now_unix, config, &rec.source_type,
-        );
+        let effective_trust =
+            trust::compute_effective_trust(&rec.metadata, now_unix, config, &rec.source_type);
         *score = *score * rec.strength * effective_trust;
     }
 
@@ -454,7 +452,12 @@ pub fn format_preamble(
     let remaining_budget = token_budget.saturating_sub(identity_budget);
 
     // Output order: IDENTITY → DOMAIN → DECISIONS → WORKING
-    let level_order = [Level::Identity, Level::Domain, Level::Decisions, Level::Working];
+    let level_order = [
+        Level::Identity,
+        Level::Domain,
+        Level::Decisions,
+        Level::Working,
+    ];
 
     for level in &level_order {
         let budget = if *level == Level::Identity {
@@ -515,14 +518,27 @@ fn format_record(rec: &Record, records: &HashMap<String, Record>) -> String {
 
     let mut base = match rec.content_type.as_str() {
         "code" => {
-            let lang = rec.metadata.get("language").map(|s| s.as_str()).unwrap_or("");
-            format!("  - [CODE]{}{}{}\n```{}\n{}\n```", source_label, semantic_label, tags_str, lang, rec.content)
+            let lang = rec
+                .metadata
+                .get("language")
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            format!(
+                "  - [CODE]{}{}{}\n```{}\n{}\n```",
+                source_label, semantic_label, tags_str, lang, rec.content
+            )
         }
         "json" => {
-            format!("  - [JSON]{}{}{}\n```json\n{}\n```", source_label, semantic_label, tags_str, rec.content)
+            format!(
+                "  - [JSON]{}{}{}\n```json\n{}\n```",
+                source_label, semantic_label, tags_str, rec.content
+            )
         }
         _ => {
-            format!("  - {}{}{}{}", rec.content, source_label, semantic_label, tags_str)
+            format!(
+                "  - {}{}{}{}",
+                rec.content, source_label, semantic_label, tags_str
+            )
         }
     };
 
@@ -569,7 +585,16 @@ pub fn recall_pipeline(
     let ns = namespaces.unwrap_or(&default_ns);
 
     // 1. Collect signals
-    let sdr_ranked = collect_sdr(sdr, inverted_index, storage, aura_index, records, query, top_k, ns);
+    let sdr_ranked = collect_sdr(
+        sdr,
+        inverted_index,
+        storage,
+        aura_index,
+        records,
+        query,
+        top_k,
+        ns,
+    );
     let ngram_ranked = collect_ngram(ngram_index, records, query, top_k, ns);
     let tag_ranked = collect_tags(tag_index, records, query, top_k, ns);
 
@@ -772,7 +797,11 @@ pub fn apply_belief_rerank(
         for i in 0..matched.len() {
             let id = &matched[i].1.id;
             if let Some(orig_pos) = baseline_ids.iter().position(|x| x == id) {
-                let shift = if i > orig_pos { i - orig_pos } else { orig_pos - i };
+                let shift = if i > orig_pos {
+                    i - orig_pos
+                } else {
+                    orig_pos - i
+                };
                 if shift > BELIEF_RERANK_MAX_POS_SHIFT {
                     // Swap toward original position
                     let target = if i > orig_pos {
@@ -811,8 +840,16 @@ pub fn apply_belief_rerank(
 
     // Top-k overlap
     let effective_k = n.min(top_k);
-    let baseline_top: HashSet<&str> = baseline_ids.iter().take(effective_k).map(|s| s.as_str()).collect();
-    let final_top: HashSet<&str> = final_ids.iter().take(effective_k).map(|s| s.as_str()).collect();
+    let baseline_top: HashSet<&str> = baseline_ids
+        .iter()
+        .take(effective_k)
+        .map(|s| s.as_str())
+        .collect();
+    let final_top: HashSet<&str> = final_ids
+        .iter()
+        .take(effective_k)
+        .map(|s| s.as_str())
+        .collect();
     let overlap = if effective_k > 0 {
         baseline_top.intersection(&final_top).count() as f32 / effective_k as f32
     } else {
@@ -827,7 +864,11 @@ pub fn apply_belief_rerank(
         records_moved,
         max_up_shift: max_up,
         max_down_shift: max_down,
-        avg_belief_multiplier: if n > 0 { multiplier_sum / n as f32 } else { 1.0 },
+        avg_belief_multiplier: if n > 0 {
+            multiplier_sum / n as f32
+        } else {
+            1.0
+        },
         belief_coverage,
         top_k_overlap: overlap,
         rerank_latency_us: latency,
@@ -944,15 +985,17 @@ pub fn compute_shadow_belief_scores(
             belief_state: state_str,
             belief_confidence: confidence,
             baseline_rank,
-            shadow_rank: 0,  // computed in phase 2
-            rank_delta: 0,   // computed in phase 2
+            shadow_rank: 0, // computed in phase 2
+            rank_delta: 0,  // computed in phase 2
         });
     }
 
     // Phase 2: compute shadow ranking (sort by shadow_score descending, stable)
     let mut shadow_order: Vec<usize> = (0..scores.len()).collect();
     shadow_order.sort_by(|&a, &b| {
-        scores[b].shadow_score.partial_cmp(&scores[a].shadow_score)
+        scores[b]
+            .shadow_score
+            .partial_cmp(&scores[a].shadow_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
@@ -967,11 +1010,13 @@ pub fn compute_shadow_belief_scores(
     let n = scores.len();
     let top_k = n.min(requested_top_k);
 
-    let baseline_top: HashSet<&str> = scores.iter()
+    let baseline_top: HashSet<&str> = scores
+        .iter()
         .filter(|s| s.baseline_rank < top_k)
         .map(|s| s.record_id.as_str())
         .collect();
-    let shadow_top: HashSet<&str> = scores.iter()
+    let shadow_top: HashSet<&str> = scores
+        .iter()
         .filter(|s| s.shadow_rank < top_k)
         .map(|s| s.record_id.as_str())
         .collect();
@@ -1200,7 +1245,9 @@ mod tests {
         }
 
         // Baseline: r0(0.90) > r1(0.89) > r2(0.88) > r3(0.87) > r4(0.86)
-        let baseline: Vec<(f32, Record)> = records.into_iter().enumerate()
+        let baseline: Vec<(f32, Record)> = records
+            .into_iter()
+            .enumerate()
             .map(|(i, r)| (0.90 - i as f32 * 0.01, r))
             .collect();
 
@@ -1227,15 +1274,20 @@ mod tests {
             r.id = format!("r{}", i);
             records.push(r);
         }
-        let baseline: Vec<(f32, Record)> = records.into_iter().enumerate()
+        let baseline: Vec<(f32, Record)> = records
+            .into_iter()
+            .enumerate()
             .map(|(i, r)| (0.90 - i as f32 * 0.01, r))
             .collect();
         let engine = make_belief_engine_with_records(&[("r4", BeliefState::Resolved, 0.95)]);
 
         let report = compute_shadow_belief_scores(&baseline, &engine, 3);
         // r4 jumps into shadow top-3, displacing r2
-        assert!((report.top_k_overlap - 2.0 / 3.0).abs() < 0.01,
-            "expected overlap ~0.67, got {}", report.top_k_overlap);
+        assert!(
+            (report.top_k_overlap - 2.0 / 3.0).abs() < 0.01,
+            "expected overlap ~0.67, got {}",
+            report.top_k_overlap
+        );
     }
 
     #[test]
@@ -1267,11 +1319,13 @@ mod tests {
     #[test]
     fn test_rerank_no_beliefs_skipped() {
         // No belief coverage → scope guard skips reranking
-        let mut matched: Vec<(f32, Record)> = (0..5).map(|i| {
-            let mut r = Record::new(format!("rec_{}", i), Level::Working);
-            r.id = format!("r{}", i);
-            (0.90 - i as f32 * 0.02, r)
-        }).collect();
+        let mut matched: Vec<(f32, Record)> = (0..5)
+            .map(|i| {
+                let mut r = Record::new(format!("rec_{}", i), Level::Working);
+                r.id = format!("r{}", i);
+                (0.90 - i as f32 * 0.02, r)
+            })
+            .collect();
 
         let engine = BeliefEngine::default();
         let report = apply_belief_rerank(&mut matched, &engine, 10);
@@ -1300,11 +1354,13 @@ mod tests {
 
     #[test]
     fn test_rerank_top_k_too_large_skipped() {
-        let mut matched: Vec<(f32, Record)> = (0..5).map(|i| {
-            let mut r = Record::new(format!("rec_{}", i), Level::Working);
-            r.id = format!("r{}", i);
-            (0.90 - i as f32 * 0.02, r)
-        }).collect();
+        let mut matched: Vec<(f32, Record)> = (0..5)
+            .map(|i| {
+                let mut r = Record::new(format!("rec_{}", i), Level::Working);
+                r.id = format!("r{}", i);
+                (0.90 - i as f32 * 0.02, r)
+            })
+            .collect();
 
         let engine = make_belief_engine_with_records(&[("r0", BeliefState::Resolved, 0.9)]);
         let report = apply_belief_rerank(&mut matched, &engine, 50);
@@ -1316,28 +1372,35 @@ mod tests {
     #[test]
     fn test_rerank_resolved_boosts_within_cap() {
         // 5 records, r0 has resolved belief → boosted by 1.05
-        let mut matched: Vec<(f32, Record)> = (0..5).map(|i| {
-            let mut r = Record::new(format!("rec_{}", i), Level::Working);
-            r.id = format!("r{}", i);
-            (0.50 - i as f32 * 0.01, r)
-        }).collect();
+        let mut matched: Vec<(f32, Record)> = (0..5)
+            .map(|i| {
+                let mut r = Record::new(format!("rec_{}", i), Level::Working);
+                r.id = format!("r{}", i);
+                (0.50 - i as f32 * 0.01, r)
+            })
+            .collect();
         let engine = make_belief_engine_with_records(&[("r0", BeliefState::Resolved, 0.9)]);
 
         let report = apply_belief_rerank(&mut matched, &engine, 10);
 
         assert!(report.was_applied);
         // r0: 0.50 * 1.05 = 0.525, within 5% cap
-        assert!((matched[0].0 - 0.525).abs() < 0.001,
-            "expected 0.525, got {}", matched[0].0);
+        assert!(
+            (matched[0].0 - 0.525).abs() < 0.001,
+            "expected 0.525, got {}",
+            matched[0].0
+        );
     }
 
     #[test]
     fn test_rerank_unresolved_penalizes_within_cap() {
-        let mut matched: Vec<(f32, Record)> = (0..5).map(|i| {
-            let mut r = Record::new(format!("rec_{}", i), Level::Working);
-            r.id = format!("r{}", i);
-            (0.50 - i as f32 * 0.01, r)
-        }).collect();
+        let mut matched: Vec<(f32, Record)> = (0..5)
+            .map(|i| {
+                let mut r = Record::new(format!("rec_{}", i), Level::Working);
+                r.id = format!("r{}", i);
+                (0.50 - i as f32 * 0.01, r)
+            })
+            .collect();
         let engine = make_belief_engine_with_records(&[("r0", BeliefState::Unresolved, 0.5)]);
 
         let report = apply_belief_rerank(&mut matched, &engine, 10);
@@ -1345,8 +1408,7 @@ mod tests {
         assert!(report.was_applied);
         // r0: 0.50 * 0.97 = 0.485, within 5% cap
         let r0 = matched.iter().find(|(_, r)| r.id == "r0").unwrap();
-        assert!((r0.0 - 0.485).abs() < 0.001,
-            "expected 0.485, got {}", r0.0);
+        assert!((r0.0 - 0.485).abs() < 0.001, "expected 0.485, got {}", r0.0);
     }
 
     #[test]
@@ -1398,11 +1460,13 @@ mod tests {
     #[test]
     fn test_rerank_effect_bounded_by_cap() {
         // Verify the actual delta never exceeds BELIEF_RERANK_CAP (5%)
-        let mut matched: Vec<(f32, Record)> = (0..5).map(|i| {
-            let mut r = Record::new(format!("rec_{}", i), Level::Working);
-            r.id = format!("r{}", i);
-            (0.80 - i as f32 * 0.05, r)
-        }).collect();
+        let mut matched: Vec<(f32, Record)> = (0..5)
+            .map(|i| {
+                let mut r = Record::new(format!("rec_{}", i), Level::Working);
+                r.id = format!("r{}", i);
+                (0.80 - i as f32 * 0.05, r)
+            })
+            .collect();
         let engine = make_belief_engine_with_records(&[
             ("r0", BeliefState::Resolved, 0.95),
             ("r1", BeliefState::Unresolved, 0.5),
@@ -1413,14 +1477,21 @@ mod tests {
 
         assert!(report.was_applied);
         for (score, rec) in &matched {
-            if let Some(orig) = original_scores.iter().zip(["r0","r1","r2","r3","r4"].iter())
+            if let Some(orig) = original_scores
+                .iter()
+                .zip(["r0", "r1", "r2", "r3", "r4"].iter())
                 .find(|(_, id)| **id == rec.id)
                 .map(|(s, _)| *s)
             {
                 let delta = (*score - orig).abs();
                 let max_allowed = orig * BELIEF_RERANK_CAP;
-                assert!(delta <= max_allowed + 0.0001,
-                    "record {} delta {} exceeds cap {}", rec.id, delta, max_allowed);
+                assert!(
+                    delta <= max_allowed + 0.0001,
+                    "record {} delta {} exceeds cap {}",
+                    rec.id,
+                    delta,
+                    max_allowed
+                );
             }
         }
     }
@@ -1429,29 +1500,41 @@ mod tests {
     fn test_rerank_positional_shift_bounded() {
         // 8 records, r7 (last) has resolved belief.
         // Even with boost, it should not move more than 2 positions up.
-        let mut matched: Vec<(f32, Record)> = (0..8).map(|i| {
-            let mut r = Record::new(format!("rec_{}", i), Level::Working);
-            r.id = format!("r{}", i);
-            (0.80 - i as f32 * 0.001, r) // very close scores
-        }).collect();
+        let mut matched: Vec<(f32, Record)> = (0..8)
+            .map(|i| {
+                let mut r = Record::new(format!("rec_{}", i), Level::Working);
+                r.id = format!("r{}", i);
+                (0.80 - i as f32 * 0.001, r) // very close scores
+            })
+            .collect();
 
         let engine = make_belief_engine_with_records(&[("r7", BeliefState::Resolved, 0.95)]);
         let report = apply_belief_rerank(&mut matched, &engine, 10);
 
         assert!(report.was_applied);
-        assert!(report.max_up_shift <= BELIEF_RERANK_MAX_POS_SHIFT,
-            "max up shift {} exceeds limit {}", report.max_up_shift, BELIEF_RERANK_MAX_POS_SHIFT);
-        assert!(report.max_down_shift <= BELIEF_RERANK_MAX_POS_SHIFT,
-            "max down shift {} exceeds limit {}", report.max_down_shift, BELIEF_RERANK_MAX_POS_SHIFT);
+        assert!(
+            report.max_up_shift <= BELIEF_RERANK_MAX_POS_SHIFT,
+            "max up shift {} exceeds limit {}",
+            report.max_up_shift,
+            BELIEF_RERANK_MAX_POS_SHIFT
+        );
+        assert!(
+            report.max_down_shift <= BELIEF_RERANK_MAX_POS_SHIFT,
+            "max down shift {} exceeds limit {}",
+            report.max_down_shift,
+            BELIEF_RERANK_MAX_POS_SHIFT
+        );
     }
 
     #[test]
     fn test_rerank_report_metrics() {
-        let mut matched: Vec<(f32, Record)> = (0..5).map(|i| {
-            let mut r = Record::new(format!("rec_{}", i), Level::Working);
-            r.id = format!("r{}", i);
-            (0.80 - i as f32 * 0.002, r) // close scores
-        }).collect();
+        let mut matched: Vec<(f32, Record)> = (0..5)
+            .map(|i| {
+                let mut r = Record::new(format!("rec_{}", i), Level::Working);
+                r.id = format!("r{}", i);
+                (0.80 - i as f32 * 0.002, r) // close scores
+            })
+            .collect();
 
         let engine = make_belief_engine_with_records(&[
             ("r0", BeliefState::Resolved, 0.9),

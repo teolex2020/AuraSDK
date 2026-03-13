@@ -3,13 +3,13 @@
 //! Rewritten from aura-cognitive store.py.
 //! Format: COG1 header → [OP(1B) | payload_len(4B) | CRC32(4B) | payload]...
 
+use anyhow::{anyhow, Result};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use anyhow::{anyhow, Result};
-use parking_lot::Mutex;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::record::Record;
 
@@ -49,9 +49,7 @@ impl CognitiveStore {
             f.flush()?;
         }
 
-        let writer_file = OpenOptions::new()
-            .append(true)
-            .open(&log_path)?;
+        let writer_file = OpenOptions::new().append(true).open(&log_path)?;
         let writer = BufWriter::new(writer_file);
 
         Ok(Self {
@@ -194,7 +192,9 @@ impl CognitiveStore {
         let crc = crc32fast::hash(payload);
 
         let mut writer = self.writer.lock();
-        let w = writer.as_mut().ok_or_else(|| anyhow!("Cognitive store is closed"))?;
+        let w = writer
+            .as_mut()
+            .ok_or_else(|| anyhow!("Cognitive store is closed"))?;
         w.write_u8(op)?;
         w.write_u32::<LittleEndian>(payload.len() as u32)?;
         w.write_u32::<LittleEndian>(crc)?;
