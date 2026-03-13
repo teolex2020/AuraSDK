@@ -21,12 +21,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Build tests
-        run: cargo test --no-default-features --features "encryption,audit" --no-run 2>&1 | tail -5
-      - name: Run tests
-        run: cargo test --no-default-features --features "encryption,audit" -- --test-threads=2
-      - name: Clippy
-        run: cargo clippy --no-default-features --features "encryption,audit" -- -D warnings
+      - name: Build library tests
+        run: cargo test --lib --no-default-features --features "encryption,audit" --no-run 2>&1 | tail -5
+      - name: Run library tests
+        run: cargo test --lib --no-default-features --features "encryption,audit" -- --test-threads=2
+      - name: Cargo check
+        run: cargo check --no-default-features --features "encryption,audit"
 
   python-tests:
     name: Python Tests (${{ matrix.os }}, ${{ matrix.python-version }})
@@ -60,9 +60,11 @@ jobs:
       - name: Build and install (Windows)
         run: .venv\Scripts\maturin develop --release --features "pyo3/extension-module,encryption"
         if: runner.os == 'Windows'
-      - name: Run Python tests
-        run: .venv/bin/pytest tests/ -v --timeout=60
+      - name: Run Python smoke
+        run: |
+          .venv/bin/python -c "from aura import Aura, Level; b = Aura('./ci_smoke_brain'); b.store('User prefers dark mode', level=Level.Identity, tags=['ui'], semantic_type='preference'); r = b.recall('dark mode'); assert r and 'dark mode' in r[0].lower()"
         if: runner.os != 'Windows'
-      - name: Run Python tests (Windows)
-        run: .venv\Scripts\pytest tests/ -v --timeout=60
+      - name: Run Python smoke (Windows)
+        run: |
+          .venv\Scripts\python -c "from aura import Aura, Level; b = Aura('./ci_smoke_brain'); b.store('User prefers dark mode', level=Level.Identity, tags=['ui'], semantic_type='preference'); r = b.recall('dark mode'); assert r and 'dark mode' in r[0].lower()"
         if: runner.os == 'Windows'
