@@ -62,9 +62,9 @@ jobs:
         if: runner.os == 'Windows'
       - name: Run Python smoke
         run: |
-          .venv/bin/python -c "from aura import Aura, Level; b = Aura('./ci_smoke_brain'); b.store('User prefers dark mode', level=Level.Identity, tags=['ui'], semantic_type='preference'); r = b.recall('dark mode'); assert r and 'dark mode' in r[0].lower()"
+          .venv/bin/python -c "from aura import Aura, Level; b = Aura('./ci_smoke_brain'); b.store('User prefers dark mode', level=Level.Identity, tags=['ui'], semantic_type='preference'); r = b.recall('dark mode'); assert r and 'dark mode' in r.lower()"
         if: runner.os != 'Windows'
       - name: Run Python smoke (Windows)
         run: |
-          .venv\Scripts\python -c "from aura import Aura, Level; b = Aura('./ci_smoke_brain'); b.store('User prefers dark mode', level=Level.Identity, tags=['ui'], semantic_type='preference'); r = b.recall('dark mode'); assert r and 'dark mode' in r[0].lower()"
+          .venv\Scripts\python -c "from aura import Aura, Level; b = Aura('./ci_smoke_brain'); b.store('User prefers dark mode', level=Level.Identity, tags=['ui'], semantic_type='preference'); r = b.recall('dark mode'); assert r and 'dark mode' in r.lower()"
         if: runner.os == 'Windows'
