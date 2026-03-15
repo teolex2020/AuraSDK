@@ -38,7 +38,9 @@ use crate::synonym::SynonymRing;
 use crate::background_brain::{self, BackgroundBrain, MaintenanceConfig, MaintenanceReport};
 use crate::belief::{BeliefEngine, BeliefStore, CoarseKeyMode, SdrLookup};
 use crate::cache::{RecallCache, StructuredRecallCache};
-use crate::causal::{CausalEngine, CausalEvidenceMode, CausalStore, TemporalEdgeBudgetMode};
+use crate::causal::{
+    CausalEngine, CausalEvidenceMode, CausalRerankMode, CausalStore, TemporalEdgeBudgetMode,
+};
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::concept::{
     ConceptEngine, ConceptPartitionMode, ConceptSeedMode, ConceptSimilarityMode, ConceptStore,
@@ -46,7 +48,13 @@ use crate::concept::{
 };
 use crate::guards;
 use crate::identity::{self, AgentPersona};
-use crate::policy::{PolicyEngine, PolicyStore};
+use crate::policy::{PolicyEngine, PolicyRerankMode, PolicyStore};
+use crate::relation::{
+    self, EntityDigest, EntityGraphDigest, EntityGraphNeighbor, EntityRelationEdge,
+    FamilyGraphSnapshot, FamilyRelationMember, PersonDigest, ProjectDigest, ProjectGraphSnapshot,
+    ProjectStatusSnapshot, ProjectTimelineEntry, ProjectTimelineSnapshot, RelationDigest,
+    RelationEdge, StructuralRelation,
+};
 use crate::research::{ResearchEngine, ResearchProject};
 use crate::storage::StoredRecord;
 use crate::trust::{self, TagTaxonomy, TrustConfig};
@@ -55,6 +63,8 @@ use crate::trust::{self, TagTaxonomy, TrustConfig};
 const MAX_CONTENT_SIZE: usize = 100 * 1024;
 /// Maximum tags per record.
 const MAX_TAGS: usize = 50;
+const STRUCTURAL_RELATION_DEFAULT_LIMIT: usize = 32;
+const ENTITY_RELATION_PROMOTION_MIN_WEIGHT: f32 = 0.8;
 /// Surprise threshold — below this similarity, info is considered novel.
 const SURPRISE_THRESHOLD: f32 = 0.2;
 
@@ -127,6 +137,8 @@ pub struct Aura {
     // ── Belief Reranking (Phase 4 — tri-state: Off/Shadow/Limited) ──
     belief_rerank_mode: std::sync::atomic::AtomicU8,
     concept_surface_mode: std::sync::atomic::AtomicU8,
+    causal_rerank_mode: std::sync::atomic::AtomicU8,
+    policy_rerank_mode: std::sync::atomic::AtomicU8,
     concept_surface_global_calls: AtomicU64,
     concept_surface_namespace_calls: AtomicU64,
     concept_surface_record_calls: AtomicU64,
@@ -292,6 +304,8 @@ impl Aura {
                 recall::BeliefRerankMode::Off as u8,
             ),
             concept_surface_mode: std::sync::atomic::AtomicU8::new(ConceptSurfaceMode::Off as u8),
+            causal_rerank_mode: std::sync::atomic::AtomicU8::new(CausalRerankMode::Off as u8),
+            policy_rerank_mode: std::sync::atomic::AtomicU8::new(PolicyRerankMode::Off as u8),
             concept_surface_global_calls: AtomicU64::new(0),
             concept_surface_namespace_calls: AtomicU64::new(0),
             concept_surface_record_calls: AtomicU64::new(0),
@@ -580,6 +594,8 @@ impl Aura {
         if let Some(ref log) = self.audit_log {
             let _ = log.log_store(&rec.id, content);
         }
+
+        self.refresh_deterministic_relations_for_namespace(&rec.namespace)?;
 
         // Invalidate recall cache on write
         self.recall_cache.clear();
@@ -1013,6 +1029,33 @@ impl Aura {
             let _report = recall::apply_belief_rerank(&mut scored, &belief_eng, top_k);
         }
 
+        // Phase 4b: concept-aware reranking (only in ConceptSurfaceMode::Limited)
+        let concept_mode = self.get_concept_surface_mode();
+        if concept_mode == ConceptSurfaceMode::Limited {
+            let concept_eng = self.concept_engine.read();
+            let _report = recall::apply_concept_rerank(&mut scored, &concept_eng, top_k);
+        }
+
+        // Phase 4c: causal-pattern-aware reranking (only in CausalRerankMode::Limited)
+        let causal_rerank = CausalRerankMode::from_u8(
+            self.causal_rerank_mode
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if causal_rerank == CausalRerankMode::Limited {
+            let causal_eng = self.causal_engine.read();
+            let _report = recall::apply_causal_rerank(&mut scored, &causal_eng, top_k);
+        }
+
+        // Phase 4d: policy-hint-aware reranking (only in PolicyRerankMode::Limited)
+        let policy_rerank = PolicyRerankMode::from_u8(
+            self.policy_rerank_mode
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if policy_rerank == PolicyRerankMode::Limited {
+            let policy_eng = self.policy_engine.read();
+            let _report = recall::apply_policy_rerank(&mut scored, &policy_eng, top_k);
+        }
+
         self.recall_finalize(&scored, query, session_id);
         Ok(scored)
     }
@@ -1197,13 +1240,18 @@ impl Aura {
             rec.source_type = st.to_string();
         }
 
+        let namespace = rec.namespace.clone();
         self.cognitive_store.append_update(rec)?;
+        let updated = rec.clone();
+        drop(records);
+
+        self.refresh_deterministic_relations_for_namespace(&namespace)?;
 
         // Invalidate recall cache on write
         self.recall_cache.clear();
         self.structured_recall_cache.clear();
 
-        Ok(Some(rec.clone()))
+        Ok(Some(updated))
     }
 
     /// Delete a record.
@@ -2070,6 +2118,7 @@ impl Aura {
             // Persist causal state (best-effort)
             let _ = self.causal_store.save(&causal_eng);
             background_brain::CausalPhaseReport {
+                skipped: cr.skipped,
                 edges_found: cr.edges_found,
                 explicit_edges_found: cr.explicit_edges_found,
                 temporal_edges_found: cr.temporal_edges_found,
@@ -2297,7 +2346,7 @@ impl Aura {
         let concept_surface = {
             let mode = self.get_concept_surface_mode();
             let (surfaced_concepts_available, surfaced_namespaces) =
-                if mode == ConceptSurfaceMode::Inspect {
+                if mode == ConceptSurfaceMode::Inspect || mode == ConceptSurfaceMode::Limited {
                     let concept_eng = self.concept_engine.read();
                     let surfaced = crate::concept::surface_concepts(&concept_eng, None);
                     let namespaces: HashSet<String> =
@@ -2455,7 +2504,8 @@ impl Aura {
         &self,
         limit: Option<usize>,
     ) -> Vec<crate::concept::SurfacedConcept> {
-        if self.get_concept_surface_mode() != ConceptSurfaceMode::Inspect {
+        let mode = self.get_concept_surface_mode();
+        if mode != ConceptSurfaceMode::Inspect && mode != ConceptSurfaceMode::Limited {
             return Vec::new();
         }
         let engine = self.concept_engine.read();
@@ -2470,7 +2520,8 @@ impl Aura {
         namespace: &str,
         limit: Option<usize>,
     ) -> Vec<crate::concept::SurfacedConcept> {
-        if self.get_concept_surface_mode() != ConceptSurfaceMode::Inspect {
+        let mode = self.get_concept_surface_mode();
+        if mode != ConceptSurfaceMode::Inspect && mode != ConceptSurfaceMode::Limited {
             return Vec::new();
         }
         let engine = self.concept_engine.read();
@@ -2488,7 +2539,8 @@ impl Aura {
         record_id: &str,
         limit: Option<usize>,
     ) -> Vec<crate::concept::SurfacedConcept> {
-        if self.get_concept_surface_mode() != ConceptSurfaceMode::Inspect {
+        let mode = self.get_concept_surface_mode();
+        if mode != ConceptSurfaceMode::Inspect && mode != ConceptSurfaceMode::Limited {
             return Vec::new();
         }
         let max = limit.unwrap_or(3).min(3);
@@ -2500,6 +2552,1829 @@ impl Aura {
             .collect();
         self.track_record_concept_surface_call(surfaced.len());
         surfaced
+    }
+
+    fn upsert_structural_connection(
+        rec: &mut Record,
+        other_id: &str,
+        weight: f32,
+        relation_type: &str,
+    ) -> bool {
+        let current_weight = rec.connections.get(other_id).copied();
+        let current_type = rec.connection_type(other_id);
+        if current_weight == Some(weight) && current_type == Some(relation_type) {
+            return false;
+        }
+        rec.add_typed_connection(other_id, weight, relation_type);
+        true
+    }
+
+    fn build_relation_edges(
+        &self,
+        record_id: Option<&str>,
+        limit: Option<usize>,
+        structural_only: bool,
+    ) -> Vec<RelationEdge> {
+        let max = limit.unwrap_or(STRUCTURAL_RELATION_DEFAULT_LIMIT);
+        let records = self.records.read();
+        let mut seen_pairs = HashSet::new();
+        let mut edges = Vec::new();
+
+        let iter: Box<dyn Iterator<Item = &Record>> = match record_id {
+            Some(record_id) => match records.get(record_id) {
+                Some(rec) => Box::new(std::iter::once(rec)),
+                None => Box::new(std::iter::empty()),
+            },
+            None => Box::new(records.values()),
+        };
+
+        for rec in iter {
+            for (other_id, relation_type) in &rec.connection_types {
+                if structural_only && !relation::is_structural_relation_type(relation_type) {
+                    continue;
+                }
+                let Some(other) = records.get(other_id) else {
+                    continue;
+                };
+
+                let has_reverse = other
+                    .connection_type(&rec.id)
+                    .map(|rev_type| rev_type == relation_type)
+                    .unwrap_or(false);
+                let rec_is_profile = rec.tags.iter().any(|tag| tag == identity::PROFILE_TAG);
+                let other_is_profile = other.tags.iter().any(|tag| tag == identity::PROFILE_TAG);
+                let rec_is_project = rec.tags.iter().any(|tag| tag == "research-project");
+                let other_is_project = other.tags.iter().any(|tag| tag == "research-project");
+                let is_record_scoped = record_id.is_some();
+                let (source_id, target_id, dedupe_key) = if relation_type
+                    == relation::PROJECT_MEMBERSHIP_RELATION
+                    && rec_is_project
+                    && !other_is_project
+                {
+                    (
+                        rec.id.clone(),
+                        other.id.clone(),
+                        (rec.id.clone(), other.id.clone(), relation_type.clone()),
+                    )
+                } else if relation_type == relation::PROJECT_MEMBERSHIP_RELATION
+                    && other_is_project
+                    && !rec_is_project
+                {
+                    (
+                        other.id.clone(),
+                        rec.id.clone(),
+                        (other.id.clone(), rec.id.clone(), relation_type.clone()),
+                    )
+                } else if relation::is_family_relation_type(relation_type)
+                    && rec_is_profile
+                    && !other_is_profile
+                {
+                    (
+                        rec.id.clone(),
+                        other.id.clone(),
+                        (rec.id.clone(), other.id.clone(), relation_type.clone()),
+                    )
+                } else if relation::is_family_relation_type(relation_type)
+                    && other_is_profile
+                    && !rec_is_profile
+                {
+                    (
+                        other.id.clone(),
+                        rec.id.clone(),
+                        (other.id.clone(), rec.id.clone(), relation_type.clone()),
+                    )
+                } else if is_record_scoped {
+                    (
+                        rec.id.clone(),
+                        other.id.clone(),
+                        (rec.id.clone(), other.id.clone(), relation_type.clone()),
+                    )
+                } else if has_reverse {
+                    if rec.id <= other.id {
+                        (
+                            rec.id.clone(),
+                            other.id.clone(),
+                            (rec.id.clone(), other.id.clone(), relation_type.clone()),
+                        )
+                    } else {
+                        (
+                            other.id.clone(),
+                            rec.id.clone(),
+                            (other.id.clone(), rec.id.clone(), relation_type.clone()),
+                        )
+                    }
+                } else {
+                    (
+                        rec.id.clone(),
+                        other.id.clone(),
+                        (rec.id.clone(), other.id.clone(), relation_type.clone()),
+                    )
+                };
+
+                if !seen_pairs.insert(dedupe_key) {
+                    continue;
+                }
+
+                edges.push(RelationEdge {
+                    source_record_id: source_id,
+                    target_record_id: target_id,
+                    relation_type: relation_type.clone(),
+                    weight: rec.connections.get(other_id).copied().unwrap_or(0.0),
+                    namespace: rec.namespace.clone(),
+                    structural: relation::is_structural_relation_type(relation_type),
+                });
+
+                if edges.len() >= max {
+                    return edges;
+                }
+            }
+        }
+
+        edges
+    }
+
+    fn refresh_family_relations_for_namespace(&self, namespace: &str) -> Result<usize> {
+        let mut changed_records: HashMap<String, Record> = HashMap::new();
+
+        {
+            let mut records = self.records.write();
+            let Some(profile_id) = records
+                .values()
+                .find(|rec| {
+                    rec.namespace == namespace
+                        && rec.tags.iter().any(|tag| tag == identity::PROFILE_TAG)
+                })
+                .map(|rec| rec.id.clone())
+            else {
+                return Ok(0);
+            };
+
+            let relation_targets: Vec<(String, String)> = records
+                .values()
+                .filter(|rec| rec.namespace == namespace && rec.id != profile_id)
+                .filter_map(|rec| {
+                    rec.metadata
+                        .get("family_relation")
+                        .and_then(|relation_type| {
+                            relation::is_family_relation_type(relation_type)
+                                .then_some(relation_type.clone())
+                        })
+                        .or_else(|| {
+                            relation::detect_family_relation(&rec.content)
+                                .map(|relation_type| relation_type.to_string())
+                        })
+                        .map(|relation_type| (rec.id.clone(), relation_type))
+                })
+                .collect();
+
+            for (record_id, relation_type) in relation_targets {
+                if let Some(profile) = records.get_mut(&profile_id) {
+                    if Self::upsert_structural_connection(
+                        profile,
+                        &record_id,
+                        relation::STRUCTURAL_FAMILY_WEIGHT,
+                        &relation_type,
+                    ) {
+                        changed_records.insert(profile.id.clone(), profile.clone());
+                    }
+                }
+
+                if let Some(target) = records.get_mut(&record_id) {
+                    if Self::upsert_structural_connection(
+                        target,
+                        &profile_id,
+                        relation::STRUCTURAL_FAMILY_WEIGHT,
+                        &relation_type,
+                    ) {
+                        changed_records.insert(target.id.clone(), target.clone());
+                    }
+                }
+            }
+        }
+
+        if changed_records.is_empty() {
+            return Ok(0);
+        }
+
+        for rec in changed_records.values() {
+            self.cognitive_store.append_update(rec)?;
+        }
+        self.recall_cache.clear();
+        self.structured_recall_cache.clear();
+
+        Ok(changed_records.len())
+    }
+
+    fn find_profile_record(&self, namespace: Option<&str>) -> Option<Record> {
+        let records = self.records.read();
+        records
+            .values()
+            .filter(|rec| rec.tags.iter().any(|tag| tag == identity::PROFILE_TAG))
+            .find(|rec| namespace.map(|ns| rec.namespace == ns).unwrap_or(true))
+            .cloned()
+    }
+
+    fn normalize_entity_component(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        let mut last_sep = false;
+        for ch in value.chars().flat_map(char::to_lowercase) {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch);
+                last_sep = false;
+            } else if !last_sep {
+                out.push('-');
+                last_sep = true;
+            }
+        }
+        out.trim_matches('-').to_string()
+    }
+
+    fn derive_family_entity_id(
+        relation_type: &str,
+        metadata: &HashMap<String, String>,
+        content: &str,
+    ) -> Option<String> {
+        if let Some(entity_id) = metadata.get("entity_id") {
+            if !entity_id.trim().is_empty() {
+                return Some(entity_id.clone());
+            }
+        }
+        let seed = metadata
+            .get("name")
+            .map(|s| s.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(content);
+        let normalized = Self::normalize_entity_component(seed);
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(format!("person:{}:{}", relation_type, normalized))
+        }
+    }
+
+    fn refresh_project_membership_relations_for_namespace(&self, namespace: &str) -> Result<usize> {
+        let mut changed_records: HashMap<String, Record> = HashMap::new();
+
+        {
+            let mut records = self.records.write();
+            let project_anchors: HashMap<String, String> = records
+                .values()
+                .filter(|rec| {
+                    rec.namespace == namespace
+                        && rec.tags.iter().any(|tag| tag == "research-project")
+                })
+                .filter_map(|rec| {
+                    rec.metadata
+                        .get("project_id")
+                        .cloned()
+                        .map(|project_id| (project_id, rec.id.clone()))
+                })
+                .collect();
+
+            if project_anchors.is_empty() {
+                return Ok(0);
+            }
+
+            let relation_targets: Vec<(String, String)> = records
+                .values()
+                .filter(|rec| rec.namespace == namespace)
+                .filter_map(|rec| {
+                    if rec.tags.iter().any(|tag| tag == "research-project") {
+                        return None;
+                    }
+                    rec.metadata.get("project_id").and_then(|project_id| {
+                        project_anchors
+                            .get(project_id)
+                            .map(|anchor_id| (rec.id.clone(), anchor_id.clone()))
+                    })
+                })
+                .collect();
+
+            for (report_id, project_id) in relation_targets {
+                if let Some(project) = records.get_mut(&project_id) {
+                    if Self::upsert_structural_connection(
+                        project,
+                        &report_id,
+                        relation::STRUCTURAL_PROJECT_WEIGHT,
+                        relation::PROJECT_MEMBERSHIP_RELATION,
+                    ) {
+                        changed_records.insert(project.id.clone(), project.clone());
+                    }
+                }
+
+                if let Some(report) = records.get_mut(&report_id) {
+                    if Self::upsert_structural_connection(
+                        report,
+                        &project_id,
+                        relation::STRUCTURAL_PROJECT_WEIGHT,
+                        relation::PROJECT_MEMBERSHIP_RELATION,
+                    ) {
+                        changed_records.insert(report.id.clone(), report.clone());
+                    }
+                }
+            }
+        }
+
+        if changed_records.is_empty() {
+            return Ok(0);
+        }
+
+        for rec in changed_records.values() {
+            self.cognitive_store.append_update(rec)?;
+        }
+        self.recall_cache.clear();
+        self.structured_recall_cache.clear();
+
+        Ok(changed_records.len())
+    }
+
+    fn refresh_deterministic_relations_for_namespace(&self, namespace: &str) -> Result<usize> {
+        let mut changed = 0;
+        changed += self.refresh_family_relations_for_namespace(namespace)?;
+        changed += self.refresh_project_membership_relations_for_namespace(namespace)?;
+        Ok(changed)
+    }
+
+    fn ensure_research_project_anchor(&self, project: &ResearchProject) -> Result<Record> {
+        let metadata = HashMap::from([
+            ("project_id".to_string(), project.id.clone()),
+            ("entity_id".to_string(), format!("project:{}", project.id)),
+            ("project_topic".to_string(), project.topic.clone()),
+            ("project_depth".to_string(), project.depth.clone()),
+            (
+                "project_status".to_string(),
+                match project.status {
+                    crate::research::ResearchStatus::Active => "active",
+                    crate::research::ResearchStatus::Completed => "completed",
+                    crate::research::ResearchStatus::Cancelled => "cancelled",
+                }
+                .to_string(),
+            ),
+            ("project_created_at".to_string(), project.created_at.clone()),
+        ]);
+        let content = format!(
+            "Research Project: {}\nDepth: {}\nStatus: {}\nProject ID: {}",
+            project.topic,
+            project.depth,
+            metadata.get("project_status").cloned().unwrap_or_default(),
+            project.id
+        );
+
+        let existing_id = {
+            let records = self.records.read();
+            records
+                .values()
+                .find(|rec| {
+                    rec.tags.iter().any(|tag| tag == "research-project")
+                        && rec
+                            .metadata
+                            .get("project_id")
+                            .map(|value| value == &project.id)
+                            .unwrap_or(false)
+                })
+                .map(|rec| rec.id.clone())
+        };
+
+        if let Some(record_id) = existing_id {
+            self.update(
+                &record_id,
+                Some(&content),
+                None,
+                None,
+                None,
+                Some(metadata),
+                None,
+            )?
+            .ok_or_else(|| anyhow::anyhow!("Research project anchor disappeared"))
+        } else {
+            self.store(
+                &content,
+                Some(Level::Domain),
+                Some(vec!["research-project".into()]),
+                Some(false),
+                None,
+                Some("recorded"),
+                Some(metadata),
+                Some(false),
+                None,
+                None,
+                Some("fact"),
+            )
+        }
+    }
+
+    fn ensure_project_anchor_by_id(&self, project_id: &str) -> Result<Record> {
+        let existing_id = {
+            let records = self.records.read();
+            records
+                .values()
+                .find(|rec| {
+                    rec.tags.iter().any(|tag| tag == "research-project")
+                        && rec
+                            .metadata
+                            .get("project_id")
+                            .map(|value| value == project_id)
+                            .unwrap_or(false)
+                })
+                .map(|rec| rec.id.clone())
+        };
+
+        if let Some(record_id) = existing_id {
+            return self
+                .get(&record_id)
+                .ok_or_else(|| anyhow::anyhow!("Project anchor disappeared"));
+        }
+
+        let project = self
+            .research_engine
+            .get_project(project_id)
+            .ok_or_else(|| anyhow::anyhow!("Project {} not found", project_id))?;
+        self.ensure_research_project_anchor(&project)
+    }
+
+    fn build_project_graph_snapshot(
+        &self,
+        project_anchor: &Record,
+    ) -> Option<ProjectGraphSnapshot> {
+        let project_id = project_anchor.metadata.get("project_id")?.clone();
+        let project_topic = project_anchor
+            .metadata
+            .get("project_topic")
+            .cloned()
+            .unwrap_or_default();
+        let records = self.records.read();
+        let mut member_ids = Vec::new();
+        let mut member_tags: HashMap<String, usize> = HashMap::new();
+
+        for rec in records.values() {
+            if rec.id == project_anchor.id {
+                continue;
+            }
+            if rec.metadata.get("project_id") != Some(&project_id) {
+                continue;
+            }
+            member_ids.push(rec.id.clone());
+            for tag in &rec.tags {
+                *member_tags.entry(tag.clone()).or_insert(0) += 1;
+            }
+        }
+
+        member_ids.sort();
+
+        Some(ProjectGraphSnapshot {
+            project_id,
+            project_record_id: project_anchor.id.clone(),
+            project_topic,
+            namespace: project_anchor.namespace.clone(),
+            relation_count: member_ids.len(),
+            member_record_ids: member_ids,
+            member_tags,
+        })
+    }
+
+    fn collect_project_records(
+        &self,
+        project_id: &str,
+    ) -> Option<(Record, HashMap<String, Record>)> {
+        let project_anchor = self.ensure_project_anchor_by_id(project_id).ok()?;
+        let records = self.records.read();
+        let mut scoped_records = HashMap::new();
+        scoped_records.insert(project_anchor.id.clone(), project_anchor.clone());
+
+        for rec in records.values() {
+            if rec.id == project_anchor.id {
+                continue;
+            }
+            if rec.metadata.get("project_id") == Some(&project_id.to_string()) {
+                scoped_records.insert(rec.id.clone(), rec.clone());
+            }
+        }
+
+        Some((project_anchor, scoped_records))
+    }
+
+    fn record_marked_completed(rec: &Record) -> bool {
+        rec.metadata
+            .get("completed")
+            .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false)
+            || rec
+                .metadata
+                .get("status")
+                .map(|v| matches!(v.as_str(), "done" | "completed" | "closed"))
+                .unwrap_or(false)
+    }
+
+    fn parse_due_date_for_timeline(due_str: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+        chrono::DateTime::parse_from_rfc3339(due_str)
+            .ok()
+            .or_else(|| {
+                chrono::NaiveDate::parse_from_str(due_str, "%Y-%m-%d")
+                    .ok()
+                    .and_then(|d| d.and_hms_opt(0, 0, 0))
+                    .map(|dt| dt.and_utc().fixed_offset())
+            })
+    }
+
+    /// Return deterministic structural relations built from typed record connections.
+    pub fn get_structural_relations(&self, limit: Option<usize>) -> Vec<StructuralRelation> {
+        self.build_relation_edges(None, limit, true)
+            .into_iter()
+            .map(|edge| StructuralRelation {
+                source_record_id: edge.source_record_id,
+                target_record_id: edge.target_record_id,
+                relation_type: edge.relation_type,
+                weight: edge.weight,
+                namespace: edge.namespace,
+                evidence_record_ids: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Return deterministic structural relations touching a specific record.
+    pub fn get_structural_relations_for_record(
+        &self,
+        record_id: &str,
+        limit: Option<usize>,
+    ) -> Vec<StructuralRelation> {
+        self.build_relation_edges(Some(record_id), limit, true)
+            .into_iter()
+            .map(|edge| StructuralRelation {
+                source_record_id: edge.source_record_id,
+                target_record_id: edge.target_record_id,
+                relation_type: edge.relation_type,
+                weight: edge.weight,
+                namespace: edge.namespace,
+                evidence_record_ids: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Return all explicit typed relation edges.
+    pub fn get_relations(&self, limit: Option<usize>) -> Vec<RelationEdge> {
+        self.build_relation_edges(None, limit, false)
+    }
+
+    /// Return explicit typed relation edges touching one record.
+    pub fn get_relations_for_record(
+        &self,
+        record_id: &str,
+        limit: Option<usize>,
+    ) -> Vec<RelationEdge> {
+        self.build_relation_edges(Some(record_id), limit, false)
+    }
+
+    /// Return a bounded digest of direct typed relations for one record.
+    pub fn get_relation_digest(
+        &self,
+        record_id: &str,
+        limit: Option<usize>,
+    ) -> Option<RelationDigest> {
+        let anchor = {
+            let records = self.records.read();
+            records.get(record_id)?.clone()
+        };
+
+        let edges = self.get_relations_for_record(record_id, limit);
+        let mut relation_types = HashMap::new();
+        let mut linked_record_ids = Vec::new();
+        let mut structural_relations = 0;
+        let mut non_structural_relations = 0;
+
+        for edge in &edges {
+            *relation_types
+                .entry(edge.relation_type.clone())
+                .or_insert(0) += 1;
+            if edge.structural {
+                structural_relations += 1;
+            } else {
+                non_structural_relations += 1;
+            }
+
+            let other_id = if edge.source_record_id == record_id {
+                edge.target_record_id.clone()
+            } else {
+                edge.source_record_id.clone()
+            };
+            if !linked_record_ids.contains(&other_id) {
+                linked_record_ids.push(other_id);
+            }
+        }
+
+        Some(RelationDigest {
+            anchor_record_id: anchor.id,
+            namespace: anchor.namespace,
+            anchor_tags: anchor.tags,
+            anchor_content: anchor.content,
+            relation_count: edges.len(),
+            structural_relations,
+            non_structural_relations,
+            relation_types,
+            linked_record_ids,
+            edges,
+        })
+    }
+
+    fn collect_entity_records(&self, entity_id: &str) -> Option<(String, HashMap<String, Record>)> {
+        let records = self.records.read();
+        let mut namespace = None;
+        let mut scoped = HashMap::new();
+
+        for rec in records.values() {
+            if rec.metadata.get("entity_id") != Some(&entity_id.to_string()) {
+                continue;
+            }
+            if namespace.is_none() {
+                namespace = Some(rec.namespace.clone());
+            }
+            if namespace.as_deref() != Some(rec.namespace.as_str()) {
+                continue;
+            }
+            scoped.insert(rec.id.clone(), rec.clone());
+        }
+
+        Some((namespace?, scoped)).filter(|(_, scoped)| !scoped.is_empty())
+    }
+
+    fn select_entity_anchor_record(&self, entity_id: &str) -> Option<Record> {
+        let (_, scoped) = self.collect_entity_records(entity_id)?;
+        let mut records: Vec<Record> = scoped.into_values().collect();
+        records.sort_by(|a, b| {
+            let a_project = a.tags.iter().any(|tag| tag == "research-project");
+            let b_project = b.tags.iter().any(|tag| tag == "research-project");
+            let a_profile = a.tags.iter().any(|tag| tag == identity::PROFILE_TAG);
+            let b_profile = b.tags.iter().any(|tag| tag == identity::PROFILE_TAG);
+            b_project
+                .cmp(&a_project)
+                .then_with(|| b_profile.cmp(&a_profile))
+                .then_with(|| b.level.value().cmp(&a.level.value()))
+                .then_with(|| a.created_at.total_cmp(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        records.into_iter().next()
+    }
+
+    fn promote_record_link_to_entity_anchors(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        relation_type: &str,
+        weight: f32,
+    ) -> Result<usize> {
+        if weight < ENTITY_RELATION_PROMOTION_MIN_WEIGHT {
+            return Ok(0);
+        }
+
+        let (source_entity_id, target_entity_id) = {
+            let records = self.records.read();
+            let Some(source) = records.get(source_id) else {
+                return Ok(0);
+            };
+            let Some(target) = records.get(target_id) else {
+                return Ok(0);
+            };
+            let Some(source_entity_id) = source.metadata.get("entity_id").cloned() else {
+                return Ok(0);
+            };
+            let Some(target_entity_id) = target.metadata.get("entity_id").cloned() else {
+                return Ok(0);
+            };
+            if source_entity_id == target_entity_id {
+                return Ok(0);
+            }
+            (source_entity_id, target_entity_id)
+        };
+
+        let Some(source_anchor) = self.select_entity_anchor_record(&source_entity_id) else {
+            return Ok(0);
+        };
+        let Some(target_anchor) = self.select_entity_anchor_record(&target_entity_id) else {
+            return Ok(0);
+        };
+
+        let mut changed_records: Vec<Record> = Vec::new();
+        {
+            let mut records = self.records.write();
+            if let Some(source) = records.get_mut(&source_anchor.id) {
+                if Self::upsert_structural_connection(
+                    source,
+                    &target_anchor.id,
+                    weight,
+                    relation_type,
+                ) {
+                    changed_records.push(source.clone());
+                }
+            }
+            if let Some(target) = records.get_mut(&target_anchor.id) {
+                if Self::upsert_structural_connection(
+                    target,
+                    &source_anchor.id,
+                    weight,
+                    relation_type,
+                ) {
+                    changed_records.push(target.clone());
+                }
+            }
+        }
+
+        for rec in &changed_records {
+            self.cognitive_store.append_update(rec)?;
+        }
+        if !changed_records.is_empty() {
+            self.recall_cache.clear();
+            self.structured_recall_cache.clear();
+        }
+
+        Ok(changed_records.len())
+    }
+
+    /// Return an aggregate digest for one local entity id.
+    pub fn get_entity_digest(&self, entity_id: &str) -> Option<EntityDigest> {
+        let (namespace, scoped) = self.collect_entity_records(entity_id)?;
+        let mut tags = HashMap::new();
+        let mut levels = HashMap::new();
+        let mut record_ids = Vec::new();
+        let mut relation_count = 0;
+
+        for rec in scoped.values() {
+            record_ids.push(rec.id.clone());
+            relation_count += rec.connection_types.len();
+            for tag in &rec.tags {
+                *tags.entry(tag.clone()).or_insert(0) += 1;
+            }
+            *levels.entry(rec.level.name().to_string()).or_insert(0) += 1;
+        }
+
+        record_ids.sort();
+
+        Some(EntityDigest {
+            entity_id: entity_id.to_string(),
+            namespace,
+            record_ids,
+            relation_count,
+            tags,
+            levels,
+        })
+    }
+
+    /// Return an aggregate digest inferred from a record's `entity_id`.
+    pub fn get_entity_digest_for_record(&self, record_id: &str) -> Option<EntityDigest> {
+        let entity_id = {
+            let records = self.records.read();
+            records.get(record_id)?.metadata.get("entity_id")?.clone()
+        };
+        self.get_entity_digest(&entity_id)
+    }
+
+    /// Return a bounded entity graph snapshot for one local entity.
+    pub fn get_entity_graph_digest(
+        &self,
+        entity_id: &str,
+        limit: Option<usize>,
+    ) -> Option<EntityGraphDigest> {
+        let entity = self.get_entity_digest(entity_id)?;
+        let anchor = self.select_entity_anchor_record(entity_id)?;
+        let edges = self.get_entity_relations(entity_id, limit);
+        let mut relation_types = HashMap::new();
+        let mut neighbors = Vec::new();
+
+        for edge in &edges {
+            *relation_types
+                .entry(edge.relation_type.clone())
+                .or_insert(0) += 1;
+        }
+
+        let mut grouped: HashMap<String, Vec<&EntityRelationEdge>> = HashMap::new();
+        for edge in &edges {
+            grouped
+                .entry(edge.target_entity_id.clone())
+                .or_default()
+                .push(edge);
+        }
+
+        for (neighbor_entity_id, neighbor_edges) in grouped {
+            let Some(neighbor_digest) = self.get_entity_digest(&neighbor_entity_id) else {
+                continue;
+            };
+            let Some(neighbor_anchor) = self.select_entity_anchor_record(&neighbor_entity_id)
+            else {
+                continue;
+            };
+            let mut neighbor_relation_types = HashMap::new();
+            let mut strongest_weight: f32 = 0.0;
+            for edge in &neighbor_edges {
+                *neighbor_relation_types
+                    .entry(edge.relation_type.clone())
+                    .or_insert(0) += 1;
+                strongest_weight = strongest_weight.max(edge.weight);
+            }
+            neighbors.push(EntityGraphNeighbor {
+                entity_id: neighbor_entity_id,
+                anchor_record_id: neighbor_anchor.id,
+                record_count: neighbor_digest.record_ids.len(),
+                relation_count: neighbor_edges.len(),
+                relation_types: neighbor_relation_types,
+                strongest_weight,
+            });
+        }
+
+        neighbors.sort_by(|a, b| {
+            b.strongest_weight
+                .total_cmp(&a.strongest_weight)
+                .then_with(|| a.entity_id.cmp(&b.entity_id))
+        });
+
+        Some(EntityGraphDigest {
+            entity,
+            anchor_record_id: anchor.id,
+            neighbor_count: neighbors.len(),
+            relation_types,
+            neighbors,
+            edges,
+        })
+    }
+
+    /// Return top-N neighbor `EntityGraphDigest` objects for one entity.
+    ///
+    /// Neighbors are taken from the entity's own `EntityGraphDigest` (already sorted by
+    /// `strongest_weight` desc, then `entity_id`), optionally filtered by a relation-type
+    /// prefix, then truncated to `top_n`.  For each surviving neighbor entity its own
+    /// `EntityGraphDigest` is built and returned in the same order.
+    ///
+    /// Parameters
+    /// - `entity_id`           — anchor entity
+    /// - `top_n`               — max neighbors to return (default: all)
+    /// - `min_weight`          — drop neighbors whose `strongest_weight` is below this
+    /// - `relation_type_filter`— keep only neighbors connected by a relation whose type
+    ///                           starts with this prefix (e.g. `"supports"`)
+    /// - `edge_limit`          — forwarded to `get_entity_graph_digest` / `get_entity_relations`
+    pub fn get_entity_graph_neighbors(
+        &self,
+        entity_id: &str,
+        top_n: Option<usize>,
+        min_weight: Option<f32>,
+        relation_type_filter: Option<&str>,
+        edge_limit: Option<usize>,
+    ) -> Vec<EntityGraphDigest> {
+        let Some(anchor_digest) = self.get_entity_graph_digest(entity_id, edge_limit) else {
+            return Vec::new();
+        };
+        let min_w = min_weight.unwrap_or(0.0);
+        let mut neighbors: Vec<&EntityGraphNeighbor> = anchor_digest
+            .neighbors
+            .iter()
+            .filter(|n| n.strongest_weight >= min_w)
+            .filter(|n| {
+                relation_type_filter
+                    .map(|prefix| n.relation_types.keys().any(|rt| rt.starts_with(prefix)))
+                    .unwrap_or(true)
+            })
+            .collect();
+        if let Some(k) = top_n {
+            neighbors.truncate(k);
+        }
+        neighbors
+            .into_iter()
+            .filter_map(|n| self.get_entity_graph_digest(&n.entity_id, edge_limit))
+            .collect()
+    }
+
+    /// Return a bounded entity graph snapshot inferred from a record's `entity_id`.
+    pub fn get_entity_graph_digest_for_record(
+        &self,
+        record_id: &str,
+        limit: Option<usize>,
+    ) -> Option<EntityGraphDigest> {
+        let entity_id = {
+            let records = self.records.read();
+            records.get(record_id)?.metadata.get("entity_id")?.clone()
+        };
+        self.get_entity_graph_digest(&entity_id, limit)
+    }
+
+    /// Link two local entities by connecting their deterministic anchor records.
+    pub fn link_entities(
+        &self,
+        source_entity_id: &str,
+        target_entity_id: &str,
+        relation_type: &str,
+        weight: Option<f32>,
+    ) -> Result<EntityRelationEdge> {
+        if source_entity_id == target_entity_id {
+            anyhow::bail!("Cannot link entity to itself");
+        }
+        let source = self
+            .select_entity_anchor_record(source_entity_id)
+            .ok_or_else(|| anyhow::anyhow!("Source entity {} not found", source_entity_id))?;
+        let target = self
+            .select_entity_anchor_record(target_entity_id)
+            .ok_or_else(|| anyhow::anyhow!("Target entity {} not found", target_entity_id))?;
+        let edge = self.link_records(&source.id, &target.id, relation_type, weight)?;
+        Ok(EntityRelationEdge {
+            source_entity_id: source_entity_id.to_string(),
+            target_entity_id: target_entity_id.to_string(),
+            relation_type: edge.relation_type,
+            weight: edge.weight,
+            namespace: edge.namespace,
+            source_record_id: source.id,
+            target_record_id: target.id,
+        })
+    }
+
+    /// Return direct entity-to-entity edges for one local entity.
+    pub fn get_entity_relations(
+        &self,
+        entity_id: &str,
+        limit: Option<usize>,
+    ) -> Vec<EntityRelationEdge> {
+        let Some((namespace, scoped)) = self.collect_entity_records(entity_id) else {
+            return Vec::new();
+        };
+
+        let records = self.records.read();
+        let max = limit.unwrap_or(STRUCTURAL_RELATION_DEFAULT_LIMIT);
+        let source_anchor_id = self
+            .select_entity_anchor_record(entity_id)
+            .map(|rec| rec.id)
+            .unwrap_or_default();
+        let mut aggregated: HashMap<(String, String), EntityRelationEdge> = HashMap::new();
+
+        for rec in scoped.values() {
+            for (other_id, relation_type) in &rec.connection_types {
+                let Some(other) = records.get(other_id) else {
+                    continue;
+                };
+                let Some(other_entity_id) = other.metadata.get("entity_id").cloned() else {
+                    continue;
+                };
+                if other_entity_id == entity_id {
+                    continue;
+                }
+                let target_anchor_id = self
+                    .select_entity_anchor_record(&other_entity_id)
+                    .map(|rec| rec.id)
+                    .unwrap_or_default();
+                let key = (other_entity_id.clone(), relation_type.clone());
+                let candidate = EntityRelationEdge {
+                    source_entity_id: entity_id.to_string(),
+                    target_entity_id: other_entity_id,
+                    relation_type: relation_type.clone(),
+                    weight: rec.connections.get(other_id).copied().unwrap_or(0.0),
+                    namespace: namespace.clone(),
+                    source_record_id: rec.id.clone(),
+                    target_record_id: other.id.clone(),
+                };
+                match aggregated.get(&key) {
+                    Some(existing)
+                        if existing.weight > candidate.weight
+                            || (existing.weight == candidate.weight
+                                && existing.source_record_id == source_anchor_id
+                                && existing.target_record_id == target_anchor_id) => {}
+                    _ => {
+                        aggregated.insert(key, candidate);
+                    }
+                }
+            }
+        }
+
+        let mut edges: Vec<EntityRelationEdge> = aggregated.into_values().collect();
+        edges.sort_by(|a, b| {
+            b.weight
+                .total_cmp(&a.weight)
+                .then_with(|| a.target_entity_id.cmp(&b.target_entity_id))
+                .then_with(|| a.relation_type.cmp(&b.relation_type))
+        });
+        edges.truncate(max);
+        edges
+    }
+
+    /// Create a deterministic explicit typed relation between two existing records.
+    pub fn link_records(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        relation_type: &str,
+        weight: Option<f32>,
+    ) -> Result<RelationEdge> {
+        if source_id == target_id {
+            anyhow::bail!("Cannot link record to itself");
+        }
+        if relation_type.trim().is_empty() {
+            anyhow::bail!("Relation type must not be empty");
+        }
+
+        let clamped_weight = weight.unwrap_or(0.8).clamp(0.0, 1.0);
+        let mut changed_records: Vec<Record> = Vec::new();
+        let namespace = {
+            let records = self.records.read();
+            let source = records
+                .get(source_id)
+                .ok_or_else(|| anyhow::anyhow!("Source record {} not found", source_id))?;
+            let target = records
+                .get(target_id)
+                .ok_or_else(|| anyhow::anyhow!("Target record {} not found", target_id))?;
+            if source.namespace != target.namespace {
+                anyhow::bail!(
+                    "Cannot link records across namespaces: {} vs {}",
+                    source.namespace,
+                    target.namespace
+                );
+            }
+            source.namespace.clone()
+        };
+
+        {
+            let mut records = self.records.write();
+            if let Some(source) = records.get_mut(source_id) {
+                if Self::upsert_structural_connection(
+                    source,
+                    target_id,
+                    clamped_weight,
+                    relation_type,
+                ) {
+                    changed_records.push(source.clone());
+                }
+            }
+            if let Some(target) = records.get_mut(target_id) {
+                if Self::upsert_structural_connection(
+                    target,
+                    source_id,
+                    clamped_weight,
+                    relation_type,
+                ) {
+                    changed_records.push(target.clone());
+                }
+            }
+        }
+
+        for rec in &changed_records {
+            self.cognitive_store.append_update(rec)?;
+        }
+        self.promote_record_link_to_entity_anchors(
+            source_id,
+            target_id,
+            relation_type,
+            clamped_weight,
+        )?;
+        if !changed_records.is_empty() {
+            self.recall_cache.clear();
+            self.structured_recall_cache.clear();
+        }
+
+        Ok(RelationEdge {
+            source_record_id: source_id.to_string(),
+            target_record_id: target_id.to_string(),
+            relation_type: relation_type.to_string(),
+            weight: clamped_weight,
+            namespace,
+            structural: relation::is_structural_relation_type(relation_type),
+        })
+    }
+
+    /// Recall only within one direct typed-relation corridor.
+    pub fn recall_relation_context(
+        &self,
+        record_id: &str,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(f32, Record)>> {
+        let digest = self
+            .get_relation_digest(record_id, limit)
+            .ok_or_else(|| anyhow::anyhow!("Relation digest not found for {}", record_id))?;
+
+        let scoped_records = {
+            let records = self.records.read();
+            let mut scoped = HashMap::new();
+            if let Some(anchor) = records.get(&digest.anchor_record_id) {
+                scoped.insert(anchor.id.clone(), anchor.clone());
+            }
+            for linked_id in &digest.linked_record_ids {
+                if let Some(rec) = records.get(linked_id) {
+                    scoped.insert(rec.id.clone(), rec.clone());
+                }
+            }
+            scoped
+        };
+
+        let top = top_k.unwrap_or(10);
+        let ngram = self.ngram_index.read();
+        let tag_idx = self.tag_index.read();
+        let aura_idx = self.aura_index.read();
+        let trust_config = self.trust_config.read();
+        let embedding_ranked = self.collect_embedding_signal(query, top);
+        let ns = [digest.namespace.as_str()];
+
+        let scored = recall::recall_pipeline(
+            query,
+            top,
+            min_strength.unwrap_or(0.1),
+            expand_connections.unwrap_or(true),
+            &self.sdr,
+            &self.index,
+            &self.storage,
+            &ngram,
+            &tag_idx,
+            &aura_idx,
+            &scoped_records,
+            embedding_ranked,
+            Some(&trust_config),
+            Some(&ns),
+        );
+
+        drop(ngram);
+        drop(tag_idx);
+        drop(aura_idx);
+        drop(trust_config);
+
+        {
+            let mut records = self.records.write();
+            let mut tracker = self.session_tracker.write();
+            recall::activate_and_strengthen(&scored, &mut records, &mut tracker, session_id);
+        }
+
+        if let Some(ref log) = self.audit_log {
+            let _ = log.log_retrieve(query, scored.len());
+        }
+
+        Ok(scored)
+    }
+
+    /// Recall within one entity plus its direct linked entity neighbors.
+    pub fn recall_entity_graph_context(
+        &self,
+        entity_id: &str,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(f32, Record)>> {
+        let (namespace, mut scoped_records) = self
+            .collect_entity_records(entity_id)
+            .ok_or_else(|| anyhow::anyhow!("Entity {} not found", entity_id))?;
+
+        for edge in self.get_entity_relations(entity_id, limit) {
+            if let Some((_, related_records)) = self.collect_entity_records(&edge.target_entity_id)
+            {
+                for (id, rec) in related_records {
+                    scoped_records.insert(id, rec);
+                }
+            }
+        }
+
+        let top = top_k.unwrap_or(10);
+        let ngram = self.ngram_index.read();
+        let tag_idx = self.tag_index.read();
+        let aura_idx = self.aura_index.read();
+        let trust_config = self.trust_config.read();
+        let embedding_ranked = self.collect_embedding_signal(query, top);
+        let ns = [namespace.as_str()];
+
+        let scored = recall::recall_pipeline(
+            query,
+            top,
+            min_strength.unwrap_or(0.1),
+            expand_connections.unwrap_or(true),
+            &self.sdr,
+            &self.index,
+            &self.storage,
+            &ngram,
+            &tag_idx,
+            &aura_idx,
+            &scoped_records,
+            embedding_ranked,
+            Some(&trust_config),
+            Some(&ns),
+        );
+
+        drop(ngram);
+        drop(tag_idx);
+        drop(aura_idx);
+        drop(trust_config);
+
+        {
+            let mut records = self.records.write();
+            let mut tracker = self.session_tracker.write();
+            recall::activate_and_strengthen(&scored, &mut records, &mut tracker, session_id);
+        }
+
+        if let Some(ref log) = self.audit_log {
+            let _ = log.log_retrieve(query, scored.len());
+        }
+
+        Ok(scored)
+    }
+
+    /// Recall only within one local entity corridor.
+    pub fn recall_entity_context(
+        &self,
+        entity_id: &str,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<(f32, Record)>> {
+        let (namespace, scoped_records) = self
+            .collect_entity_records(entity_id)
+            .ok_or_else(|| anyhow::anyhow!("Entity {} not found", entity_id))?;
+
+        let top = top_k.unwrap_or(10);
+        let ngram = self.ngram_index.read();
+        let tag_idx = self.tag_index.read();
+        let aura_idx = self.aura_index.read();
+        let trust_config = self.trust_config.read();
+        let embedding_ranked = self.collect_embedding_signal(query, top);
+        let ns = [namespace.as_str()];
+
+        let scored = recall::recall_pipeline(
+            query,
+            top,
+            min_strength.unwrap_or(0.1),
+            expand_connections.unwrap_or(true),
+            &self.sdr,
+            &self.index,
+            &self.storage,
+            &ngram,
+            &tag_idx,
+            &aura_idx,
+            &scoped_records,
+            embedding_ranked,
+            Some(&trust_config),
+            Some(&ns),
+        );
+
+        drop(ngram);
+        drop(tag_idx);
+        drop(aura_idx);
+        drop(trust_config);
+
+        {
+            let mut records = self.records.write();
+            let mut tracker = self.session_tracker.write();
+            recall::activate_and_strengthen(&scored, &mut records, &mut tracker, session_id);
+        }
+
+        if let Some(ref log) = self.audit_log {
+            let _ = log.log_retrieve(query, scored.len());
+        }
+
+        Ok(scored)
+    }
+
+    /// Recall only within an entity inferred from one record.
+    pub fn recall_entity_context_for_record(
+        &self,
+        record_id: &str,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<(f32, Record)>> {
+        let entity_id = {
+            let records = self.records.read();
+            records
+                .get(record_id)
+                .and_then(|rec| rec.metadata.get("entity_id"))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Record {} has no entity_id", record_id))?
+        };
+        self.recall_entity_context(
+            &entity_id,
+            query,
+            top_k,
+            min_strength,
+            expand_connections,
+            session_id,
+        )
+    }
+
+    fn build_family_graph_snapshot(&self, profile: &Record) -> FamilyGraphSnapshot {
+        let records = self.records.read();
+        let mut relation_types = HashMap::new();
+        let mut members = Vec::new();
+
+        for (other_id, relation_type) in &profile.connection_types {
+            if !relation_type.starts_with("family.") {
+                continue;
+            }
+            let Some(other) = records.get(other_id) else {
+                continue;
+            };
+            *relation_types.entry(relation_type.clone()).or_insert(0) += 1;
+            members.push(FamilyRelationMember {
+                record_id: other.id.clone(),
+                relation_type: relation_type.clone(),
+                weight: profile.connections.get(other_id).copied().unwrap_or(0.0),
+                tags: other.tags.clone(),
+                content: other.content.clone(),
+            });
+        }
+
+        members.sort_by(|a, b| {
+            a.relation_type
+                .cmp(&b.relation_type)
+                .then_with(|| a.record_id.cmp(&b.record_id))
+        });
+
+        FamilyGraphSnapshot {
+            namespace: profile.namespace.clone(),
+            profile_record_id: profile.id.clone(),
+            relation_count: members.len(),
+            relation_types,
+            members,
+        }
+    }
+
+    /// Return a deterministic self/family graph snapshot for one namespace.
+    pub fn get_family_graph(&self, namespace: Option<&str>) -> Option<FamilyGraphSnapshot> {
+        let profile = {
+            let records = self.records.read();
+            records
+                .values()
+                .filter(|rec| rec.tags.iter().any(|tag| tag == identity::PROFILE_TAG))
+                .find(|rec| namespace.map(|ns| rec.namespace == ns).unwrap_or(true))
+                .cloned()
+        }?;
+        Some(self.build_family_graph_snapshot(&profile))
+    }
+
+    /// Return a deterministic self/family graph inferred from a record namespace.
+    pub fn get_family_graph_for_record(&self, record_id: &str) -> Option<FamilyGraphSnapshot> {
+        let namespace = {
+            let records = self.records.read();
+            records.get(record_id)?.namespace.clone()
+        };
+        self.get_family_graph(Some(&namespace))
+    }
+
+    /// Return a deterministic digest for one linked family/person record.
+    pub fn get_person_digest(&self, record_id: &str) -> Option<PersonDigest> {
+        let family_graph = self.get_family_graph_for_record(record_id)?;
+        let member = family_graph
+            .members
+            .iter()
+            .find(|member| member.record_id == record_id)?;
+        Some(PersonDigest {
+            namespace: family_graph.namespace,
+            profile_record_id: family_graph.profile_record_id,
+            person_record_id: member.record_id.clone(),
+            relation_type: member.relation_type.clone(),
+            weight: member.weight,
+            person_tags: member.tags.clone(),
+            person_content: member.content.clone(),
+        })
+    }
+
+    /// Recall only within one deterministic self/person corridor.
+    pub fn recall_person_context(
+        &self,
+        record_id: &str,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<(f32, Record)>> {
+        let digest = self
+            .get_person_digest(record_id)
+            .ok_or_else(|| anyhow::anyhow!("Person digest not found for {}", record_id))?;
+
+        let person_records = {
+            let records = self.records.read();
+            let mut scoped = HashMap::new();
+            if let Some(profile) = records.get(&digest.profile_record_id) {
+                scoped.insert(profile.id.clone(), profile.clone());
+            }
+            if let Some(person) = records.get(&digest.person_record_id) {
+                scoped.insert(person.id.clone(), person.clone());
+            }
+            scoped
+        };
+
+        let top = top_k.unwrap_or(10);
+        let ngram = self.ngram_index.read();
+        let tag_idx = self.tag_index.read();
+        let aura_idx = self.aura_index.read();
+        let trust_config = self.trust_config.read();
+        let embedding_ranked = self.collect_embedding_signal(query, top);
+        let ns = [digest.namespace.as_str()];
+
+        let scored = recall::recall_pipeline(
+            query,
+            top,
+            min_strength.unwrap_or(0.1),
+            expand_connections.unwrap_or(true),
+            &self.sdr,
+            &self.index,
+            &self.storage,
+            &ngram,
+            &tag_idx,
+            &aura_idx,
+            &person_records,
+            embedding_ranked,
+            Some(&trust_config),
+            Some(&ns),
+        );
+
+        drop(ngram);
+        drop(tag_idx);
+        drop(aura_idx);
+        drop(trust_config);
+
+        {
+            let mut records = self.records.write();
+            let mut tracker = self.session_tracker.write();
+            recall::activate_and_strengthen(&scored, &mut records, &mut tracker, session_id);
+        }
+
+        if let Some(ref log) = self.audit_log {
+            let _ = log.log_retrieve(query, scored.len());
+        }
+
+        Ok(scored)
+    }
+
+    /// Return a project graph snapshot for an explicit project id.
+    pub fn get_project_graph(&self, project_id: &str) -> Option<ProjectGraphSnapshot> {
+        let project_anchor = self.ensure_project_anchor_by_id(project_id).ok()?;
+        self.build_project_graph_snapshot(&project_anchor)
+    }
+
+    /// Return a project graph snapshot inferred from a project-scoped record.
+    pub fn get_project_graph_for_record(&self, record_id: &str) -> Option<ProjectGraphSnapshot> {
+        let project_id = {
+            let records = self.records.read();
+            records.get(record_id)?.metadata.get("project_id")?.clone()
+        };
+        self.get_project_graph(&project_id)
+    }
+
+    /// Return deterministic status counters for one project graph.
+    pub fn get_project_status(&self, project_id: &str) -> Option<ProjectStatusSnapshot> {
+        let (project_anchor, project_records) = self.collect_project_records(project_id)?;
+        let mut reports = 0;
+        let mut scheduled_tasks = 0;
+        let mut open_tasks = 0;
+        let mut completed_tasks = 0;
+        let mut todos = 0;
+        let mut open_todos = 0;
+        let mut completed_todos = 0;
+        let mut notes = 0;
+        let mut due_tasks = 0;
+        let mut high_priority_todos = 0;
+
+        for rec in project_records.values() {
+            if rec.id == project_anchor.id {
+                continue;
+            }
+            if rec.tags.iter().any(|tag| tag == "research-report") {
+                reports += 1;
+            }
+            if rec.tags.iter().any(|tag| tag == "scheduled-task") {
+                scheduled_tasks += 1;
+                if Self::record_marked_completed(rec) {
+                    completed_tasks += 1;
+                } else {
+                    open_tasks += 1;
+                }
+                if rec.metadata.contains_key("due_date") {
+                    due_tasks += 1;
+                }
+            }
+            if rec.tags.iter().any(|tag| tag == "todo-item") {
+                todos += 1;
+                if Self::record_marked_completed(rec) {
+                    completed_todos += 1;
+                } else {
+                    open_todos += 1;
+                }
+                if rec
+                    .metadata
+                    .get("priority")
+                    .map(|v| v.eq_ignore_ascii_case("high"))
+                    .unwrap_or(false)
+                {
+                    high_priority_todos += 1;
+                }
+            }
+            if rec.tags.iter().any(|tag| tag == "project-note") {
+                notes += 1;
+            }
+        }
+
+        Some(ProjectStatusSnapshot {
+            project_id: project_anchor.metadata.get("project_id")?.clone(),
+            project_record_id: project_anchor.id.clone(),
+            project_topic: project_anchor
+                .metadata
+                .get("project_topic")
+                .cloned()
+                .unwrap_or_default(),
+            namespace: project_anchor.namespace.clone(),
+            project_status: project_anchor
+                .metadata
+                .get("project_status")
+                .cloned()
+                .unwrap_or_else(|| "unknown".into()),
+            total_members: project_records.len().saturating_sub(1),
+            reports,
+            scheduled_tasks,
+            open_tasks,
+            completed_tasks,
+            todos,
+            open_todos,
+            completed_todos,
+            notes,
+            due_tasks,
+            high_priority_todos,
+        })
+    }
+
+    /// Return project status counters inferred from any project-scoped record.
+    pub fn get_project_status_for_record(&self, record_id: &str) -> Option<ProjectStatusSnapshot> {
+        let project_id = {
+            let records = self.records.read();
+            records.get(record_id)?.metadata.get("project_id")?.clone()
+        };
+        self.get_project_status(&project_id)
+    }
+
+    /// Return deterministic timeline rows for one project graph.
+    pub fn get_project_timeline(&self, project_id: &str) -> Option<ProjectTimelineSnapshot> {
+        let (project_anchor, project_records) = self.collect_project_records(project_id)?;
+        let now = chrono::Utc::now().date_naive();
+        let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1)).date_naive();
+        let mut entries = Vec::new();
+        let mut overdue_entries = 0;
+        let mut upcoming_entries = 0;
+        let mut open_entries = 0;
+
+        for rec in project_records.values() {
+            if rec.id == project_anchor.id {
+                continue;
+            }
+
+            let kind = if rec.tags.iter().any(|tag| tag == "scheduled-task") {
+                "scheduled-task"
+            } else if rec.tags.iter().any(|tag| tag == "todo-item") {
+                "todo-item"
+            } else if rec.tags.iter().any(|tag| tag == "project-note") {
+                "project-note"
+            } else if rec.tags.iter().any(|tag| tag == "research-report") {
+                "research-report"
+            } else {
+                "project-record"
+            }
+            .to_string();
+
+            let status = rec.metadata.get("status").cloned().unwrap_or_else(|| {
+                if Self::record_marked_completed(rec) {
+                    "completed".into()
+                } else {
+                    "open".into()
+                }
+            });
+
+            let due_date = rec.metadata.get("due_date").cloned();
+            let overdue = due_date
+                .as_deref()
+                .and_then(Self::parse_due_date_for_timeline)
+                .map(|dt| dt.date_naive() < now && !Self::record_marked_completed(rec))
+                .unwrap_or(false);
+            let upcoming = due_date
+                .as_deref()
+                .and_then(Self::parse_due_date_for_timeline)
+                .map(|dt| {
+                    let day = dt.date_naive();
+                    day >= now && day <= tomorrow && !Self::record_marked_completed(rec)
+                })
+                .unwrap_or(false);
+
+            if overdue {
+                overdue_entries += 1;
+            }
+            if upcoming {
+                upcoming_entries += 1;
+            }
+            if !Self::record_marked_completed(rec) {
+                open_entries += 1;
+            }
+
+            entries.push(ProjectTimelineEntry {
+                record_id: rec.id.clone(),
+                content: rec.content.clone(),
+                kind,
+                status,
+                created_at: rec.created_at,
+                due_date,
+                overdue,
+                tags: rec.tags.clone(),
+            });
+        }
+
+        entries.sort_by(|a, b| {
+            let a_due = a
+                .due_date
+                .as_deref()
+                .and_then(Self::parse_due_date_for_timeline)
+                .map(|dt| dt.timestamp())
+                .unwrap_or(i64::MAX);
+            let b_due = b
+                .due_date
+                .as_deref()
+                .and_then(Self::parse_due_date_for_timeline)
+                .map(|dt| dt.timestamp())
+                .unwrap_or(i64::MAX);
+            a_due.cmp(&b_due).then_with(|| {
+                a.created_at
+                    .partial_cmp(&b.created_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+
+        Some(ProjectTimelineSnapshot {
+            project_id: project_anchor.metadata.get("project_id")?.clone(),
+            project_record_id: project_anchor.id.clone(),
+            project_topic: project_anchor
+                .metadata
+                .get("project_topic")
+                .cloned()
+                .unwrap_or_default(),
+            namespace: project_anchor.namespace.clone(),
+            total_entries: entries.len(),
+            overdue_entries,
+            upcoming_entries,
+            open_entries,
+            entries,
+        })
+    }
+
+    /// Return timeline rows inferred from a project-scoped record.
+    pub fn get_project_timeline_for_record(
+        &self,
+        record_id: &str,
+    ) -> Option<ProjectTimelineSnapshot> {
+        let project_id = {
+            let records = self.records.read();
+            records.get(record_id)?.metadata.get("project_id")?.clone()
+        };
+        self.get_project_timeline(&project_id)
+    }
+
+    /// Return a combined deterministic project digest for one project.
+    pub fn get_project_digest(&self, project_id: &str) -> Option<ProjectDigest> {
+        let graph = self.get_project_graph(project_id)?;
+        let status = self.get_project_status(project_id)?;
+        let timeline = self.get_project_timeline(project_id)?;
+        Some(ProjectDigest {
+            graph,
+            status,
+            timeline,
+        })
+    }
+
+    /// Return a combined deterministic project digest inferred from a project-scoped record.
+    pub fn get_project_digest_for_record(&self, record_id: &str) -> Option<ProjectDigest> {
+        let project_id = {
+            let records = self.records.read();
+            records.get(record_id)?.metadata.get("project_id")?.clone()
+        };
+        self.get_project_digest(&project_id)
+    }
+
+    /// Recall only within one deterministic self/family corridor.
+    pub fn recall_family_context(
+        &self,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+        namespace: Option<&str>,
+    ) -> Result<Vec<(f32, Record)>> {
+        let family_graph = self
+            .get_family_graph(namespace)
+            .ok_or_else(|| anyhow::anyhow!("Family graph not found"))?;
+
+        let family_records = {
+            let records = self.records.read();
+            let mut scoped = HashMap::new();
+            if let Some(profile) = records.get(&family_graph.profile_record_id) {
+                scoped.insert(profile.id.clone(), profile.clone());
+            }
+            for member in &family_graph.members {
+                if let Some(rec) = records.get(&member.record_id) {
+                    scoped.insert(rec.id.clone(), rec.clone());
+                }
+            }
+            scoped
+        };
+
+        let top = top_k.unwrap_or(10);
+        let ngram = self.ngram_index.read();
+        let tag_idx = self.tag_index.read();
+        let aura_idx = self.aura_index.read();
+        let trust_config = self.trust_config.read();
+        let embedding_ranked = self.collect_embedding_signal(query, top);
+        let ns = [family_graph.namespace.as_str()];
+
+        let scored = recall::recall_pipeline(
+            query,
+            top,
+            min_strength.unwrap_or(0.1),
+            expand_connections.unwrap_or(true),
+            &self.sdr,
+            &self.index,
+            &self.storage,
+            &ngram,
+            &tag_idx,
+            &aura_idx,
+            &family_records,
+            embedding_ranked,
+            Some(&trust_config),
+            Some(&ns),
+        );
+
+        drop(ngram);
+        drop(tag_idx);
+        drop(aura_idx);
+        drop(trust_config);
+
+        {
+            let mut records = self.records.write();
+            let mut tracker = self.session_tracker.write();
+            recall::activate_and_strengthen(&scored, &mut records, &mut tracker, session_id);
+        }
+
+        if let Some(ref log) = self.audit_log {
+            let _ = log.log_retrieve(query, scored.len());
+        }
+
+        Ok(scored)
+    }
+
+    /// Recall only within one explicit project graph.
+    pub fn recall_project_context(
+        &self,
+        project_id: &str,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<(f32, Record)>> {
+        let (project_anchor, project_records) = self
+            .collect_project_records(project_id)
+            .ok_or_else(|| anyhow::anyhow!("Project {} not found", project_id))?;
+
+        let top = top_k.unwrap_or(10);
+        let ngram = self.ngram_index.read();
+        let tag_idx = self.tag_index.read();
+        let aura_idx = self.aura_index.read();
+        let trust_config = self.trust_config.read();
+        let embedding_ranked = self.collect_embedding_signal(query, top);
+        let ns = [project_anchor.namespace.as_str()];
+
+        let scored = recall::recall_pipeline(
+            query,
+            top,
+            min_strength.unwrap_or(0.1),
+            expand_connections.unwrap_or(true),
+            &self.sdr,
+            &self.index,
+            &self.storage,
+            &ngram,
+            &tag_idx,
+            &aura_idx,
+            &project_records,
+            embedding_ranked,
+            Some(&trust_config),
+            Some(&ns),
+        );
+
+        drop(ngram);
+        drop(tag_idx);
+        drop(aura_idx);
+        drop(trust_config);
+
+        {
+            let mut records = self.records.write();
+            let mut tracker = self.session_tracker.write();
+            recall::activate_and_strengthen(&scored, &mut records, &mut tracker, session_id);
+        }
+
+        if let Some(ref log) = self.audit_log {
+            let _ = log.log_retrieve(query, scored.len());
+        }
+
+        Ok(scored)
     }
 
     /// Return a snapshot of all current causal patterns (cloned).
@@ -2721,6 +4596,74 @@ impl Aura {
         engine.evidence_mode
     }
 
+    /// Set policy-hint recall reranking mode.
+    ///
+    /// - `Off`: no policy influence on recall ranking (default)
+    /// - `Limited`: bounded reranking (±2% score cap, ±2 positional shift)
+    pub fn set_policy_rerank_mode(&self, mode: PolicyRerankMode) {
+        self.policy_rerank_mode
+            .store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Get current policy recall reranking mode.
+    pub fn get_policy_rerank_mode(&self) -> PolicyRerankMode {
+        PolicyRerankMode::from_u8(
+            self.policy_rerank_mode
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Enable all four cognitive recall reranking signals simultaneously.
+    ///
+    /// Sets every phase to `Limited` mode:
+    /// - Phase 4a: Belief reranking (±5% score cap, ±2 positional shift)
+    /// - Phase 4b: Concept grouping surface (±4% cap, ±2 shift)
+    /// - Phase 4c: Causal pattern reranking (±3% cap, ±2 shift)
+    /// - Phase 4d: Policy hint reranking (±2% cap, ±2 shift)
+    ///
+    /// Equivalent to calling `set_*_mode(Limited)` on all four phases.
+    /// Use `disable_full_cognitive_stack()` to revert to the Off baseline.
+    pub fn enable_full_cognitive_stack(&self) {
+        use crate::recall::BeliefRerankMode;
+        use crate::concept::ConceptSurfaceMode;
+        use crate::causal::CausalRerankMode;
+        self.set_belief_rerank_mode(BeliefRerankMode::Limited);
+        self.set_concept_surface_mode(ConceptSurfaceMode::Limited);
+        self.set_causal_rerank_mode(CausalRerankMode::Limited);
+        self.set_policy_rerank_mode(PolicyRerankMode::Limited);
+    }
+
+    /// Disable all four cognitive recall reranking signals simultaneously.
+    ///
+    /// Resets every phase to `Off` mode (the default). Raw RRF ranking is used
+    /// with no cognitive shaping. Counterpart to `enable_full_cognitive_stack()`.
+    pub fn disable_full_cognitive_stack(&self) {
+        use crate::recall::BeliefRerankMode;
+        use crate::concept::ConceptSurfaceMode;
+        use crate::causal::CausalRerankMode;
+        self.set_belief_rerank_mode(BeliefRerankMode::Off);
+        self.set_concept_surface_mode(ConceptSurfaceMode::Off);
+        self.set_causal_rerank_mode(CausalRerankMode::Off);
+        self.set_policy_rerank_mode(PolicyRerankMode::Off);
+    }
+
+    /// Set causal-pattern recall reranking mode.
+    ///
+    /// - `Off`: no causal influence on recall ranking (default)
+    /// - `Limited`: bounded reranking (±3% score cap, ±2 positional shift)
+    pub fn set_causal_rerank_mode(&self, mode: CausalRerankMode) {
+        self.causal_rerank_mode
+            .store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Get current causal recall reranking mode.
+    pub fn get_causal_rerank_mode(&self) -> CausalRerankMode {
+        CausalRerankMode::from_u8(
+            self.causal_rerank_mode
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     // ── SDK Wrapper: Research Orchestrator ──
 
     /// Start a new research project.
@@ -2747,6 +4690,7 @@ impl Aura {
             .research_engine
             .complete_research(project_id, synthesis)
             .map_err(|e| anyhow::anyhow!(e))?;
+        let _project_anchor = self.ensure_research_project_anchor(&project)?;
 
         // Build content from project
         let content = if let Some(ref syn) = project.synthesis {
@@ -2764,6 +4708,26 @@ impl Aura {
             )
         };
 
+        let report_metadata = HashMap::from([
+            ("project_id".to_string(), project.id.clone()),
+            ("entity_id".to_string(), format!("project:{}", project.id)),
+            ("project_topic".to_string(), project.topic.clone()),
+            ("project_depth".to_string(), project.depth.clone()),
+            (
+                "project_status".to_string(),
+                match project.status {
+                    crate::research::ResearchStatus::Active => "active",
+                    crate::research::ResearchStatus::Completed => "completed",
+                    crate::research::ResearchStatus::Cancelled => "cancelled",
+                }
+                .to_string(),
+            ),
+            (
+                "finding_count".to_string(),
+                project.findings.len().to_string(),
+            ),
+        ]);
+
         // Store as a record
         let rec = self.store(
             &content,
@@ -2772,14 +4736,146 @@ impl Aura {
             None,
             None,
             Some("retrieved"),
-            None,
+            Some(report_metadata),
             Some(false), // Don't dedup research
             None,
             None,
-            None,
+            Some("fact"),
         )?;
 
         Ok(rec)
+    }
+
+    /// Store a scheduled task that is explicitly scoped to a project.
+    pub fn store_project_task(
+        &self,
+        project_id: &str,
+        content: &str,
+        due_date: Option<&str>,
+        metadata: Option<HashMap<String, String>>,
+    ) -> Result<Record> {
+        let project_anchor = self.ensure_project_anchor_by_id(project_id)?;
+        let mut task_metadata = metadata.unwrap_or_default();
+        task_metadata.insert("project_id".into(), project_id.to_string());
+        task_metadata.insert("entity_id".into(), format!("project:{}", project_id));
+        task_metadata.insert("project_anchor_id".into(), project_anchor.id.clone());
+        if let Some(due) = due_date {
+            task_metadata.insert("due_date".into(), due.to_string());
+        }
+
+        self.store(
+            content,
+            Some(Level::Working),
+            Some(vec!["scheduled-task".into()]),
+            Some(false),
+            None,
+            Some("recorded"),
+            Some(task_metadata),
+            Some(false),
+            None,
+            Some(&project_anchor.namespace),
+            Some("decision"),
+        )
+    }
+
+    /// Store a todo item that is explicitly scoped to a project.
+    pub fn store_project_todo(
+        &self,
+        project_id: &str,
+        content: &str,
+        metadata: Option<HashMap<String, String>>,
+    ) -> Result<Record> {
+        let project_anchor = self.ensure_project_anchor_by_id(project_id)?;
+        let mut todo_metadata = metadata.unwrap_or_default();
+        todo_metadata.insert("project_id".into(), project_id.to_string());
+        todo_metadata.insert("entity_id".into(), format!("project:{}", project_id));
+        todo_metadata.insert("project_anchor_id".into(), project_anchor.id.clone());
+
+        self.store(
+            content,
+            Some(Level::Working),
+            Some(vec!["todo-item".into()]),
+            Some(false),
+            None,
+            Some("recorded"),
+            Some(todo_metadata),
+            Some(false),
+            None,
+            Some(&project_anchor.namespace),
+            Some("decision"),
+        )
+    }
+
+    /// Store a project-scoped note/fact with explicit project linkage.
+    pub fn store_project_note(
+        &self,
+        project_id: &str,
+        content: &str,
+        metadata: Option<HashMap<String, String>>,
+    ) -> Result<Record> {
+        let project_anchor = self.ensure_project_anchor_by_id(project_id)?;
+        let mut note_metadata = metadata.unwrap_or_default();
+        note_metadata.insert("project_id".into(), project_id.to_string());
+        note_metadata.insert("entity_id".into(), format!("project:{}", project_id));
+        note_metadata.insert("project_anchor_id".into(), project_anchor.id.clone());
+
+        self.store(
+            content,
+            Some(Level::Domain),
+            Some(vec!["project-note".into()]),
+            Some(false),
+            None,
+            Some("recorded"),
+            Some(note_metadata),
+            Some(false),
+            None,
+            Some(&project_anchor.namespace),
+            Some("fact"),
+        )
+    }
+
+    /// Store a family/person record with an explicit deterministic relation type.
+    pub fn store_family_person(
+        &self,
+        relation_type: &str,
+        content: &str,
+        metadata: Option<HashMap<String, String>>,
+        namespace: Option<&str>,
+    ) -> Result<Record> {
+        if !relation::is_family_relation_type(relation_type) {
+            anyhow::bail!("Invalid family relation type: {}", relation_type);
+        }
+
+        let profile = self.find_profile_record(namespace);
+        let mut person_metadata = metadata.unwrap_or_default();
+        person_metadata.insert("family_relation".into(), relation_type.to_string());
+        if let Some(entity_id) =
+            Self::derive_family_entity_id(relation_type, &person_metadata, content)
+        {
+            person_metadata.insert("entity_id".into(), entity_id);
+        }
+        if let Some(profile) = &profile {
+            person_metadata.insert("profile_record_id".into(), profile.id.clone());
+        }
+
+        let target_namespace = profile
+            .as_ref()
+            .map(|profile| profile.namespace.as_str())
+            .or(namespace);
+
+        self.store(
+            content,
+            Some(Level::Identity),
+            Some(vec!["family".into()]),
+            Some(false),
+            None,
+            Some("recorded"),
+            Some(person_metadata),
+            Some(false),
+            None,
+            target_namespace,
+            Some("fact"),
+        )
     }
 
     /// Get active research projects.
@@ -4073,7 +6169,7 @@ impl Aura {
             if let Some(source) = rec.metadata.get("source") {
                 dict.set_item("source", source)?;
             }
-            if self.get_concept_surface_mode() == ConceptSurfaceMode::Inspect {
+            if matches!(self.get_concept_surface_mode(), ConceptSurfaceMode::Inspect | ConceptSurfaceMode::Limited) {
                 let concepts = self.get_surfaced_concepts_for_record(&rec.id, Some(3));
                 if !concepts.is_empty() {
                     let py_concepts = pyo3::types::PyList::empty_bound(py);
@@ -4145,7 +6241,7 @@ impl Aura {
             if let Some(trust) = rec.metadata.get("trust_score") {
                 dict.set_item("trust", trust)?;
             }
-            if self.get_concept_surface_mode() == ConceptSurfaceMode::Inspect {
+            if matches!(self.get_concept_surface_mode(), ConceptSurfaceMode::Inspect | ConceptSurfaceMode::Limited) {
                 let concepts = self.get_surfaced_concepts_for_record(&rec.id, Some(3));
                 if !concepts.is_empty() {
                     let py_concepts = pyo3::types::PyList::empty_bound(py);
@@ -4233,7 +6329,7 @@ impl Aura {
             if let Some(source) = rec.metadata.get("source") {
                 dict.set_item("source", source)?;
             }
-            if self.get_concept_surface_mode() == ConceptSurfaceMode::Inspect {
+            if matches!(self.get_concept_surface_mode(), ConceptSurfaceMode::Inspect | ConceptSurfaceMode::Limited) {
                 let concepts = self.get_surfaced_concepts_for_record(&rec.id, Some(3));
                 if !concepts.is_empty() {
                     let py_concepts = pyo3::types::PyList::empty_bound(py);
@@ -4460,6 +6556,440 @@ impl Aura {
         self.get_surfaced_concepts_for_namespace(namespace, limit)
     }
 
+    #[pyo3(name = "get_structural_relations", signature = (limit=None))]
+    fn py_get_structural_relations(&self, limit: Option<usize>) -> Vec<StructuralRelation> {
+        self.get_structural_relations(limit)
+    }
+
+    #[pyo3(name = "get_relations", signature = (limit=None))]
+    fn py_get_relations(&self, limit: Option<usize>) -> Vec<RelationEdge> {
+        self.get_relations(limit)
+    }
+
+    #[pyo3(name = "get_structural_relations_for_record", signature = (record_id, limit=None))]
+    fn py_get_structural_relations_for_record(
+        &self,
+        record_id: &str,
+        limit: Option<usize>,
+    ) -> Vec<StructuralRelation> {
+        self.get_structural_relations_for_record(record_id, limit)
+    }
+
+    #[pyo3(name = "get_relations_for_record", signature = (record_id, limit=None))]
+    fn py_get_relations_for_record(
+        &self,
+        record_id: &str,
+        limit: Option<usize>,
+    ) -> Vec<RelationEdge> {
+        self.get_relations_for_record(record_id, limit)
+    }
+
+    #[pyo3(name = "get_relation_digest", signature = (record_id, limit=None))]
+    fn py_get_relation_digest(
+        &self,
+        record_id: &str,
+        limit: Option<usize>,
+    ) -> Option<RelationDigest> {
+        self.get_relation_digest(record_id, limit)
+    }
+
+    #[pyo3(name = "get_entity_digest")]
+    fn py_get_entity_digest(&self, entity_id: &str) -> Option<EntityDigest> {
+        self.get_entity_digest(entity_id)
+    }
+
+    #[pyo3(name = "get_entity_digest_for_record")]
+    fn py_get_entity_digest_for_record(&self, record_id: &str) -> Option<EntityDigest> {
+        self.get_entity_digest_for_record(record_id)
+    }
+
+    #[pyo3(name = "get_entity_graph_digest", signature = (entity_id, limit=None))]
+    fn py_get_entity_graph_digest(
+        &self,
+        entity_id: &str,
+        limit: Option<usize>,
+    ) -> Option<EntityGraphDigest> {
+        self.get_entity_graph_digest(entity_id, limit)
+    }
+
+    #[pyo3(name = "get_entity_graph_digest_for_record", signature = (record_id, limit=None))]
+    fn py_get_entity_graph_digest_for_record(
+        &self,
+        record_id: &str,
+        limit: Option<usize>,
+    ) -> Option<EntityGraphDigest> {
+        self.get_entity_graph_digest_for_record(record_id, limit)
+    }
+
+    #[pyo3(name = "get_entity_graph_neighbors", signature = (entity_id, top_n=None, min_weight=None, relation_type_filter=None, edge_limit=None))]
+    fn py_get_entity_graph_neighbors(
+        &self,
+        entity_id: &str,
+        top_n: Option<usize>,
+        min_weight: Option<f32>,
+        relation_type_filter: Option<&str>,
+        edge_limit: Option<usize>,
+    ) -> Vec<EntityGraphDigest> {
+        self.get_entity_graph_neighbors(entity_id, top_n, min_weight, relation_type_filter, edge_limit)
+    }
+
+    #[pyo3(name = "get_entity_relations", signature = (entity_id, limit=None))]
+    fn py_get_entity_relations(
+        &self,
+        entity_id: &str,
+        limit: Option<usize>,
+    ) -> Vec<EntityRelationEdge> {
+        self.get_entity_relations(entity_id, limit)
+    }
+
+    #[pyo3(name = "get_family_graph", signature = (namespace=None))]
+    fn py_get_family_graph(&self, namespace: Option<&str>) -> Option<FamilyGraphSnapshot> {
+        self.get_family_graph(namespace)
+    }
+
+    #[pyo3(name = "get_family_graph_for_record")]
+    fn py_get_family_graph_for_record(&self, record_id: &str) -> Option<FamilyGraphSnapshot> {
+        self.get_family_graph_for_record(record_id)
+    }
+
+    #[pyo3(name = "get_person_digest")]
+    fn py_get_person_digest(&self, record_id: &str) -> Option<PersonDigest> {
+        self.get_person_digest(record_id)
+    }
+
+    #[pyo3(name = "get_project_graph")]
+    fn py_get_project_graph(&self, project_id: &str) -> Option<ProjectGraphSnapshot> {
+        self.get_project_graph(project_id)
+    }
+
+    #[pyo3(name = "get_project_graph_for_record")]
+    fn py_get_project_graph_for_record(&self, record_id: &str) -> Option<ProjectGraphSnapshot> {
+        self.get_project_graph_for_record(record_id)
+    }
+
+    #[pyo3(name = "get_project_status")]
+    fn py_get_project_status(&self, project_id: &str) -> Option<ProjectStatusSnapshot> {
+        self.get_project_status(project_id)
+    }
+
+    #[pyo3(name = "get_project_status_for_record")]
+    fn py_get_project_status_for_record(&self, record_id: &str) -> Option<ProjectStatusSnapshot> {
+        self.get_project_status_for_record(record_id)
+    }
+
+    #[pyo3(name = "get_project_timeline")]
+    fn py_get_project_timeline(&self, project_id: &str) -> Option<ProjectTimelineSnapshot> {
+        self.get_project_timeline(project_id)
+    }
+
+    #[pyo3(name = "get_project_timeline_for_record")]
+    fn py_get_project_timeline_for_record(
+        &self,
+        record_id: &str,
+    ) -> Option<ProjectTimelineSnapshot> {
+        self.get_project_timeline_for_record(record_id)
+    }
+
+    #[pyo3(name = "get_project_digest")]
+    fn py_get_project_digest(&self, project_id: &str) -> Option<ProjectDigest> {
+        self.get_project_digest(project_id)
+    }
+
+    #[pyo3(name = "get_project_digest_for_record")]
+    fn py_get_project_digest_for_record(&self, record_id: &str) -> Option<ProjectDigest> {
+        self.get_project_digest_for_record(record_id)
+    }
+
+    #[pyo3(name = "recall_family_context", signature = (query, top_k=None, min_strength=None, expand_connections=None, session_id=None, namespace=None))]
+    fn py_recall_family_context(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+        namespace: Option<&str>,
+    ) -> PyResult<Vec<PyObject>> {
+        let results = py
+            .allow_threads(|| {
+                self.recall_family_context(
+                    query,
+                    top_k,
+                    min_strength,
+                    expand_connections,
+                    session_id,
+                    namespace,
+                )
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let mut py_results = Vec::new();
+        for (score, rec) in results {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("id", &rec.id)?;
+            dict.set_item("content", &rec.content)?;
+            dict.set_item("score", score)?;
+            dict.set_item("level", rec.level.name())?;
+            dict.set_item("strength", rec.strength)?;
+            dict.set_item("tags", &rec.tags)?;
+            dict.set_item("source_type", &rec.source_type)?;
+            dict.set_item("metadata", &rec.metadata)?;
+            py_results.push(dict.unbind().into_any());
+        }
+
+        Ok(py_results)
+    }
+
+    #[pyo3(name = "recall_person_context", signature = (record_id, query, top_k=None, min_strength=None, expand_connections=None, session_id=None))]
+    fn py_recall_person_context(
+        &self,
+        py: Python<'_>,
+        record_id: &str,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+    ) -> PyResult<Vec<PyObject>> {
+        let results = py
+            .allow_threads(|| {
+                self.recall_person_context(
+                    record_id,
+                    query,
+                    top_k,
+                    min_strength,
+                    expand_connections,
+                    session_id,
+                )
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let mut py_results = Vec::new();
+        for (score, rec) in results {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("id", &rec.id)?;
+            dict.set_item("content", &rec.content)?;
+            dict.set_item("score", score)?;
+            dict.set_item("level", rec.level.name())?;
+            dict.set_item("strength", rec.strength)?;
+            dict.set_item("tags", &rec.tags)?;
+            dict.set_item("source_type", &rec.source_type)?;
+            dict.set_item("metadata", &rec.metadata)?;
+            py_results.push(dict.unbind().into_any());
+        }
+
+        Ok(py_results)
+    }
+
+    #[pyo3(name = "recall_relation_context", signature = (record_id, query, top_k=None, min_strength=None, expand_connections=None, session_id=None, limit=None))]
+    fn py_recall_relation_context(
+        &self,
+        py: Python<'_>,
+        record_id: &str,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> PyResult<Vec<PyObject>> {
+        let results = py
+            .allow_threads(|| {
+                self.recall_relation_context(
+                    record_id,
+                    query,
+                    top_k,
+                    min_strength,
+                    expand_connections,
+                    session_id,
+                    limit,
+                )
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let mut py_results = Vec::new();
+        for (score, rec) in results {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("id", &rec.id)?;
+            dict.set_item("content", &rec.content)?;
+            dict.set_item("score", score)?;
+            dict.set_item("level", rec.level.name())?;
+            dict.set_item("strength", rec.strength)?;
+            dict.set_item("tags", &rec.tags)?;
+            dict.set_item("source_type", &rec.source_type)?;
+            dict.set_item("metadata", &rec.metadata)?;
+            py_results.push(dict.unbind().into_any());
+        }
+
+        Ok(py_results)
+    }
+
+    #[pyo3(name = "recall_entity_context", signature = (entity_id, query, top_k=None, min_strength=None, expand_connections=None, session_id=None))]
+    fn py_recall_entity_context(
+        &self,
+        py: Python<'_>,
+        entity_id: &str,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+    ) -> PyResult<Vec<PyObject>> {
+        let results = py
+            .allow_threads(|| {
+                self.recall_entity_context(
+                    entity_id,
+                    query,
+                    top_k,
+                    min_strength,
+                    expand_connections,
+                    session_id,
+                )
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let mut py_results = Vec::new();
+        for (score, rec) in results {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("id", &rec.id)?;
+            dict.set_item("content", &rec.content)?;
+            dict.set_item("score", score)?;
+            dict.set_item("level", rec.level.name())?;
+            dict.set_item("strength", rec.strength)?;
+            dict.set_item("tags", &rec.tags)?;
+            dict.set_item("source_type", &rec.source_type)?;
+            dict.set_item("metadata", &rec.metadata)?;
+            py_results.push(dict.unbind().into_any());
+        }
+
+        Ok(py_results)
+    }
+
+    #[pyo3(name = "recall_entity_context_for_record", signature = (record_id, query, top_k=None, min_strength=None, expand_connections=None, session_id=None))]
+    fn py_recall_entity_context_for_record(
+        &self,
+        py: Python<'_>,
+        record_id: &str,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+    ) -> PyResult<Vec<PyObject>> {
+        let results = py
+            .allow_threads(|| {
+                self.recall_entity_context_for_record(
+                    record_id,
+                    query,
+                    top_k,
+                    min_strength,
+                    expand_connections,
+                    session_id,
+                )
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let mut py_results = Vec::new();
+        for (score, rec) in results {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("id", &rec.id)?;
+            dict.set_item("content", &rec.content)?;
+            dict.set_item("score", score)?;
+            dict.set_item("level", rec.level.name())?;
+            dict.set_item("strength", rec.strength)?;
+            dict.set_item("tags", &rec.tags)?;
+            dict.set_item("source_type", &rec.source_type)?;
+            dict.set_item("metadata", &rec.metadata)?;
+            py_results.push(dict.unbind().into_any());
+        }
+
+        Ok(py_results)
+    }
+
+    #[pyo3(name = "recall_entity_graph_context", signature = (entity_id, query, top_k=None, min_strength=None, expand_connections=None, session_id=None, limit=None))]
+    fn py_recall_entity_graph_context(
+        &self,
+        py: Python<'_>,
+        entity_id: &str,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> PyResult<Vec<PyObject>> {
+        let results = py
+            .allow_threads(|| {
+                self.recall_entity_graph_context(
+                    entity_id,
+                    query,
+                    top_k,
+                    min_strength,
+                    expand_connections,
+                    session_id,
+                    limit,
+                )
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let mut py_results = Vec::new();
+        for (score, rec) in results {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("id", &rec.id)?;
+            dict.set_item("content", &rec.content)?;
+            dict.set_item("score", score)?;
+            dict.set_item("level", rec.level.name())?;
+            dict.set_item("strength", rec.strength)?;
+            dict.set_item("tags", &rec.tags)?;
+            dict.set_item("source_type", &rec.source_type)?;
+            dict.set_item("metadata", &rec.metadata)?;
+            py_results.push(dict.unbind().into_any());
+        }
+
+        Ok(py_results)
+    }
+
+    #[pyo3(name = "recall_project_context", signature = (project_id, query, top_k=None, min_strength=None, expand_connections=None, session_id=None))]
+    fn py_recall_project_context(
+        &self,
+        py: Python<'_>,
+        project_id: &str,
+        query: &str,
+        top_k: Option<usize>,
+        min_strength: Option<f32>,
+        expand_connections: Option<bool>,
+        session_id: Option<&str>,
+    ) -> PyResult<Vec<PyObject>> {
+        let results = py
+            .allow_threads(|| {
+                self.recall_project_context(
+                    project_id,
+                    query,
+                    top_k,
+                    min_strength,
+                    expand_connections,
+                    session_id,
+                )
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let mut py_results = Vec::new();
+        for (score, rec) in results {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("id", &rec.id)?;
+            dict.set_item("content", &rec.content)?;
+            dict.set_item("score", score)?;
+            dict.set_item("level", rec.level.name())?;
+            dict.set_item("strength", rec.strength)?;
+            dict.set_item("tags", &rec.tags)?;
+            dict.set_item("source_type", &rec.source_type)?;
+            dict.set_item("metadata", &rec.metadata)?;
+            py_results.push(dict.unbind().into_any());
+        }
+        Ok(py_results)
+    }
+
     #[pyo3(name = "get_surfaced_policy_hints", signature = (limit=None))]
     fn py_get_surfaced_policy_hints(
         &self,
@@ -4475,6 +7005,74 @@ impl Aura {
         limit: Option<usize>,
     ) -> Vec<crate::policy::SurfacedPolicyHint> {
         self.get_surfaced_policy_hints_for_namespace(namespace, limit)
+    }
+
+    /// Enable all four cognitive recall reranking signals (Python binding).
+    ///
+    /// Equivalent to calling `set_belief_rerank_mode("limited")`,
+    /// `set_concept_surface_mode("limited")`, `set_causal_rerank_mode("limited")`,
+    /// and `set_policy_rerank_mode("limited")` in one call.
+    #[pyo3(name = "enable_full_cognitive_stack")]
+    fn py_enable_full_cognitive_stack(&self) {
+        self.enable_full_cognitive_stack();
+    }
+
+    /// Disable all four cognitive recall reranking signals (Python binding).
+    ///
+    /// Resets every phase to Off. Counterpart to `enable_full_cognitive_stack()`.
+    #[pyo3(name = "disable_full_cognitive_stack")]
+    fn py_disable_full_cognitive_stack(&self) {
+        self.disable_full_cognitive_stack();
+    }
+
+    /// Set belief-aware recall reranking mode (Python binding).
+    /// mode: "off" | "shadow" | "limited"
+    #[pyo3(name = "set_belief_rerank_mode")]
+    fn py_set_belief_rerank_mode(&self, mode: &str) {
+        use crate::recall::BeliefRerankMode;
+        let m = match mode {
+            "limited" => BeliefRerankMode::Limited,
+            "shadow" => BeliefRerankMode::Shadow,
+            _ => BeliefRerankMode::Off,
+        };
+        self.set_belief_rerank_mode(m);
+    }
+
+    /// Set concept surface mode (Python binding).
+    /// mode: "off" | "inspect" | "limited"
+    #[pyo3(name = "set_concept_surface_mode")]
+    fn py_set_concept_surface_mode(&self, mode: &str) {
+        use crate::concept::ConceptSurfaceMode;
+        let m = match mode {
+            "limited" => ConceptSurfaceMode::Limited,
+            "inspect" => ConceptSurfaceMode::Inspect,
+            _ => ConceptSurfaceMode::Off,
+        };
+        self.set_concept_surface_mode(m);
+    }
+
+    /// Set causal pattern recall reranking mode (Python binding).
+    /// mode: "off" | "limited"
+    #[pyo3(name = "set_causal_rerank_mode")]
+    fn py_set_causal_rerank_mode(&self, mode: &str) {
+        use crate::causal::CausalRerankMode;
+        let m = match mode {
+            "limited" => CausalRerankMode::Limited,
+            _ => CausalRerankMode::Off,
+        };
+        self.set_causal_rerank_mode(m);
+    }
+
+    /// Set policy hint recall reranking mode (Python binding).
+    /// mode: "off" | "limited"
+    #[pyo3(name = "set_policy_rerank_mode")]
+    fn py_set_policy_rerank_mode(&self, mode: &str) {
+        use crate::policy::PolicyRerankMode;
+        let m = match mode {
+            "limited" => PolicyRerankMode::Limited,
+            _ => PolicyRerankMode::Off,
+        };
+        self.set_policy_rerank_mode(m);
     }
 
     #[pyo3(name = "start_background", signature = (interval_secs=None))]
@@ -4530,6 +7128,84 @@ impl Aura {
             .complete_research(project_id, synthesis)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(rec.id.clone())
+    }
+
+    #[pyo3(name = "store_project_task", signature = (project_id, content, due_date=None, metadata=None))]
+    fn py_store_project_task(
+        &self,
+        project_id: &str,
+        content: &str,
+        due_date: Option<&str>,
+        metadata: Option<HashMap<String, String>>,
+    ) -> PyResult<String> {
+        let rec = self
+            .store_project_task(project_id, content, due_date, metadata)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(rec.id.clone())
+    }
+
+    #[pyo3(name = "store_project_todo", signature = (project_id, content, metadata=None))]
+    fn py_store_project_todo(
+        &self,
+        project_id: &str,
+        content: &str,
+        metadata: Option<HashMap<String, String>>,
+    ) -> PyResult<String> {
+        let rec = self
+            .store_project_todo(project_id, content, metadata)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(rec.id.clone())
+    }
+
+    #[pyo3(name = "store_project_note", signature = (project_id, content, metadata=None))]
+    fn py_store_project_note(
+        &self,
+        project_id: &str,
+        content: &str,
+        metadata: Option<HashMap<String, String>>,
+    ) -> PyResult<String> {
+        let rec = self
+            .store_project_note(project_id, content, metadata)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(rec.id.clone())
+    }
+
+    #[pyo3(name = "store_family_person", signature = (relation_type, content, metadata=None, namespace=None))]
+    fn py_store_family_person(
+        &self,
+        relation_type: &str,
+        content: &str,
+        metadata: Option<HashMap<String, String>>,
+        namespace: Option<&str>,
+    ) -> PyResult<String> {
+        let rec = self
+            .store_family_person(relation_type, content, metadata, namespace)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(rec.id.clone())
+    }
+
+    #[pyo3(name = "link_records", signature = (source_id, target_id, relation_type, weight=None))]
+    fn py_link_records(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        relation_type: &str,
+        weight: Option<f32>,
+    ) -> PyResult<RelationEdge> {
+        self.link_records(source_id, target_id, relation_type, weight)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    #[pyo3(name = "link_entities", signature = (source_entity_id, target_entity_id, relation_type, weight=None))]
+    fn py_link_entities(
+        &self,
+        source_entity_id: &str,
+        target_entity_id: &str,
+        relation_type: &str,
+        weight: Option<f32>,
+    ) -> PyResult<EntityRelationEdge> {
+        self.link_entities(source_entity_id, target_entity_id, relation_type, weight)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     #[pyo3(name = "store_user_profile")]
@@ -5301,6 +7977,320 @@ mod tests {
     }
 
     #[test]
+    fn test_deterministic_family_relation_links_to_user_profile() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let mut fields = HashMap::new();
+        fields.insert("name".into(), "Teo".into());
+        let profile = aura.store_user_profile(fields)?;
+
+        let brother = aura.store(
+            "My brother Andriy works as a doctor.",
+            Some(Level::Identity),
+            Some(vec!["family".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("fact"),
+        )?;
+
+        let relations = aura.get_structural_relations_for_record(&brother.id, Some(8));
+        assert_eq!(relations.len(), 1);
+        let relation = &relations[0];
+        assert_eq!(relation.source_record_id, profile.id);
+        assert_eq!(relation.target_record_id, brother.id);
+        assert_eq!(relation.relation_type, "family.brother");
+        assert!((relation.weight - relation::STRUCTURAL_FAMILY_WEIGHT).abs() < 0.001);
+
+        let refreshed_profile = aura.get(&profile.id).unwrap();
+        assert_eq!(
+            refreshed_profile.connection_type(&brother.id),
+            Some("family.brother")
+        );
+
+        let refreshed_brother = aura.get(&brother.id).unwrap();
+        assert_eq!(
+            refreshed_brother.connection_type(&profile.id),
+            Some("family.brother")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_deterministic_family_relation_stays_in_namespace() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let profile_alpha = aura.store(
+            "User Profile:\n  name: Alpha",
+            Some(Level::Identity),
+            Some(vec![identity::PROFILE_TAG.into()]),
+            Some(true),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            Some("alpha"),
+            None,
+        )?;
+        let profile_beta = aura.store(
+            "User Profile:\n  name: Beta",
+            Some(Level::Identity),
+            Some(vec![identity::PROFILE_TAG.into()]),
+            Some(true),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            Some("beta"),
+            None,
+        )?;
+
+        let brother_alpha = aura.store(
+            "My brother Mark lives in Warsaw.",
+            Some(Level::Identity),
+            Some(vec!["family".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            Some("alpha"),
+            Some("fact"),
+        )?;
+        let sister_beta = aura.store(
+            "My sister Anna studies chemistry.",
+            Some(Level::Identity),
+            Some(vec!["family".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            Some("beta"),
+            Some("fact"),
+        )?;
+
+        let alpha_relations = aura.get_structural_relations_for_record(&brother_alpha.id, Some(8));
+        assert_eq!(alpha_relations.len(), 1);
+        assert_eq!(alpha_relations[0].source_record_id, profile_alpha.id);
+        assert_eq!(alpha_relations[0].target_record_id, brother_alpha.id);
+
+        let beta_relations = aura.get_structural_relations_for_record(&sister_beta.id, Some(8));
+        assert_eq!(beta_relations.len(), 1);
+        assert_eq!(beta_relations[0].source_record_id, profile_beta.id);
+        assert_eq!(beta_relations[0].target_record_id, sister_beta.id);
+
+        let all_relations = aura.get_structural_relations(Some(8));
+        assert_eq!(all_relations.len(), 2);
+        assert!(all_relations.iter().all(|rel| {
+            (rel.namespace == "alpha" && rel.source_record_id == profile_alpha.id)
+                || (rel.namespace == "beta" && rel.source_record_id == profile_beta.id)
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_family_graph_and_recall_family_context() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let mut fields = HashMap::new();
+        fields.insert("name".into(), "Teo".into());
+        let profile = aura.store_user_profile(fields)?;
+
+        let brother = aura.store(
+            "My brother Andriy works as a doctor and likes cycling.",
+            Some(Level::Identity),
+            Some(vec!["family".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("fact"),
+        )?;
+        let sister = aura.store(
+            "My sister Anna studies chemistry and biology.",
+            Some(Level::Identity),
+            Some(vec!["family".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("fact"),
+        )?;
+        aura.store(
+            "Project release note about canary rollout.",
+            Some(Level::Domain),
+            Some(vec!["project-note".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("fact"),
+        )?;
+
+        let graph = aura
+            .get_family_graph(None)
+            .expect("family graph should exist");
+        assert_eq!(graph.profile_record_id, profile.id);
+        assert_eq!(graph.relation_count, 2);
+        assert_eq!(graph.relation_types.get("family.brother"), Some(&1));
+        assert_eq!(graph.relation_types.get("family.sister"), Some(&1));
+        assert!(graph
+            .members
+            .iter()
+            .any(|member| member.record_id == brother.id));
+        assert!(graph
+            .members
+            .iter()
+            .any(|member| member.record_id == sister.id));
+
+        let by_record = aura
+            .get_family_graph_for_record(&brother.id)
+            .expect("record-scoped family graph should exist");
+        assert_eq!(by_record.profile_record_id, profile.id);
+        assert_eq!(by_record.relation_count, graph.relation_count);
+
+        let results = aura.recall_family_context(
+            "doctor cycling",
+            Some(5),
+            Some(0.1),
+            Some(true),
+            None,
+            None,
+        )?;
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|(_, rec)| {
+            rec.id == profile.id || rec.id == brother.id || rec.id == sister.id
+        }));
+        assert!(results.iter().any(|(_, rec)| rec.id == brother.id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_person_digest_and_recall_person_context() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let mut fields = HashMap::new();
+        fields.insert("name".into(), "Teo".into());
+        let profile = aura.store_user_profile(fields)?;
+
+        let brother = aura.store(
+            "My brother Andriy works as a doctor and likes cycling.",
+            Some(Level::Identity),
+            Some(vec!["family".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("fact"),
+        )?;
+        let sister = aura.store(
+            "My sister Anna studies chemistry and biology.",
+            Some(Level::Identity),
+            Some(vec!["family".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("fact"),
+        )?;
+
+        let digest = aura
+            .get_person_digest(&brother.id)
+            .expect("person digest should exist");
+        assert_eq!(digest.profile_record_id, profile.id);
+        assert_eq!(digest.person_record_id, brother.id);
+        assert_eq!(digest.relation_type, "family.brother");
+        assert!(digest.person_tags.contains(&"family".to_string()));
+        assert!(digest.person_content.contains("Andriy"));
+
+        let results = aura.recall_person_context(
+            &brother.id,
+            "doctor cycling",
+            Some(5),
+            Some(0.1),
+            Some(true),
+            None,
+        )?;
+        assert!(!results.is_empty());
+        assert!(results
+            .iter()
+            .all(|(_, rec)| rec.id == profile.id || rec.id == brother.id));
+        assert!(results.iter().any(|(_, rec)| rec.id == brother.id));
+        assert!(!results.iter().any(|(_, rec)| rec.id == sister.id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_store_family_person_helper_writes_explicit_relation_contract() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let mut fields = HashMap::new();
+        fields.insert("name".into(), "Teo".into());
+        let profile = aura.store_user_profile(fields)?;
+
+        let brother = aura.store_family_person(
+            "family.brother",
+            "Andriy works as a doctor and likes cycling.",
+            Some(HashMap::from([("name".to_string(), "Andriy".to_string())])),
+            None,
+        )?;
+
+        assert!(brother.tags.contains(&"family".to_string()));
+        assert_eq!(
+            brother.metadata.get("family_relation"),
+            Some(&"family.brother".to_string())
+        );
+        assert_eq!(brother.metadata.get("profile_record_id"), Some(&profile.id));
+
+        let digest = aura
+            .get_person_digest(&brother.id)
+            .expect("person digest should exist");
+        assert_eq!(digest.relation_type, "family.brother");
+        assert_eq!(digest.profile_record_id, profile.id);
+
+        let relations = aura.get_structural_relations_for_record(&brother.id, Some(8));
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].source_record_id, profile.id);
+        assert_eq!(relations[0].target_record_id, brother.id);
+        assert_eq!(relations[0].relation_type, "family.brother");
+
+        Ok(())
+    }
+
+    #[test]
     fn test_persona() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let aura = Aura::open(dir.path().to_str().unwrap())?;
@@ -5349,6 +8339,989 @@ mod tests {
         )?;
         assert!(rec.content.contains("GRPO"));
         assert!(rec.tags.contains(&"research-report".to_string()));
+        assert_eq!(rec.metadata.get("project_id"), Some(&project.id));
+
+        let project_anchor = aura
+            .search(
+                None,
+                Some(Level::Domain),
+                Some(vec!["research-project".into()]),
+                Some(10),
+                None,
+                None,
+                None,
+                None,
+            )
+            .into_iter()
+            .find(|r| r.metadata.get("project_id") == Some(&project.id))
+            .expect("research project anchor should exist");
+        assert_eq!(
+            project_anchor.metadata.get("project_topic"),
+            Some(&project.topic)
+        );
+
+        let relations = aura.get_structural_relations_for_record(&rec.id, Some(8));
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].source_record_id, project_anchor.id);
+        assert_eq!(relations[0].target_record_id, rec.id);
+        assert_eq!(
+            relations[0].relation_type,
+            relation::PROJECT_MEMBERSHIP_RELATION
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scheduled_task_links_to_project_by_explicit_project_id() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let project = aura.start_research("Memory safety rollout", Some("standard"));
+        let project_anchor = aura.ensure_research_project_anchor(&project)?;
+
+        let task = aura.store(
+            "Prepare rollout checklist for tomorrow morning.",
+            Some(Level::Working),
+            Some(vec!["scheduled-task".into()]),
+            Some(false),
+            None,
+            Some("recorded"),
+            Some(HashMap::from([
+                ("project_id".to_string(), project.id.clone()),
+                ("due_date".to_string(), "tomorrow".to_string()),
+            ])),
+            Some(false),
+            None,
+            None,
+            Some("decision"),
+        )?;
+
+        let relations = aura.get_structural_relations_for_record(&task.id, Some(8));
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].source_record_id, project_anchor.id);
+        assert_eq!(relations[0].target_record_id, task.id);
+        assert_eq!(
+            relations[0].relation_type,
+            relation::PROJECT_MEMBERSHIP_RELATION
+        );
+        assert!((relations[0].weight - relation::STRUCTURAL_PROJECT_WEIGHT).abs() < 0.001);
+
+        let refreshed_project = aura.get(&project_anchor.id).unwrap();
+        assert_eq!(
+            refreshed_project.connection_type(&task.id),
+            Some(relation::PROJECT_MEMBERSHIP_RELATION)
+        );
+
+        let refreshed_task = aura.get(&task.id).unwrap();
+        assert_eq!(
+            refreshed_task.connection_type(&project_anchor.id),
+            Some(relation::PROJECT_MEMBERSHIP_RELATION)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_link_records_creates_general_typed_relation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let project_note = aura.store(
+            "Release note about the Aura rollout plan.",
+            Some(Level::Domain),
+            Some(vec!["project-note".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("fact"),
+        )?;
+        let task = aura.store(
+            "Prepare rollout checklist for next release.",
+            Some(Level::Working),
+            Some(vec!["task".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("decision"),
+        )?;
+
+        let edge = aura.link_records(&project_note.id, &task.id, "supports.task", Some(0.88))?;
+        assert_eq!(edge.source_record_id, project_note.id);
+        assert_eq!(edge.target_record_id, task.id);
+        assert_eq!(edge.relation_type, "supports.task");
+        assert!(!edge.structural);
+
+        let note = aura.get(&project_note.id).unwrap();
+        let linked_task = aura.get(&task.id).unwrap();
+        assert_eq!(note.connection_type(&task.id), Some("supports.task"));
+        assert_eq!(
+            linked_task.connection_type(&project_note.id),
+            Some("supports.task")
+        );
+
+        let relations = aura.get_relations_for_record(&project_note.id, Some(8));
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].relation_type, "supports.task");
+        assert_eq!(relations[0].source_record_id, project_note.id);
+        assert_eq!(relations[0].target_record_id, task.id);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_link_records_rejects_cross_namespace_links() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let alpha = aura.store(
+            "Alpha record",
+            Some(Level::Domain),
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            Some("alpha"),
+            Some("fact"),
+        )?;
+        let beta = aura.store(
+            "Beta record",
+            Some(Level::Domain),
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            Some("beta"),
+            Some("fact"),
+        )?;
+
+        let err = aura
+            .link_records(&alpha.id, &beta.id, "related.topic", Some(0.7))
+            .expect_err("cross-namespace links should fail");
+        assert!(err
+            .to_string()
+            .contains("Cannot link records across namespaces"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_relation_digest_and_recall_relation_context() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let note = aura.store(
+            "Release note about the Aura rollout plan.",
+            Some(Level::Domain),
+            Some(vec!["project-note".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("fact"),
+        )?;
+        let task = aura.store(
+            "Prepare rollout checklist for next release.",
+            Some(Level::Working),
+            Some(vec!["task".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("decision"),
+        )?;
+        let unrelated = aura.store(
+            "Unrelated medical note about hydration.",
+            Some(Level::Domain),
+            Some(vec!["health".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("fact"),
+        )?;
+
+        aura.link_records(&note.id, &task.id, "supports.task", Some(0.88))?;
+
+        let digest = aura
+            .get_relation_digest(&note.id, Some(8))
+            .expect("relation digest should exist");
+        assert_eq!(digest.anchor_record_id, note.id);
+        assert_eq!(digest.relation_count, 1);
+        assert_eq!(digest.structural_relations, 0);
+        assert_eq!(digest.non_structural_relations, 1);
+        assert_eq!(digest.relation_types.get("supports.task"), Some(&1));
+        assert_eq!(digest.linked_record_ids, vec![task.id.clone()]);
+
+        let results = aura.recall_relation_context(
+            &note.id,
+            "rollout checklist",
+            Some(5),
+            Some(0.1),
+            Some(true),
+            None,
+            Some(8),
+        )?;
+        assert!(!results.is_empty());
+        assert!(results
+            .iter()
+            .all(|(_, rec)| rec.id == note.id || rec.id == task.id));
+        assert!(results.iter().any(|(_, rec)| rec.id == task.id));
+        assert!(!results.iter().any(|(_, rec)| rec.id == unrelated.id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_entity_digest_and_recall_entity_context() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let project = aura.start_research("Entity anchor rollout", Some("quick"));
+        let report = aura.complete_research(&project.id, Some("Entity summary".into()))?;
+        let task = aura.store_project_task(
+            &project.id,
+            "Prepare entity checklist",
+            Some("2026-03-14"),
+            None,
+        )?;
+        let note = aura.store_project_note(&project.id, "Entity rollout note", None)?;
+        let other = aura.store(
+            "Unrelated health note about hydration.",
+            Some(Level::Domain),
+            Some(vec!["health".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("fact"),
+        )?;
+
+        let entity_id = format!("project:{}", project.id);
+        let digest = aura
+            .get_entity_digest(&entity_id)
+            .expect("entity digest should exist");
+        assert_eq!(digest.entity_id, entity_id);
+        assert_eq!(digest.record_ids.len(), 4);
+        let project_graph = aura
+            .get_project_graph(&project.id)
+            .expect("project graph should exist");
+        assert!(digest.record_ids.contains(&project_graph.project_record_id));
+        assert!(digest.record_ids.contains(&report.id));
+        assert!(digest.record_ids.contains(&task.id));
+        assert!(digest.record_ids.contains(&note.id));
+        assert_eq!(digest.tags.get("research-project"), Some(&1));
+        assert_eq!(digest.tags.get("research-report"), Some(&1));
+        assert_eq!(digest.tags.get("scheduled-task"), Some(&1));
+        assert_eq!(digest.tags.get("project-note"), Some(&1));
+
+        let by_record = aura
+            .get_entity_digest_for_record(&task.id)
+            .expect("record-scoped entity digest should exist");
+        assert_eq!(by_record.entity_id, digest.entity_id);
+
+        let results = aura.recall_entity_context(
+            &digest.entity_id,
+            "entity checklist",
+            Some(5),
+            Some(0.1),
+            Some(true),
+            None,
+        )?;
+        assert!(!results.is_empty());
+        assert!(results
+            .iter()
+            .all(|(_, rec)| rec.metadata.get("entity_id") == Some(&digest.entity_id)));
+        assert!(!results.iter().any(|(_, rec)| rec.id == other.id));
+
+        let by_record_results = aura.recall_entity_context_for_record(
+            &note.id,
+            "rollout note",
+            Some(5),
+            Some(0.1),
+            Some(true),
+            None,
+        )?;
+        assert!(by_record_results.iter().any(|(_, rec)| rec.id == note.id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_link_entities_and_recall_entity_graph_context() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let project = aura.start_research("Entity graph rollout", Some("quick"));
+        let task = aura.store_project_task(
+            &project.id,
+            "Prepare entity graph checklist",
+            Some("2026-03-14"),
+            None,
+        )?;
+        let person = aura.store_family_person(
+            "family.brother",
+            "Andriy owns deployment checklist knowledge.",
+            Some(HashMap::from([("name".to_string(), "Andriy".to_string())])),
+            None,
+        )?;
+        let other = aura.store(
+            "Unrelated finance note about invoices.",
+            Some(Level::Domain),
+            Some(vec!["finance".into()]),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(false),
+            None,
+            None,
+            Some("fact"),
+        )?;
+
+        let project_entity = format!("project:{}", project.id);
+        let person_entity = aura
+            .get(&person.id)
+            .and_then(|rec| rec.metadata.get("entity_id").cloned())
+            .expect("person entity_id should exist");
+
+        let edge = aura.link_entities(
+            &project_entity,
+            &person_entity,
+            "owner.collaborates",
+            Some(0.91),
+        )?;
+        assert_eq!(edge.source_entity_id, project_entity);
+        assert_eq!(edge.target_entity_id, person_entity);
+        assert_eq!(edge.relation_type, "owner.collaborates");
+
+        let entity_edges = aura.get_entity_relations(&edge.source_entity_id, Some(8));
+        assert_eq!(entity_edges.len(), 1);
+        assert_eq!(entity_edges[0].target_entity_id, edge.target_entity_id);
+
+        let results = aura.recall_entity_graph_context(
+            &edge.source_entity_id,
+            "deployment checklist",
+            Some(5),
+            Some(0.1),
+            Some(true),
+            None,
+            Some(8),
+        )?;
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|(_, rec)| rec.id == task.id));
+        assert!(results.iter().any(|(_, rec)| rec.id == person.id));
+        assert!(!results.iter().any(|(_, rec)| rec.id == other.id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_link_records_promotes_strong_cross_entity_edge_to_anchors() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let project = aura.start_research("Anchor promotion rollout", Some("quick"));
+        let task = aura.store_project_task(
+            &project.id,
+            "Prepare deployment checklist for the rollout.",
+            Some("2026-03-14"),
+            None,
+        )?;
+        let person = aura.store_family_person(
+            "family.brother",
+            "Andriy owns deployment checklist knowledge.",
+            Some(HashMap::from([("name".to_string(), "Andriy".to_string())])),
+            None,
+        )?;
+
+        aura.link_records(&task.id, &person.id, "supports.person", Some(0.91))?;
+
+        let project_graph = aura
+            .get_project_graph(&project.id)
+            .expect("project graph should exist");
+        let anchor_digest = aura
+            .get_relation_digest(&project_graph.project_record_id, Some(8))
+            .expect("anchor digest should exist");
+        assert!(anchor_digest
+            .edges
+            .iter()
+            .any(|edge| edge.target_record_id == person.id
+                && edge.relation_type == "supports.person"
+                && edge.weight >= 0.91));
+
+        let project_entity = format!("project:{}", project.id);
+        let entity_edges = aura.get_entity_relations(&project_entity, Some(8));
+        assert_eq!(entity_edges.len(), 1);
+        assert_eq!(entity_edges[0].relation_type, "supports.person");
+        assert_eq!(
+            entity_edges[0].source_record_id,
+            project_graph.project_record_id
+        );
+        assert_eq!(entity_edges[0].target_record_id, person.id);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_entity_graph_digest_aggregates_direct_neighbors() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let project = aura.start_research("Entity graph digest rollout", Some("quick"));
+        let project_entity = format!("project:{}", project.id);
+        let task = aura.store_project_task(
+            &project.id,
+            "Prepare shared deployment checklist.",
+            Some("2026-03-14"),
+            None,
+        )?;
+        let person = aura.store_family_person(
+            "family.brother",
+            "Andriy owns deployment checklist knowledge.",
+            Some(HashMap::from([("name".to_string(), "Andriy".to_string())])),
+            None,
+        )?;
+        let teammate = aura.store(
+            "Teammate note for rollout approvals.",
+            Some(Level::Identity),
+            Some(vec!["contact".into()]),
+            Some(false),
+            None,
+            None,
+            Some(HashMap::from([(
+                "entity_id".to_string(),
+                "person:teammate:olena".to_string(),
+            )])),
+            Some(false),
+            None,
+            None,
+            Some("fact"),
+        )?;
+
+        aura.link_records(&task.id, &person.id, "supports.person", Some(0.91))?;
+        aura.link_records(&task.id, &teammate.id, "works_with", Some(0.84))?;
+
+        let digest = aura
+            .get_entity_graph_digest(&project_entity, Some(8))
+            .expect("entity graph digest should exist");
+        assert_eq!(digest.entity.entity_id, project_entity);
+        assert_eq!(digest.neighbor_count, 2);
+        assert_eq!(digest.relation_types.get("supports.person"), Some(&1));
+        assert_eq!(digest.relation_types.get("works_with"), Some(&1));
+        assert_eq!(digest.edges.len(), 2);
+        assert_eq!(digest.neighbors.len(), 2);
+        assert_eq!(digest.neighbors[0].relation_count, 1);
+        assert!(digest.neighbors[0].strongest_weight >= digest.neighbors[1].strongest_weight);
+        assert!(digest.neighbors.iter().any(|neighbor| neighbor.entity_id
+            == "person:family.brother:andriy"
+            && neighbor.relation_types.get("supports.person") == Some(&1)));
+        assert!(digest
+            .neighbors
+            .iter()
+            .any(|neighbor| neighbor.entity_id == "person:teammate:olena"
+                && neighbor.relation_types.get("works_with") == Some(&1)));
+
+        let by_record = aura
+            .get_entity_graph_digest_for_record(&task.id, Some(8))
+            .expect("record-scoped entity graph digest should exist");
+        assert_eq!(by_record.entity.entity_id, digest.entity.entity_id);
+        assert_eq!(by_record.neighbor_count, digest.neighbor_count);
+
+        Ok(())
+    }
+
+    // ── get_entity_graph_neighbors ──────────────────────────────────────────────
+
+    /// Helper that builds the three-entity project graph used by neighbor tests.
+    fn build_neighbor_test_graph() -> Result<(
+        tempfile::TempDir,
+        Aura,
+        String, // project_entity
+        String, // person entity_id
+        String, // teammate entity_id
+    )> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+        let project = aura.start_research("Neighbor test project", Some("quick"));
+        let project_entity = format!("project:{}", project.id);
+        let task = aura.store_project_task(
+            &project.id,
+            "Deploy checklist for neighbor test.",
+            Some("2026-03-14"),
+            None,
+        )?;
+        let person = aura.store_family_person(
+            "family.sibling",
+            "Olena owns deployment knowledge.",
+            Some(HashMap::from([("name".to_string(), "Olena".to_string())])),
+            None,
+        )?;
+        let teammate = aura.store(
+            "Teammate note for neighbor test approvals.",
+            Some(Level::Identity),
+            Some(vec!["contact".into()]),
+            Some(false),
+            None,
+            None,
+            Some(HashMap::from([(
+                "entity_id".to_string(),
+                "person:teammate:mykola".to_string(),
+            )])),
+            Some(false),
+            None,
+            None,
+            Some("fact"),
+        )?;
+        aura.link_records(&task.id, &person.id, "supports.person", Some(0.91))?;
+        aura.link_records(&task.id, &teammate.id, "works_with", Some(0.75))?;
+        let person_entity = aura
+            .get(&person.id)
+            .and_then(|r| r.metadata.get("entity_id").cloned())
+            .expect("person entity_id");
+        Ok((dir, aura, project_entity, person_entity, "person:teammate:mykola".to_string()))
+    }
+
+    #[test]
+    fn test_get_entity_graph_neighbors_returns_all_by_default() -> Result<()> {
+        let (_dir, aura, project_entity, _, _) = build_neighbor_test_graph()?;
+        let neighbors = aura.get_entity_graph_neighbors(&project_entity, None, None, None, None);
+        assert_eq!(neighbors.len(), 2, "expected both neighbors without filter");
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_entity_graph_neighbors_top_n_truncates() -> Result<()> {
+        let (_dir, aura, project_entity, _, _) = build_neighbor_test_graph()?;
+        let neighbors =
+            aura.get_entity_graph_neighbors(&project_entity, Some(1), None, None, None);
+        assert_eq!(neighbors.len(), 1);
+        // strongest weight neighbor should be first (supports.person @ 0.91 > works_with @ 0.75)
+        assert!(neighbors[0].entity.entity_id.contains("sibling") || neighbors[0].entity.entity_id.contains("Olena") || neighbors[0].entity.entity_id.contains("olena"),
+            "first neighbor should be the highest-weight one, got {}", neighbors[0].entity.entity_id);
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_entity_graph_neighbors_min_weight_filters() -> Result<()> {
+        let (_dir, aura, project_entity, _, _) = build_neighbor_test_graph()?;
+        // 0.91 passes, 0.75 is below 0.80 cutoff
+        let neighbors =
+            aura.get_entity_graph_neighbors(&project_entity, None, Some(0.80), None, None);
+        assert_eq!(neighbors.len(), 1);
+        assert!(neighbors[0].entity.entity_id.contains("sibling") || neighbors[0].entity.entity_id.contains("olena"),
+            "only the supports.person neighbor should survive; got {}", neighbors[0].entity.entity_id);
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_entity_graph_neighbors_relation_type_filter() -> Result<()> {
+        let (_dir, aura, project_entity, _, _) = build_neighbor_test_graph()?;
+        let neighbors = aura.get_entity_graph_neighbors(
+            &project_entity,
+            None,
+            None,
+            Some("works_with"),
+            None,
+        );
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].entity.entity_id, "person:teammate:mykola");
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_entity_graph_neighbors_each_result_is_valid_digest() -> Result<()> {
+        let (_dir, aura, project_entity, _, _) = build_neighbor_test_graph()?;
+        let neighbors = aura.get_entity_graph_neighbors(&project_entity, None, None, None, None);
+        for n in &neighbors {
+            assert!(!n.entity.entity_id.is_empty());
+            assert!(!n.anchor_record_id.is_empty());
+            // each returned digest is valid entity from anchor entity's perspective
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_entity_graph_neighbors_unknown_entity_returns_empty() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+        let neighbors =
+            aura.get_entity_graph_neighbors("entity:does:not:exist", None, None, None, None);
+        assert!(neighbors.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_store_project_task_helper_writes_contract_metadata() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let project = aura.start_research("Contract enforcement", Some("quick"));
+        let task = aura.store_project_task(
+            &project.id,
+            "Write rollout note for the team.",
+            Some("2026-03-14"),
+            Some(HashMap::from([("owner".to_string(), "ops".to_string())])),
+        )?;
+
+        assert!(task.tags.contains(&"scheduled-task".to_string()));
+        assert_eq!(task.metadata.get("project_id"), Some(&project.id));
+        assert_eq!(
+            task.metadata.get("due_date"),
+            Some(&"2026-03-14".to_string())
+        );
+        assert_eq!(task.metadata.get("owner"), Some(&"ops".to_string()));
+
+        let relations = aura.get_structural_relations_for_record(&task.id, Some(8));
+        assert_eq!(relations.len(), 1);
+        assert_eq!(
+            relations[0].relation_type,
+            relation::PROJECT_MEMBERSHIP_RELATION
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_store_project_todo_helper_writes_contract_metadata() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let project = aura.start_research("Todo contract", Some("quick"));
+        let todo = aura.store_project_todo(
+            &project.id,
+            "Document the rollout edge cases.",
+            Some(HashMap::from([(
+                "priority".to_string(),
+                "high".to_string(),
+            )])),
+        )?;
+
+        assert!(todo.tags.contains(&"todo-item".to_string()));
+        assert_eq!(todo.metadata.get("project_id"), Some(&project.id));
+        assert_eq!(todo.metadata.get("priority"), Some(&"high".to_string()));
+
+        let relations = aura.get_structural_relations_for_record(&todo.id, Some(8));
+        assert_eq!(relations.len(), 1);
+        assert_eq!(
+            relations[0].relation_type,
+            relation::PROJECT_MEMBERSHIP_RELATION
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_store_project_note_helper_writes_contract_metadata() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let project = aura.start_research("Project note contract", Some("quick"));
+        let note = aura.store_project_note(
+            &project.id,
+            "The rollout must stay inspect-only for this tenant.",
+            Some(HashMap::from([(
+                "kind".to_string(),
+                "constraint".to_string(),
+            )])),
+        )?;
+
+        assert!(note.tags.contains(&"project-note".to_string()));
+        assert_eq!(note.metadata.get("project_id"), Some(&project.id));
+        assert_eq!(note.metadata.get("kind"), Some(&"constraint".to_string()));
+
+        let relations = aura.get_structural_relations_for_record(&note.id, Some(8));
+        assert_eq!(relations.len(), 1);
+        assert_eq!(
+            relations[0].relation_type,
+            relation::PROJECT_MEMBERSHIP_RELATION
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_project_graph_collects_project_members() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let project = aura.start_research("Project graph view", Some("quick"));
+        let report = aura.complete_research(&project.id, Some("Graph summary".into()))?;
+        let task = aura.store_project_task(
+            &project.id,
+            "Prepare rollout checklist",
+            Some("2026-03-14"),
+            None,
+        )?;
+        let todo = aura.store_project_todo(
+            &project.id,
+            "Document edge cases",
+            Some(HashMap::from([(
+                "priority".to_string(),
+                "high".to_string(),
+            )])),
+        )?;
+        let note = aura.store_project_note(
+            &project.id,
+            "Keep rollout inspect-only",
+            Some(HashMap::from([(
+                "kind".to_string(),
+                "constraint".to_string(),
+            )])),
+        )?;
+
+        let snapshot = aura
+            .get_project_graph(&project.id)
+            .expect("project graph should exist");
+        assert_eq!(snapshot.project_id, project.id);
+        assert_eq!(snapshot.project_topic, project.topic);
+        assert_eq!(snapshot.relation_count, 4);
+        assert_eq!(snapshot.member_record_ids.len(), 4);
+        assert!(snapshot.member_record_ids.contains(&report.id));
+        assert!(snapshot.member_record_ids.contains(&task.id));
+        assert!(snapshot.member_record_ids.contains(&todo.id));
+        assert!(snapshot.member_record_ids.contains(&note.id));
+        assert_eq!(snapshot.member_tags.get("research-report"), Some(&1));
+        assert_eq!(snapshot.member_tags.get("scheduled-task"), Some(&1));
+        assert_eq!(snapshot.member_tags.get("todo-item"), Some(&1));
+        assert_eq!(snapshot.member_tags.get("project-note"), Some(&1));
+
+        let by_record = aura
+            .get_project_graph_for_record(&task.id)
+            .expect("record-scoped project graph should exist");
+        assert_eq!(by_record.project_record_id, snapshot.project_record_id);
+        assert_eq!(by_record.member_record_ids, snapshot.member_record_ids);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_recall_project_context_stays_bounded_to_project_records() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let alpha = aura.start_research("Alpha rollout", Some("quick"));
+        aura.store_project_task(
+            &alpha.id,
+            "Prepare alpha checklist",
+            Some("2026-03-14"),
+            None,
+        )?;
+        let alpha_note = aura.store_project_note(
+            &alpha.id,
+            "Alpha rollback uses canary analysis and staged metrics.",
+            None,
+        )?;
+
+        let beta = aura.start_research("Beta rollout", Some("quick"));
+        let beta_note = aura.store_project_note(
+            &beta.id,
+            "Beta rollback uses manual review and freeze windows.",
+            None,
+        )?;
+
+        let results = aura.recall_project_context(
+            &alpha.id,
+            "rollback canary metrics",
+            Some(5),
+            Some(0.0),
+            Some(true),
+            None,
+        )?;
+
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|(_, rec)| {
+            rec.id != beta_note.id && rec.metadata.get("project_id") != Some(&beta.id)
+        }));
+        assert!(results.iter().any(|(_, rec)| rec.id == alpha_note.id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_project_status_counts_project_members() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let project = aura.start_research("Status snapshot", Some("quick"));
+        let report = aura.complete_research(&project.id, Some("Status summary".into()))?;
+        aura.store_project_task(
+            &project.id,
+            "Prepare checklist",
+            Some("2026-03-14"),
+            Some(HashMap::from([("status".to_string(), "done".to_string())])),
+        )?;
+        let todo = aura.store_project_todo(
+            &project.id,
+            "Document edge cases",
+            Some(HashMap::from([
+                ("priority".to_string(), "high".to_string()),
+                ("completed".to_string(), "false".to_string()),
+            ])),
+        )?;
+        aura.store_project_note(
+            &project.id,
+            "Keep rollout inspect-only",
+            Some(HashMap::from([(
+                "kind".to_string(),
+                "constraint".to_string(),
+            )])),
+        )?;
+
+        let status = aura
+            .get_project_status(&project.id)
+            .expect("project status should exist");
+        assert_eq!(status.project_id, project.id);
+        assert_eq!(status.project_status, "completed");
+        assert_eq!(status.total_members, 4);
+        assert_eq!(status.reports, 1);
+        assert_eq!(status.scheduled_tasks, 1);
+        assert_eq!(status.completed_tasks, 1);
+        assert_eq!(status.open_tasks, 0);
+        assert_eq!(status.todos, 1);
+        assert_eq!(status.open_todos, 1);
+        assert_eq!(status.completed_todos, 0);
+        assert_eq!(status.notes, 1);
+        assert_eq!(status.due_tasks, 1);
+        assert_eq!(status.high_priority_todos, 1);
+
+        let by_record = aura
+            .get_project_status_for_record(&todo.id)
+            .expect("record-scoped status should exist");
+        assert_eq!(by_record.project_record_id, status.project_record_id);
+        assert_eq!(by_record.total_members, status.total_members);
+        assert_eq!(report.metadata.get("project_id"), Some(&project.id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_project_timeline_sorts_due_and_flags_overdue() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let project = aura.start_research("Timeline snapshot", Some("quick"));
+        let overdue_task = aura.store_project_task(
+            &project.id,
+            "Fix expired checklist item",
+            Some("2000-01-01"),
+            None,
+        )?;
+        let upcoming_task = aura.store_project_task(
+            &project.id,
+            "Prepare today checklist",
+            Some(&chrono::Utc::now().date_naive().to_string()),
+            None,
+        )?;
+        let note = aura.store_project_note(&project.id, "Project context note", None)?;
+
+        let timeline = aura
+            .get_project_timeline(&project.id)
+            .expect("project timeline should exist");
+        assert_eq!(timeline.project_id, project.id);
+        assert_eq!(timeline.total_entries, 3);
+        assert_eq!(timeline.overdue_entries, 1);
+        assert!(timeline.upcoming_entries >= 1);
+        assert_eq!(timeline.entries[0].record_id, overdue_task.id);
+        assert!(timeline.entries[0].overdue);
+        assert_eq!(timeline.entries[1].record_id, upcoming_task.id);
+        assert!(timeline
+            .entries
+            .iter()
+            .any(|entry| entry.record_id == note.id));
+
+        let by_record = aura
+            .get_project_timeline_for_record(&note.id)
+            .expect("record-scoped timeline should exist");
+        assert_eq!(by_record.project_record_id, timeline.project_record_id);
+        assert_eq!(by_record.total_entries, timeline.total_entries);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_project_digest_combines_graph_status_and_timeline() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let aura = Aura::open(dir.path().to_str().unwrap())?;
+
+        let project = aura.start_research("Digest snapshot", Some("quick"));
+        aura.complete_research(&project.id, Some("Digest summary".into()))?;
+        let task = aura.store_project_task(
+            &project.id,
+            "Prepare digest checklist",
+            Some("2026-03-14"),
+            Some(HashMap::from([(
+                "status".to_string(),
+                "in_progress".to_string(),
+            )])),
+        )?;
+        aura.store_project_todo(
+            &project.id,
+            "Document digest edge cases",
+            Some(HashMap::from([(
+                "priority".to_string(),
+                "high".to_string(),
+            )])),
+        )?;
+        aura.store_project_note(&project.id, "Digest note", None)?;
+
+        let digest = aura
+            .get_project_digest(&project.id)
+            .expect("project digest should exist");
+        assert_eq!(digest.graph.project_id, project.id);
+        assert_eq!(digest.status.project_id, project.id);
+        assert_eq!(digest.timeline.project_id, project.id);
+        assert_eq!(digest.graph.relation_count, 4);
+        assert_eq!(digest.status.total_members, 4);
+        assert_eq!(digest.timeline.total_entries, 4);
+        assert_eq!(digest.status.reports, 1);
+        assert_eq!(digest.status.scheduled_tasks, 1);
+        assert_eq!(digest.status.todos, 1);
+        assert_eq!(digest.status.notes, 1);
+        assert_eq!(
+            digest.graph.project_record_id,
+            digest.status.project_record_id
+        );
+        assert_eq!(
+            digest.graph.project_record_id,
+            digest.timeline.project_record_id
+        );
+
+        let by_record = aura
+            .get_project_digest_for_record(&task.id)
+            .expect("record-scoped digest should exist");
+        assert_eq!(by_record.graph.project_id, digest.graph.project_id);
+        assert_eq!(by_record.status.total_members, digest.status.total_members);
+        assert_eq!(
+            by_record.timeline.total_entries,
+            digest.timeline.total_entries
+        );
 
         Ok(())
     }

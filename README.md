@@ -12,7 +12,7 @@
   <a href="https://pypi.org/project/aura-memory/"><img src="https://img.shields.io/pypi/dm/aura-memory.svg" alt="Downloads"></a>
   <a href="https://github.com/teolex2020/AuraSDK/stargazers"><img src="https://img.shields.io/github/stars/teolex2020/AuraSDK?style=social" alt="GitHub stars"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
-  <a href="https://github.com/teolex2020/AuraSDK/actions/workflows/test.yml"><img src="https://img.shields.io/badge/tests-622_passed-brightgreen" alt="Tests"></a>
+  <a href="https://github.com/teolex2020/AuraSDK/actions/workflows/test.yml"><img src="https://img.shields.io/badge/tests-828_passed-brightgreen" alt="Tests"></a>
   <a href="https://www.uspto.gov/"><img src="https://img.shields.io/badge/Patent_Pending-US_63%2F969%2C703-blue.svg" alt="Patent Pending"></a>
 </p>
 
@@ -84,16 +84,32 @@ Mem0 recall requires an embedding API call (~200ms+) + vector search. Aura recal
 
 ## What Ships Today
 
-Aura's supported production path is:
+Aura's full cognitive recall pipeline is active and bounded:
 
-`Record -> Belief -> bounded recall rerank`
+`Record → Belief (±5%) → Concept (±4%) → Causal (±3%) → Policy (±2%)`
 
-Higher layers exist, but remain advisory:
+Enable everything in one call:
 
-- `Concept` is available through surfaced inspect output only
-- `Causal` is advisory only
-- `Policy` is advisory surfaced output only
-- no concept, causal, or policy layer changes recall ordering or agent behavior automatically
+```python
+brain.enable_full_cognitive_stack()   # activates all four bounded reranking phases
+brain.disable_full_cognitive_stack()  # back to raw RRF baseline
+```
+
+Or configure individual phases:
+
+```python
+brain.set_belief_rerank_mode("limited")   # belief-aware ranking
+brain.set_concept_surface_mode("inspect") # concept annotations, no ranking change
+brain.set_causal_rerank_mode("limited")   # causal chain boost
+brain.set_policy_rerank_mode("limited")   # policy hint shaping
+```
+
+Higher layers also expose advisory surfaced output:
+
+- `get_surfaced_concepts()` — stable concept abstractions over repeated beliefs
+- `get_surfaced_causal_patterns()` — learned cause→effect patterns
+- `get_surfaced_policy_hints()` — behavioral recommendations (Prefer / Avoid / Warn)
+- no automatic behavior influence — all output is advisory and read-only
 
 ---
 

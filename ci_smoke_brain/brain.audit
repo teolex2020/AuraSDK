@@ -1,0 +1,5 @@
+{"timestamp":1773394846613,"time_iso":"2026-03-06T09:40:46Z","action":{"store":{"id":"0a0ca717e059","text_preview":"User prefers dark mode"}},"session_id":"session_1773394846610"}
+{"timestamp":1773394846614,"time_iso":"2026-03-06T09:40:46Z","action":{"retrieve":{"query_preview":"dark mode","results_count":1}},"session_id":"session_1773394846610"}
+{"timestamp":1773394846682,"time_iso":"2026-03-06T09:40:46Z","action":"close","session_id":"session_1773394846610"}
+{"timestamp":1773394873743,"time_iso":"2026-03-06T09:41:13Z","action":{"retrieve":{"query_preview":"dark mode","results_count":1}},"session_id":"session_1773394873741"}
+{"timestamp":1773394873821,"time_iso":"2026-03-06T09:41:13Z","action":"close","session_id":"session_1773394873741"}
