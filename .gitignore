@@ -80,5 +80,14 @@ plans/
 reports/
 tests/
 
+# Marketing materials (strategy — not public)
+marketing/
+
+# Internal implementation files — not for public
+src/relation.rs
+
+# CI smoke brain data
+ci_smoke_brain/
+
 # Claude Code local config
 .claude/

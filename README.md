@@ -1,8 +1,8 @@
 <p align="center">
   <h1 align="center">AuraSDK</h1>
-  <p align="center"><strong>Deterministic Local Memory Engine for AI Agents</strong></p>
+  <p align="center"><strong>Cognitive Layer That Makes Your AI Model Smarter Over Time</strong></p>
   <p align="center">
-    Learns from experience · <1ms recall · No LLM calls · No cloud · ~3 MB
+    Self-learning · No fine-tuning · No cloud training · <1ms recall · ~3 MB
   </p>
 </p>
 
@@ -24,9 +24,9 @@
 
 ---
 
-LLMs forget everything. Every conversation starts from zero. Existing solutions bolt on vector databases and LLM calls for basic recall, adding latency, cloud dependency, and cost to every operation.
+Your AI model is smart. But it forgets everything after every conversation — and it never gets smarter from experience.
 
-Aura gives your agent a deterministic local memory engine with bounded belief-aware recall ranking and advisory cognitive overlays. Every record carries a semantic type (fact, decision, trend, preference, contradiction, serendipity) that shapes how it decays, promotes, and surfaces in local recall. One `pip install`, works fully offline.
+AuraSDK is a cognitive layer that runs alongside any LLM. It observes every interaction, builds beliefs from patterns, discovers causal relationships, and derives behavioral policies — all locally, without fine-tuning or cloud training. The longer it runs, the smarter your agent becomes.
 
 ```bash
 pip install aura-memory
@@ -36,16 +36,21 @@ pip install aura-memory
 from aura import Aura, Level
 
 brain = Aura("./agent_memory")
+brain.enable_full_cognitive_stack()  # activate all 5 cognitive layers
 
-brain.store("User prefers dark mode", level=Level.Identity, tags=["ui"],
-            semantic_type="preference")
-brain.store("Deploy to staging first", level=Level.Decisions, tags=["workflow"],
-            semantic_type="decision")
+# store what happens
+brain.store("User always deploys to staging first", level=Level.Domain, tags=["workflow"])
+brain.store("Staging deploy prevented 3 production incidents", level=Level.Domain, tags=["workflow"])
 
-context = brain.recall("user preferences")  # <1ms — inject into any LLM prompt
+# recall — cognitive layer automatically surfaces relevant patterns
+context = brain.recall("deployment decision")  # <1ms, no API call
+
+# after enough interactions, the system derives this on its own:
+hints = brain.get_surfaced_policy_hints()
+# → [{"action": "Prefer", "domain": "workflow", "description": "deploy to staging first"}]
 ```
 
-Your agent now remembers. No API keys. No embeddings required. No cloud runtime.
+No API keys. No embeddings. No cloud. The model stays the same — your agent gets smarter.
 
 > **⭐ If AuraSDK is useful to you, a [GitHub star](https://github.com/teolex2020/AuraSDK) helps us get funding to continue development from Kyiv.**
 
@@ -55,13 +60,14 @@ Your agent now remembers. No API keys. No embeddings required. No cloud runtime.
 
 | | **Aura** | Mem0 | Zep | Cognee | Letta/MemGPT |
 |---|---|---|---|---|---|
-| **Architecture** | **Deterministic local memory** | Vector + LLM | Vector + LLM | Graph + LLM | LLM orchestration |
+| **Architecture** | **5-layer cognitive engine** | Vector + LLM | Vector + LLM | Graph + LLM | LLM orchestration |
+| **Self-learning without LLM** | **Yes — Belief→Causal→Policy** | No | No | No | No |
+| **Behavioral policies from experience** | **Yes — automatic** | No | No | No | No |
 | **LLM required** | **No** | Yes | Yes | Yes | Yes |
 | **Recall latency** | **<1ms** | ~200ms+ | ~200ms | LLM-bound | LLM-bound |
 | **Works offline** | **Fully** | Partial | No | No | With local LLM |
 | **Cost per operation** | **$0** | API billing | Credit-based | LLM + DB cost | LLM cost |
 | **Binary size** | **~3 MB** | ~50 MB+ | Cloud service | Heavy (Neo4j+) | Python pkg |
-| **Semantic memory types** | **Built-in (6 types)** | No | No | No | No |
 | **Memory decay & promotion** | **Built-in** | Via LLM | Via LLM | No | Via LLM |
 | **Trust & provenance** | **Built-in** | No | No | No | No |
 | **Encryption at rest** | **ChaCha20 + Argon2** | No | No | No | No |
