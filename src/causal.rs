@@ -132,6 +132,26 @@ pub enum CausalEvidenceMode {
     TemporalClusterRecovery,
 }
 
+/// Recall reranking mode for causal-pattern-weighted influence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CausalRerankMode {
+    /// No causal influence on recall ranking. Default.
+    #[default]
+    Off = 0,
+    /// Limited influence: apply bounded reranking (capped score delta + positional shift limit).
+    Limited = 1,
+}
+
+impl CausalRerankMode {
+    /// Convert from u8 (for atomic storage). Invalid values → Off.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Limited,
+            _ => Self::Off,
+        }
+    }
+}
+
 // ── CausalPattern ──
 
 /// A discovered candidate causal relation between two groups of records/beliefs.
@@ -198,6 +218,8 @@ pub struct CausalPattern {
 /// Per-cycle report returned by CausalEngine::discover().
 #[derive(Debug, Clone, Default)]
 pub struct CausalReport {
+    /// True if the rebuild was skipped because the corpus fingerprint is unchanged.
+    pub skipped: bool,
     /// Number of raw record-level edges found.
     pub edges_found: usize,
     /// Number of explicit record-level edges found.
@@ -277,6 +299,17 @@ pub struct CausalEngine {
     pub temporal_budget_mode: TemporalEdgeBudgetMode,
     /// Evidence-gating policy for Candidate/Stable promotion.
     pub evidence_mode: CausalEvidenceMode,
+    /// xxh3 fingerprint of the last corpus seen by discover().
+    /// Used to skip full rebuild when the corpus has not changed.
+    #[serde(default)]
+    pub last_corpus_fingerprint: u64,
+    /// Edge counts from the last full rebuild, replayed in skipped reports.
+    #[serde(default)]
+    pub last_edges_found: usize,
+    #[serde(default)]
+    pub last_explicit_edges_found: usize,
+    #[serde(default)]
+    pub last_temporal_edges_found: usize,
 }
 
 impl CausalEngine {
@@ -287,12 +320,63 @@ impl CausalEngine {
             key_index: HashMap::new(),
             temporal_budget_mode: TemporalEdgeBudgetMode::ExhaustiveCapped,
             evidence_mode: CausalEvidenceMode::StrictRepeatedWindows,
+            last_corpus_fingerprint: 0,
+            last_edges_found: 0,
+            last_explicit_edges_found: 0,
+            last_temporal_edges_found: 0,
         }
     }
 
-    /// Full rebuild: discover causal patterns from records and beliefs.
+    /// Compute a deterministic fingerprint over the causal-relevant fields of
+    /// all records: record ID, namespace, created_at, caused_by_id, and any
+    /// connection entries typed "causal".
     ///
-    /// Algorithm (3 phases):
+    /// Two corpora produce the same fingerprint if and only if their causal
+    /// signal (explicit edges + temporal ordering) is identical.
+    fn corpus_fingerprint(records: &HashMap<String, Record>) -> u64 {
+        // Sort by record ID for determinism across HashMap iteration order.
+        let mut keys: Vec<&String> = records.keys().collect();
+        keys.sort_unstable();
+
+        let mut buf = String::with_capacity(keys.len() * 64);
+        for rid in keys {
+            let rec = &records[rid];
+            buf.push_str(rid);
+            buf.push('|');
+            buf.push_str(&rec.namespace);
+            buf.push('|');
+            // created_at as bits for exact float comparison
+            buf.push_str(&rec.created_at.to_bits().to_string());
+            buf.push('|');
+            if let Some(ref cid) = rec.caused_by_id {
+                buf.push_str(cid);
+            }
+            buf.push('|');
+            // Include any "causal" connection entries, sorted for determinism
+            let mut causal_conns: Vec<&String> = rec
+                .connection_types
+                .iter()
+                .filter(|(_, t)| t.as_str() == "causal")
+                .map(|(id, _)| id)
+                .collect();
+            causal_conns.sort_unstable();
+            for cid in causal_conns {
+                buf.push_str(cid);
+                buf.push(',');
+            }
+            buf.push('\n');
+        }
+        xxhash_rust::xxh3::xxh3_64(buf.as_bytes())
+    }
+
+    /// Discover causal patterns from records and beliefs.
+    ///
+    /// Skips the full rebuild if the corpus fingerprint (record IDs, namespaces,
+    /// created_at, caused_by_id, causal connections) has not changed since the
+    /// last cycle. Returns a report with `skipped=true` and preserves existing
+    /// pattern state unchanged.
+    ///
+    /// Algorithm when not skipped (3 phases):
     ///   1. Extract record-level causal edges (explicit + temporal)
     ///   2. Aggregate edges to belief-level patterns
     ///   3. Score and classify patterns
@@ -302,6 +386,32 @@ impl CausalEngine {
         records: &HashMap<String, Record>,
         _sdr_lookup: &SdrLookup,
     ) -> CausalReport {
+        // Skip rebuild if corpus is unchanged
+        let fingerprint = Self::corpus_fingerprint(records);
+        if fingerprint != 0 && fingerprint == self.last_corpus_fingerprint {
+            // Re-derive summary counters from cached patterns (no rebuild)
+            let stable_count = self.patterns.values().filter(|p| p.state == CausalState::Stable).count();
+            let rejected_count = self.patterns.values().filter(|p| p.state == CausalState::Rejected).count();
+            let candidates_found = self.patterns.len();
+            let avg_causal_strength = if candidates_found > 0 {
+                self.patterns.values().map(|p| p.causal_strength).sum::<f32>() / candidates_found as f32
+            } else {
+                0.0
+            };
+            return CausalReport {
+                skipped: true,
+                // Replay edge counts from last full rebuild so callers see consistent metrics
+                edges_found: self.last_edges_found,
+                explicit_edges_found: self.last_explicit_edges_found,
+                temporal_edges_found: self.last_temporal_edges_found,
+                candidates_found,
+                stable_count,
+                rejected_count,
+                avg_causal_strength,
+                ..CausalReport::default()
+            };
+        }
+
         // Full rebuild — clear previous state
         self.patterns.clear();
         self.key_index.clear();
@@ -316,6 +426,7 @@ impl CausalEngine {
         let edges_found = edge_stats.edges.len();
 
         if edge_stats.edges.is_empty() {
+            self.last_corpus_fingerprint = fingerprint;
             return CausalReport::default();
         }
 
@@ -383,7 +494,14 @@ impl CausalEngine {
             0.0
         };
 
+        // Persist fingerprint and edge counts so the next cycle can skip if corpus is unchanged
+        self.last_corpus_fingerprint = fingerprint;
+        self.last_edges_found = edges_found;
+        self.last_explicit_edges_found = edge_stats.explicit_edges_found;
+        self.last_temporal_edges_found = edge_stats.temporal_edges_found;
+
         CausalReport {
+            skipped: false,
             edges_found,
             explicit_edges_found: edge_stats.explicit_edges_found,
             temporal_edges_found: edge_stats.temporal_edges_found,
@@ -878,11 +996,16 @@ pub(crate) fn meets_repeated_evidence_gate(
     match mode {
         CausalEvidenceMode::StrictRepeatedWindows => false,
         CausalEvidenceMode::TemporalClusterRecovery => {
+            // Narrowed guard: require at least one positive outcome signal on the
+            // effect side. This prevents neutral temporal co-occurrence (records
+            // that happen to be close in time but carry no outcome signal) from
+            // passing the recovery gate on diverse corpora.
             pattern.temporal_support_count >= MIN_SUPPORT
                 && pattern.explicit_support_count == 0
                 && pattern.counterevidence == 0
                 && pattern.effect_record_signature_variants <= 1
                 && pattern.negative_effect_signals == 0
+                && pattern.positive_effect_signals >= 1
         }
     }
 }
@@ -1631,6 +1754,58 @@ mod tests {
     }
 
     // ── 15. Self-loops at belief level are skipped ──
+
+    // ── TemporalClusterRecovery narrowed guard ──────────────────────────────
+
+    #[test]
+    fn temporal_cluster_recovery_requires_positive_effect_signal() {
+        // Pattern with temporal support but zero positive signals must NOT pass.
+        let mut pattern = make_pattern_for_scoring(2, 0, 1);
+        pattern.temporal_support_count = 2;
+        pattern.positive_effect_signals = 0;
+        pattern.negative_effect_signals = 0;
+        assert!(
+            !meets_repeated_evidence_gate(&pattern, CausalEvidenceMode::TemporalClusterRecovery),
+            "recovery must not pass when positive_effect_signals == 0"
+        );
+    }
+
+    #[test]
+    fn temporal_cluster_recovery_passes_with_positive_signal() {
+        // Same pattern but with one positive signal must pass.
+        let mut pattern = make_pattern_for_scoring(2, 0, 1);
+        pattern.temporal_support_count = 2;
+        pattern.positive_effect_signals = 1;
+        pattern.negative_effect_signals = 0;
+        assert!(
+            meets_repeated_evidence_gate(&pattern, CausalEvidenceMode::TemporalClusterRecovery),
+            "recovery must pass when positive_effect_signals >= 1 and all other guards hold"
+        );
+    }
+
+    #[test]
+    fn temporal_cluster_recovery_blocked_by_negative_signal() {
+        // Positive signal present but negative too — negative gate blocks it.
+        let mut pattern = make_pattern_for_scoring(2, 0, 1);
+        pattern.temporal_support_count = 2;
+        pattern.positive_effect_signals = 2;
+        pattern.negative_effect_signals = 1;
+        assert!(
+            !meets_repeated_evidence_gate(&pattern, CausalEvidenceMode::TemporalClusterRecovery),
+            "recovery must not pass when negative_effect_signals > 0"
+        );
+    }
+
+    #[test]
+    fn strict_mode_unaffected_by_positive_signal_change() {
+        // StrictRepeatedWindows must not be affected by the new positive_signal guard.
+        let mut pattern = make_pattern_for_scoring(2, 2, 2);
+        pattern.positive_effect_signals = 0;
+        assert!(
+            meets_repeated_evidence_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows),
+            "strict mode must still pass on explicit_support >= MIN_SUPPORT regardless of positive signal"
+        );
+    }
 
     #[test]
     fn self_loop_edges_skipped() {

@@ -192,6 +192,26 @@ enum Polarity {
 
 // ── PolicyEngine ──
 
+/// Recall reranking mode for policy-hint-weighted influence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PolicyRerankMode {
+    /// No policy influence on recall ranking. Default.
+    #[default]
+    Off = 0,
+    /// Limited influence: apply bounded reranking (capped score delta + positional shift limit).
+    Limited = 1,
+}
+
+impl PolicyRerankMode {
+    /// Convert from u8 (for atomic storage). Invalid values → Off.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Limited,
+            _ => Self::Off,
+        }
+    }
+}
+
 /// Policy hint discovery engine. Full rebuild each maintenance cycle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyEngine {

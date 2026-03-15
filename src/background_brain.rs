@@ -281,6 +281,8 @@ pub struct ConceptPhaseReport {
 #[cfg_attr(feature = "python", pyclass(get_all))]
 #[derive(Debug, Clone, Default)]
 pub struct CausalPhaseReport {
+    /// True if the causal rebuild was skipped (corpus fingerprint unchanged).
+    pub skipped: bool,
     /// Number of raw record-level causal edges found.
     pub edges_found: usize,
     /// Number of explicit record-level causal edges found.

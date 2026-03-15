@@ -11,7 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::instrument;
 
 use crate::belief::{BeliefEngine, BeliefState};
+use crate::causal::{CausalEngine, CausalState};
+use crate::concept::{ConceptEngine, ConceptState};
 use crate::graph::SessionTracker;
+use crate::policy::{PolicyActionKind, PolicyEngine, PolicyState};
 use crate::index::InvertedIndex;
 use crate::levels::Level;
 use crate::ngram::NGramIndex;
@@ -1053,6 +1056,709 @@ pub fn compute_shadow_belief_scores(
         belief_coverage,
         avg_belief_multiplier: avg_multiplier,
         shadow_latency_us: latency,
+    }
+}
+
+// ── Concept Reranking (Phase 4 — Limited Influence, Concept-Weighted) ──
+//
+// Applied after belief reranking (if both enabled) and after trust-aware scoring.
+// Uses concept membership as a signal: records that belong to a strong/stable
+// concept cluster receive a small boost; those outside any concept are unaffected.
+// Guardrails mirror belief reranking: ±4% score cap, ±2 positional shift.
+
+/// Maximum concept rerank score effect: ±4% of original score.
+const CONCEPT_RERANK_CAP: f32 = 0.04;
+
+/// Maximum positional shift allowed: ±2 positions in the ranking.
+const CONCEPT_RERANK_MAX_POS_SHIFT: usize = 2;
+
+/// Minimum result count to apply limited concept reranking.
+const CONCEPT_RERANK_MIN_RESULTS: usize = 4;
+
+/// Maximum top_k for which concept reranking is applied.
+const CONCEPT_RERANK_MAX_TOP_K: usize = 20;
+
+/// Multiplier for records inside a Stable concept cluster.
+const CONCEPT_RERANK_STABLE: f32 = 1.04;
+
+/// Multiplier for records inside a strong Candidate concept (score ≥ 0.70).
+const CONCEPT_RERANK_CANDIDATE: f32 = 1.02;
+
+/// Report from limited concept reranking.
+#[derive(Debug, Clone)]
+pub struct LimitedConceptRerankReport {
+    /// Whether concept reranking was actually applied (false if scope guards blocked).
+    pub was_applied: bool,
+    /// Reason reranking was skipped (empty if applied).
+    pub skip_reason: String,
+    /// Number of records whose position changed.
+    pub records_moved: usize,
+    /// Maximum upward positional shift observed.
+    pub max_up_shift: usize,
+    /// Maximum downward positional shift observed.
+    pub max_down_shift: usize,
+    /// Average concept multiplier across all records.
+    pub avg_concept_multiplier: f32,
+    /// Fraction of records that belong to at least one concept.
+    pub concept_coverage: f32,
+    /// Top-k overlap: fraction of top-k records shared between baseline and reranked.
+    pub top_k_overlap: f32,
+    /// Latency in microseconds.
+    pub rerank_latency_us: u64,
+}
+
+impl LimitedConceptRerankReport {
+    fn skipped(reason: &str) -> Self {
+        Self {
+            was_applied: false,
+            skip_reason: reason.to_string(),
+            records_moved: 0,
+            max_up_shift: 0,
+            max_down_shift: 0,
+            avg_concept_multiplier: 1.0,
+            concept_coverage: 0.0,
+            top_k_overlap: 1.0,
+            rerank_latency_us: 0,
+        }
+    }
+}
+
+/// Build an index: record_id → (best_multiplier, concept_state_label).
+///
+/// For each record, we find the best concept it belongs to (Stable beats Candidate).
+fn build_concept_membership_index(
+    concept_engine: &ConceptEngine,
+) -> HashMap<String, f32> {
+    let mut index: HashMap<String, f32> = HashMap::new();
+
+    for concept in concept_engine.concepts.values() {
+        let multiplier = match concept.state {
+            ConceptState::Stable => CONCEPT_RERANK_STABLE,
+            ConceptState::Candidate if concept.abstraction_score >= 0.70 => {
+                CONCEPT_RERANK_CANDIDATE
+            }
+            _ => continue, // below threshold — skip
+        };
+        for rid in &concept.record_ids {
+            let entry = index.entry(rid.clone()).or_insert(1.0f32);
+            if multiplier > *entry {
+                *entry = multiplier;
+            }
+        }
+    }
+
+    index
+}
+
+/// Apply concept-aware reranking with guardrails.
+///
+/// Mirrors `apply_belief_rerank`:
+/// - Score delta capped at ±4% of original score
+/// - Positional shift capped at ±2 positions
+/// - Only applied when result count ≥ 4, top_k ≤ 20, concept_coverage > 0
+pub fn apply_concept_rerank(
+    matched: &mut Vec<(f32, Record)>,
+    concept_engine: &ConceptEngine,
+    top_k: usize,
+) -> LimitedConceptRerankReport {
+    let start = std::time::Instant::now();
+    let n = matched.len();
+
+    // ── Scope guards ──
+
+    if n < CONCEPT_RERANK_MIN_RESULTS {
+        return LimitedConceptRerankReport::skipped("too few results");
+    }
+
+    if top_k > CONCEPT_RERANK_MAX_TOP_K {
+        return LimitedConceptRerankReport::skipped("top_k exceeds limit");
+    }
+
+    // Build membership index once
+    let membership = build_concept_membership_index(concept_engine);
+
+    // Check concept coverage
+    let concept_count = matched
+        .iter()
+        .filter(|(_, r)| membership.contains_key(&r.id))
+        .count();
+
+    if concept_count == 0 {
+        return LimitedConceptRerankReport::skipped("no concept coverage");
+    }
+
+    let concept_coverage = concept_count as f32 / n as f32;
+
+    // ── Phase 1: Score adjustment (capped) ──
+
+    let baseline_ids: Vec<String> = matched.iter().map(|(_, r)| r.id.clone()).collect();
+
+    let mut multiplier_sum = 0.0f32;
+    for (score, rec) in matched.iter_mut() {
+        let multiplier = *membership.get(&rec.id).unwrap_or(&1.0f32);
+        multiplier_sum += multiplier;
+
+        let original = *score;
+        let adjusted = original * multiplier;
+        let max_delta = original * CONCEPT_RERANK_CAP;
+        *score = adjusted.clamp(original - max_delta, original + max_delta);
+    }
+
+    // ── Phase 2: Sort, then enforce positional shift cap ──
+
+    matched.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut needs_fixup = true;
+    let mut fixup_rounds = 0;
+    while needs_fixup && fixup_rounds < n {
+        needs_fixup = false;
+        fixup_rounds += 1;
+        for i in 0..matched.len() {
+            let id = &matched[i].1.id;
+            if let Some(orig_pos) = baseline_ids.iter().position(|x| x == id) {
+                let shift = if i > orig_pos {
+                    i - orig_pos
+                } else {
+                    orig_pos - i
+                };
+                if shift > CONCEPT_RERANK_MAX_POS_SHIFT {
+                    let target = if i > orig_pos {
+                        (i - 1).max(orig_pos)
+                    } else {
+                        (i + 1).min(orig_pos)
+                    };
+                    matched.swap(i, target);
+                    needs_fixup = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // ── Phase 3: Compute report ──
+
+    let final_ids: Vec<String> = matched.iter().map(|(_, r)| r.id.clone()).collect();
+    let mut records_moved = 0;
+    let mut max_up: usize = 0;
+    let mut max_down: usize = 0;
+
+    for (orig_pos, id) in baseline_ids.iter().enumerate() {
+        if let Some(new_pos) = final_ids.iter().position(|x| x == id) {
+            if new_pos != orig_pos {
+                records_moved += 1;
+                if new_pos < orig_pos {
+                    max_up = max_up.max(orig_pos - new_pos);
+                } else {
+                    max_down = max_down.max(new_pos - orig_pos);
+                }
+            }
+        }
+    }
+
+    let effective_k = n.min(top_k);
+    let baseline_top: HashSet<&str> = baseline_ids
+        .iter()
+        .take(effective_k)
+        .map(|s| s.as_str())
+        .collect();
+    let final_top: HashSet<&str> = final_ids
+        .iter()
+        .take(effective_k)
+        .map(|s| s.as_str())
+        .collect();
+    let overlap = if effective_k > 0 {
+        baseline_top.intersection(&final_top).count() as f32 / effective_k as f32
+    } else {
+        1.0
+    };
+
+    let latency = start.elapsed().as_micros() as u64;
+
+    LimitedConceptRerankReport {
+        was_applied: true,
+        skip_reason: String::new(),
+        records_moved,
+        max_up_shift: max_up,
+        max_down_shift: max_down,
+        avg_concept_multiplier: if n > 0 {
+            multiplier_sum / n as f32
+        } else {
+            1.0
+        },
+        concept_coverage,
+        top_k_overlap: overlap,
+        rerank_latency_us: latency,
+    }
+}
+
+// ── Causal Reranking (Phase 4c — Limited Influence, Causal-Pattern-Weighted) ──
+//
+// Applied after belief + concept reranking (if enabled), after trust-aware scoring.
+// Uses causal pattern membership as a signal:
+//   - Effect-side records in a Stable/strong-Candidate pattern → small boost (1.03)
+//   - Cause-side records → smaller boost (1.01)
+//   - No pattern membership → 1.0
+// Guardrails: ±3% score cap, ±2 positional shift, same scope guards as belief/concept.
+
+/// Maximum causal rerank score effect: ±3% of original score.
+const CAUSAL_RERANK_CAP: f32 = 0.03;
+
+/// Maximum positional shift allowed: ±2 positions in the ranking.
+const CAUSAL_RERANK_MAX_POS_SHIFT: usize = 2;
+
+/// Minimum result count to apply limited causal reranking.
+const CAUSAL_RERANK_MIN_RESULTS: usize = 4;
+
+/// Maximum top_k for which limited causal reranking is applied.
+const CAUSAL_RERANK_MAX_TOP_K: usize = 20;
+
+/// Multiplier for effect-side records in a Stable causal pattern.
+const CAUSAL_RERANK_EFFECT_STABLE: f32 = 1.03;
+
+/// Multiplier for effect-side records in a strong Candidate pattern (strength ≥ 0.65).
+const CAUSAL_RERANK_EFFECT_CANDIDATE: f32 = 1.015;
+
+/// Multiplier for cause-side records in a Stable causal pattern.
+const CAUSAL_RERANK_CAUSE_STABLE: f32 = 1.01;
+
+/// Report from limited causal reranking.
+#[derive(Debug, Clone)]
+pub struct LimitedCausalRerankReport {
+    /// Whether causal reranking was actually applied (false if scope guards blocked).
+    pub was_applied: bool,
+    /// Reason reranking was skipped (empty if applied).
+    pub skip_reason: String,
+    /// Number of records whose position changed.
+    pub records_moved: usize,
+    /// Maximum upward positional shift observed.
+    pub max_up_shift: usize,
+    /// Maximum downward positional shift observed.
+    pub max_down_shift: usize,
+    /// Average causal multiplier across all records.
+    pub avg_causal_multiplier: f32,
+    /// Fraction of records that appear in at least one causal pattern.
+    pub causal_coverage: f32,
+    /// Top-k overlap: fraction of top-k records shared between baseline and reranked.
+    pub top_k_overlap: f32,
+    /// Latency in microseconds.
+    pub rerank_latency_us: u64,
+}
+
+impl LimitedCausalRerankReport {
+    fn skipped(reason: &str) -> Self {
+        Self {
+            was_applied: false,
+            skip_reason: reason.to_string(),
+            records_moved: 0,
+            max_up_shift: 0,
+            max_down_shift: 0,
+            avg_causal_multiplier: 1.0,
+            causal_coverage: 0.0,
+            top_k_overlap: 1.0,
+            rerank_latency_us: 0,
+        }
+    }
+}
+
+/// Build an index: record_id → best causal multiplier.
+///
+/// Effect-side membership in a strong pattern outweighs cause-side.
+fn build_causal_membership_index(causal_engine: &CausalEngine) -> HashMap<String, f32> {
+    let mut index: HashMap<String, f32> = HashMap::new();
+
+    for pattern in causal_engine.patterns.values() {
+        // Determine pattern quality
+        let effect_multiplier = match pattern.state {
+            CausalState::Stable => CAUSAL_RERANK_EFFECT_STABLE,
+            CausalState::Candidate if pattern.causal_strength >= 0.65 => {
+                CAUSAL_RERANK_EFFECT_CANDIDATE
+            }
+            _ => continue, // weak pattern — skip
+        };
+        let cause_multiplier = match pattern.state {
+            CausalState::Stable => CAUSAL_RERANK_CAUSE_STABLE,
+            _ => continue,
+        };
+
+        // Effect-side records get the effect multiplier
+        for rid in &pattern.effect_record_ids {
+            let entry = index.entry(rid.clone()).or_insert(1.0f32);
+            if effect_multiplier > *entry {
+                *entry = effect_multiplier;
+            }
+        }
+
+        // Cause-side records get the cause multiplier (only if not already higher from effect)
+        for rid in &pattern.cause_record_ids {
+            let entry = index.entry(rid.clone()).or_insert(1.0f32);
+            if cause_multiplier > *entry {
+                *entry = cause_multiplier;
+            }
+        }
+    }
+
+    index
+}
+
+/// Apply causal-pattern-aware reranking with guardrails.
+///
+/// Mirrors `apply_belief_rerank` and `apply_concept_rerank`:
+/// - Score delta capped at ±3% of original score
+/// - Positional shift capped at ±2 positions
+/// - Only applied when result count ≥ 4, top_k ≤ 20, causal_coverage > 0
+pub fn apply_causal_rerank(
+    matched: &mut Vec<(f32, Record)>,
+    causal_engine: &CausalEngine,
+    top_k: usize,
+) -> LimitedCausalRerankReport {
+    let start = std::time::Instant::now();
+    let n = matched.len();
+
+    // ── Scope guards ──
+
+    if n < CAUSAL_RERANK_MIN_RESULTS {
+        return LimitedCausalRerankReport::skipped("too few results");
+    }
+
+    if top_k > CAUSAL_RERANK_MAX_TOP_K {
+        return LimitedCausalRerankReport::skipped("top_k exceeds limit");
+    }
+
+    let membership = build_causal_membership_index(causal_engine);
+
+    let causal_count = matched
+        .iter()
+        .filter(|(_, r)| membership.contains_key(&r.id))
+        .count();
+
+    if causal_count == 0 {
+        return LimitedCausalRerankReport::skipped("no causal coverage");
+    }
+
+    let causal_coverage = causal_count as f32 / n as f32;
+
+    // ── Phase 1: Score adjustment (capped) ──
+
+    let baseline_ids: Vec<String> = matched.iter().map(|(_, r)| r.id.clone()).collect();
+
+    let mut multiplier_sum = 0.0f32;
+    for (score, rec) in matched.iter_mut() {
+        let multiplier = *membership.get(&rec.id).unwrap_or(&1.0f32);
+        multiplier_sum += multiplier;
+
+        let original = *score;
+        let adjusted = original * multiplier;
+        let max_delta = original * CAUSAL_RERANK_CAP;
+        *score = adjusted.clamp(original - max_delta, original + max_delta);
+    }
+
+    // ── Phase 2: Sort, then enforce positional shift cap ──
+
+    matched.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut needs_fixup = true;
+    let mut fixup_rounds = 0;
+    while needs_fixup && fixup_rounds < n {
+        needs_fixup = false;
+        fixup_rounds += 1;
+        for i in 0..matched.len() {
+            let id = &matched[i].1.id;
+            if let Some(orig_pos) = baseline_ids.iter().position(|x| x == id) {
+                let shift = if i > orig_pos {
+                    i - orig_pos
+                } else {
+                    orig_pos - i
+                };
+                if shift > CAUSAL_RERANK_MAX_POS_SHIFT {
+                    let target = if i > orig_pos {
+                        (i - 1).max(orig_pos)
+                    } else {
+                        (i + 1).min(orig_pos)
+                    };
+                    matched.swap(i, target);
+                    needs_fixup = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // ── Phase 3: Compute report ──
+
+    let final_ids: Vec<String> = matched.iter().map(|(_, r)| r.id.clone()).collect();
+    let mut records_moved = 0;
+    let mut max_up: usize = 0;
+    let mut max_down: usize = 0;
+
+    for (orig_pos, id) in baseline_ids.iter().enumerate() {
+        if let Some(new_pos) = final_ids.iter().position(|x| x == id) {
+            if new_pos != orig_pos {
+                records_moved += 1;
+                if new_pos < orig_pos {
+                    max_up = max_up.max(orig_pos - new_pos);
+                } else {
+                    max_down = max_down.max(new_pos - orig_pos);
+                }
+            }
+        }
+    }
+
+    let effective_k = n.min(top_k);
+    let baseline_top: HashSet<&str> = baseline_ids
+        .iter()
+        .take(effective_k)
+        .map(|s| s.as_str())
+        .collect();
+    let final_top: HashSet<&str> = final_ids
+        .iter()
+        .take(effective_k)
+        .map(|s| s.as_str())
+        .collect();
+    let overlap = if effective_k > 0 {
+        baseline_top.intersection(&final_top).count() as f32 / effective_k as f32
+    } else {
+        1.0
+    };
+
+    let latency = start.elapsed().as_micros() as u64;
+
+    LimitedCausalRerankReport {
+        was_applied: true,
+        skip_reason: String::new(),
+        records_moved,
+        max_up_shift: max_up,
+        max_down_shift: max_down,
+        avg_causal_multiplier: if n > 0 {
+            multiplier_sum / n as f32
+        } else {
+            1.0
+        },
+        causal_coverage,
+        top_k_overlap: overlap,
+        rerank_latency_us: latency,
+    }
+}
+
+// ── Policy Reranking (Phase 4d — Limited Influence, Policy-Hint-Weighted) ──
+//
+// Final shaping signal in the recall pipeline. Applied last (after belief,
+// concept, causal). Uses policy hint action_kind + state as signal:
+//   - Prefer/Recommend + Stable → small boost for supporting records (1.02)
+//   - Prefer/Recommend + strong Candidate (strength ≥ 0.70) → smaller boost (1.01)
+//   - Avoid + Stable → slight downrank (0.99)
+//   - VerifyFirst/Warn → neutral (1.0)
+// Guardrails: ±2% score cap, ±2 positional shift (tightest of all phases).
+
+/// Maximum policy rerank score effect: ±2% of original score.
+const POLICY_RERANK_CAP: f32 = 0.02;
+
+/// Maximum positional shift: ±2 positions.
+const POLICY_RERANK_MAX_POS_SHIFT: usize = 2;
+
+/// Minimum result count to apply policy reranking.
+const POLICY_RERANK_MIN_RESULTS: usize = 4;
+
+/// Maximum top_k for which policy reranking is applied.
+const POLICY_RERANK_MAX_TOP_K: usize = 20;
+
+/// Multiplier for records supporting a Stable Prefer/Recommend hint.
+const POLICY_RERANK_PREFER_STABLE: f32 = 1.02;
+
+/// Multiplier for records supporting a strong Candidate Prefer/Recommend hint.
+const POLICY_RERANK_PREFER_CANDIDATE: f32 = 1.01;
+
+/// Multiplier for records supporting a Stable Avoid hint (slight downrank).
+const POLICY_RERANK_AVOID_STABLE: f32 = 0.99;
+
+/// Report from limited policy reranking.
+#[derive(Debug, Clone)]
+pub struct LimitedPolicyRerankReport {
+    /// Whether policy reranking was actually applied.
+    pub was_applied: bool,
+    /// Reason reranking was skipped (empty if applied).
+    pub skip_reason: String,
+    /// Number of records whose position changed.
+    pub records_moved: usize,
+    /// Maximum upward positional shift observed.
+    pub max_up_shift: usize,
+    /// Maximum downward positional shift observed.
+    pub max_down_shift: usize,
+    /// Average policy multiplier across all records.
+    pub avg_policy_multiplier: f32,
+    /// Fraction of records covered by at least one policy hint.
+    pub policy_coverage: f32,
+    /// Top-k overlap: fraction of top-k records shared between baseline and reranked.
+    pub top_k_overlap: f32,
+    /// Latency in microseconds.
+    pub rerank_latency_us: u64,
+}
+
+impl LimitedPolicyRerankReport {
+    fn skipped(reason: &str) -> Self {
+        Self {
+            was_applied: false,
+            skip_reason: reason.to_string(),
+            records_moved: 0,
+            max_up_shift: 0,
+            max_down_shift: 0,
+            avg_policy_multiplier: 1.0,
+            policy_coverage: 0.0,
+            top_k_overlap: 1.0,
+            rerank_latency_us: 0,
+        }
+    }
+}
+
+/// Build an index: record_id → best policy multiplier.
+fn build_policy_membership_index(policy_engine: &PolicyEngine) -> HashMap<String, f32> {
+    let mut index: HashMap<String, f32> = HashMap::new();
+
+    for hint in policy_engine.hints.values() {
+        let multiplier = match (&hint.action_kind, &hint.state) {
+            (PolicyActionKind::Prefer | PolicyActionKind::Recommend, PolicyState::Stable) => {
+                POLICY_RERANK_PREFER_STABLE
+            }
+            (PolicyActionKind::Prefer | PolicyActionKind::Recommend, PolicyState::Candidate)
+                if hint.policy_strength >= 0.70 =>
+            {
+                POLICY_RERANK_PREFER_CANDIDATE
+            }
+            (PolicyActionKind::Avoid, PolicyState::Stable) => POLICY_RERANK_AVOID_STABLE,
+            _ => continue,
+        };
+
+        for rid in &hint.supporting_record_ids {
+            let entry = index.entry(rid.clone()).or_insert(1.0f32);
+            // For boosts, take the best (highest) multiplier.
+            // For downranks (< 1.0), take the most aggressive (lowest).
+            if multiplier >= 1.0 && multiplier > *entry {
+                *entry = multiplier;
+            } else if multiplier < 1.0 && multiplier < *entry {
+                *entry = multiplier;
+            }
+        }
+    }
+
+    index
+}
+
+/// Apply policy-hint-aware reranking with guardrails.
+///
+/// Phase 4d — the final shaping signal:
+/// - Score delta capped at ±2% of original score
+/// - Positional shift capped at ±2 positions
+/// - Only applied when result count ≥ 4, top_k ≤ 20, policy_coverage > 0
+pub fn apply_policy_rerank(
+    matched: &mut Vec<(f32, Record)>,
+    policy_engine: &PolicyEngine,
+    top_k: usize,
+) -> LimitedPolicyRerankReport {
+    let start = std::time::Instant::now();
+    let n = matched.len();
+
+    if n < POLICY_RERANK_MIN_RESULTS {
+        return LimitedPolicyRerankReport::skipped("too few results");
+    }
+    if top_k > POLICY_RERANK_MAX_TOP_K {
+        return LimitedPolicyRerankReport::skipped("top_k exceeds limit");
+    }
+
+    let membership = build_policy_membership_index(policy_engine);
+
+    let policy_count = matched
+        .iter()
+        .filter(|(_, r)| membership.contains_key(&r.id))
+        .count();
+
+    if policy_count == 0 {
+        return LimitedPolicyRerankReport::skipped("no policy coverage");
+    }
+
+    let policy_coverage = policy_count as f32 / n as f32;
+
+    // ── Phase 1: Score adjustment (capped) ──
+
+    let baseline_ids: Vec<String> = matched.iter().map(|(_, r)| r.id.clone()).collect();
+    let mut multiplier_sum = 0.0f32;
+
+    for (score, rec) in matched.iter_mut() {
+        let multiplier = *membership.get(&rec.id).unwrap_or(&1.0f32);
+        multiplier_sum += multiplier;
+
+        let original = *score;
+        let adjusted = original * multiplier;
+        let max_delta = original * POLICY_RERANK_CAP;
+        *score = adjusted.clamp(original - max_delta, original + max_delta);
+    }
+
+    // ── Phase 2: Sort + positional shift cap ──
+
+    matched.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut needs_fixup = true;
+    let mut fixup_rounds = 0;
+    while needs_fixup && fixup_rounds < n {
+        needs_fixup = false;
+        fixup_rounds += 1;
+        for i in 0..matched.len() {
+            let id = &matched[i].1.id;
+            if let Some(orig_pos) = baseline_ids.iter().position(|x| x == id) {
+                let shift = if i > orig_pos { i - orig_pos } else { orig_pos - i };
+                if shift > POLICY_RERANK_MAX_POS_SHIFT {
+                    let target = if i > orig_pos {
+                        (i - 1).max(orig_pos)
+                    } else {
+                        (i + 1).min(orig_pos)
+                    };
+                    matched.swap(i, target);
+                    needs_fixup = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // ── Phase 3: Report ──
+
+    let final_ids: Vec<String> = matched.iter().map(|(_, r)| r.id.clone()).collect();
+    let mut records_moved = 0;
+    let mut max_up: usize = 0;
+    let mut max_down: usize = 0;
+
+    for (orig_pos, id) in baseline_ids.iter().enumerate() {
+        if let Some(new_pos) = final_ids.iter().position(|x| x == id) {
+            if new_pos != orig_pos {
+                records_moved += 1;
+                if new_pos < orig_pos {
+                    max_up = max_up.max(orig_pos - new_pos);
+                } else {
+                    max_down = max_down.max(new_pos - orig_pos);
+                }
+            }
+        }
+    }
+
+    let effective_k = n.min(top_k);
+    let baseline_top: HashSet<&str> = baseline_ids.iter().take(effective_k).map(|s| s.as_str()).collect();
+    let final_top: HashSet<&str> = final_ids.iter().take(effective_k).map(|s| s.as_str()).collect();
+    let overlap = if effective_k > 0 {
+        baseline_top.intersection(&final_top).count() as f32 / effective_k as f32
+    } else {
+        1.0
+    };
+
+    let latency = start.elapsed().as_micros() as u64;
+
+    LimitedPolicyRerankReport {
+        was_applied: true,
+        skip_reason: String::new(),
+        records_moved,
+        max_up_shift: max_up,
+        max_down_shift: max_down,
+        avg_policy_multiplier: if n > 0 { multiplier_sum / n as f32 } else { 1.0 },
+        policy_coverage,
+        top_k_overlap: overlap,
+        rerank_latency_us: latency,
     }
 }
 

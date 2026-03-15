@@ -208,33 +208,14 @@ impl Record {
     ///
     /// Uses adaptive decay: rate interpolates from base toward 0.999
     /// as activation_count grows (ceiling effect for frequently used records).
-    /// Semantic type provides a retention modifier:
-    /// - decision/preference/contradiction: 1.1x (decay slower)
-    /// - trend: 0.95x (decay slightly faster — trends should prove themselves)
-    /// - fact/serendipity: 1.0x (default)
+    /// Retention is driven by Level (Identity=0.99 .. Working=0.80) and activation frequency.
+    /// semantic_type does not influence decay — Level already encodes information importance.
     pub fn apply_decay(&mut self) {
         let base_rate = self.level.decay_rate();
         let ceiling_factor = (self.activation_count as f32 / 10.0).min(1.0);
-        let adaptive_rate = base_rate + (0.999 - base_rate) * ceiling_factor;
-
-        // Semantic retention modifier
-        let semantic_modifier = self.semantic_decay_modifier();
-        let effective_rate = (adaptive_rate * semantic_modifier).min(0.999);
+        let effective_rate = (base_rate + (0.999 - base_rate) * ceiling_factor).min(0.999);
 
         self.strength *= effective_rate;
-    }
-
-    /// Semantic type retention modifier for decay.
-    ///
-    /// Values > 1.0 slow decay (retain longer), < 1.0 speed decay.
-    fn semantic_decay_modifier(&self) -> f32 {
-        match self.semantic_type.as_str() {
-            "decision" => 1.05,
-            "preference" => 1.08,
-            "contradiction" => 1.10,
-            "trend" => 0.97,
-            _ => 1.0, // fact, serendipity
-        }
     }
 
     /// Whether this record is still alive (not archived).

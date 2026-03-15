@@ -158,6 +158,7 @@ pub mod circuit_breaker;
 pub mod credibility;
 pub mod guards;
 pub mod identity;
+pub mod relation;
 pub mod research;
 pub mod trust;
 
@@ -230,6 +231,21 @@ fn _core(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<background_brain::LayerStability>()?;
     m.add_class::<concept::SurfacedConcept>()?;
     m.add_class::<policy::SurfacedPolicyHint>()?;
+    m.add_class::<relation::StructuralRelation>()?;
+    m.add_class::<relation::RelationEdge>()?;
+    m.add_class::<relation::RelationDigest>()?;
+    m.add_class::<relation::EntityDigest>()?;
+    m.add_class::<relation::EntityRelationEdge>()?;
+    m.add_class::<relation::EntityGraphNeighbor>()?;
+    m.add_class::<relation::EntityGraphDigest>()?;
+    m.add_class::<relation::FamilyRelationMember>()?;
+    m.add_class::<relation::FamilyGraphSnapshot>()?;
+    m.add_class::<relation::PersonDigest>()?;
+    m.add_class::<relation::ProjectGraphSnapshot>()?;
+    m.add_class::<relation::ProjectStatusSnapshot>()?;
+    m.add_class::<relation::ProjectTimelineEntry>()?;
+    m.add_class::<relation::ProjectTimelineSnapshot>()?;
+    m.add_class::<relation::ProjectDigest>()?;
 
     // Identity
     m.add_class::<identity::AgentPersona>()?;
