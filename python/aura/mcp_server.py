@@ -218,7 +218,7 @@ class AuraMcpServer:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {
                     "name": "aura",
-                    "version": "1.5.1",
+                    "version": "1.5.2",
                 },
                 "instructions": (
                     "Aura is a cognitive memory layer for AI agents. "
@@ -332,8 +332,7 @@ class AuraMcpServer:
 
     def _write_message(self, msg: dict):
         body = json.dumps(msg, separators=(",", ":")).encode("utf-8")
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode()
-        self._stdout.write(header + body)
+        self._stdout.write(body + b"\n")
         self._stdout.flush()
 
 
