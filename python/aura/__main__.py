@@ -260,6 +260,14 @@ def main():
                         help="Path to brain data directory (default: ./aura_brain)")
     p_mcp.add_argument("--password", help="Encryption password")
 
+    # serve
+    p_serve = subparsers.add_parser("serve", help="Run MCP HTTP+SSE server (Make.com, n8n, remote)")
+    p_serve.add_argument("path", nargs="?", default="./aura_brain",
+                          help="Path to brain data directory (default: ./aura_brain)")
+    p_serve.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
+    p_serve.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
+    p_serve.add_argument("--password", help="Encryption password")
+
     args = parser.parse_args()
 
     if args.command == "maintain":
@@ -270,6 +278,9 @@ def main():
         cmd_shell(args)
     elif args.command == "mcp":
         cmd_mcp(args)
+    elif args.command == "serve":
+        from aura.mcp_http import run_http
+        run_http(path=args.path, host=args.host, port=args.port, password=args.password)
     else:
         parser.print_help()
         sys.exit(1)
