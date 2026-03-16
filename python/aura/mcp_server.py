@@ -293,19 +293,36 @@ class AuraMcpServer:
         self.brain.close()
 
     def _read_message(self) -> bytes | None:
-        """Read a JSON-RPC message (Content-Length framing per MCP spec)."""
-        # Read headers
+        """Read a JSON-RPC message.
+
+        Supports both Content-Length framing (MCP spec) and bare JSON lines
+        (some clients skip headers). Robust on Windows pipes.
+        """
+        first = self._stdin.readline()
+        if not first:
+            return None
+        first = first.rstrip(b"\r\n")
+
+        # Bare JSON line (starts with '{')
+        if first.startswith(b"{"):
+            return first
+
+        # Content-Length header framing
         headers = {}
+        if b":" in first:
+            k, _, v = first.partition(b":")
+            headers[k.strip().lower()] = v.strip()
+
         while True:
             line = self._stdin.readline()
             if not line:
                 return None
             line = line.rstrip(b"\r\n")
             if line == b"":
-                break  # blank line ends headers
+                break
             if b":" in line:
-                key, _, value = line.partition(b":")
-                headers[key.strip().lower()] = value.strip()
+                k, _, v = line.partition(b":")
+                headers[k.strip().lower()] = v.strip()
 
         length = int(headers.get(b"content-length", 0))
         if length == 0:
