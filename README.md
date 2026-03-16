@@ -73,6 +73,25 @@ No API keys. No embeddings. No cloud. The model stays the same — your agent ge
 | **Encryption at rest** | **ChaCha20 + Argon2** | No | No | No | No |
 | **Language** | **Rust** | Python | Proprietary | Python | Python |
 
+### The Core Idea: Cheap Model + Aura > Expensive Model Alone
+
+Fine-tuning costs thousands of dollars and weeks of work. RAG requires embeddings and a vector database. Context windows are expensive per token.
+
+Aura gives you a third path: **a cognitive layer that accumulates experience between conversations** — free, local, sub-millisecond.
+
+```
+Week 1: GPT-4o-mini + Aura                Week 1: GPT-4 alone
+  → average answers                          → average answers
+
+Week 4: GPT-4o-mini + Aura                Week 4: GPT-4 alone
+  → knows your workflow                      → still forgets everything
+  → surfaces patterns you repeat             → same cost per token
+  → warns before risky actions               → no improvement
+  → $0 compute cost                          → still billing per call
+```
+
+The model stays the same. The agent gets smarter. That's Aura.
+
 ### Performance
 
 Benchmarked on 1,000 records (Windows 10 / Ryzen 7):
@@ -343,7 +362,21 @@ pip install aura-memory
 python -m aura mcp ~/aura_brain
 ```
 
-Once connected, Claude automatically has 8 tools: `recall` (call before answering), `store`, `store_code`, `store_decision`, `recall_structured`, `search`, `insights`, `consolidate`.
+Once connected, Claude automatically has 11 tools:
+
+| Tool | Purpose |
+|------|---------|
+| `recall` | Retrieve relevant memories before answering |
+| `recall_structured` | Get memories with scores and metadata |
+| `store` | Save a fact, note, or context |
+| `store_code` | Save a code snippet at Domain level |
+| `store_decision` | Save a decision with reasoning |
+| `search` | Filter memories by level or tags |
+| `insights` | Memory health stats |
+| `consolidate` | Merge similar records |
+| `get` | Fetch a specific record by ID |
+| `delete` | Remove a record by ID |
+| `maintain` | Run a full maintenance cycle |
 
 > After connecting, tell Claude: *"Before answering, always recall relevant context from memory. After our conversation, store key facts."*
 
