@@ -303,15 +303,15 @@ Identity persists. Tasks fade. Important patterns get promoted. Like a real brai
 
 ---
 
-## MCP Server (Claude Desktop)
+## MCP Server — Claude Desktop · Cursor · Zed · VS Code
 
-Give Claude persistent memory across conversations:
+Give any MCP-compatible AI persistent, self-organizing memory:
 
 ```bash
 pip install aura-memory
 ```
 
-Add to Claude Desktop config (Settings → Developer → Edit Config):
+**Claude Desktop** — Settings → Developer → Edit Config:
 
 ```json
 {
@@ -324,7 +324,28 @@ Add to Claude Desktop config (Settings → Developer → Edit Config):
 }
 ```
 
-Provides 8 tools: `recall`, `recall_structured`, `store`, `store_code`, `store_decision`, `search`, `insights` (with phase filtering), `consolidate`. Store and search support `semantic_type` filtering.
+**Cursor / VS Code** — `.cursor/mcp.json` or `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "aura": {
+      "command": "python",
+      "args": ["-m", "aura", "mcp", "./aura_brain"],
+      "type": "stdio"
+    }
+  }
+}
+```
+
+**macOS / Linux path:**
+```bash
+python -m aura mcp ~/aura_brain
+```
+
+Once connected, Claude automatically has 8 tools: `recall` (call before answering), `store`, `store_code`, `store_decision`, `recall_structured`, `search`, `insights`, `consolidate`.
+
+> After connecting, tell Claude: *"Before answering, always recall relevant context from memory. After our conversation, store key facts."*
 
 ---
 

@@ -1,0 +1,26 @@
+# Smithery configuration for Aura MCP Server
+# https://smithery.ai
+
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      brainPath:
+        type: string
+        description: Path to brain data directory
+        default: ./aura_brain
+      password:
+        type: string
+        description: Optional encryption password
+    required: []
+  commandFunction: |-
+    (config) => ({
+      command: "python",
+      args: [
+        "-m", "aura", "mcp",
+        config.brainPath || "./aura_brain",
+        ...(config.password ? ["--password", config.password] : [])
+      ],
+      env: {}
+    })

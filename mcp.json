@@ -1,0 +1,93 @@
+{
+  "name": "aura-memory",
+  "version": "1.5.0",
+  "description": "Cognitive memory layer for AI agents. Gives Claude persistent, self-organizing memory with hierarchical decay, belief formation, and causal reasoning. Zero LLM calls, sub-millisecond recall.",
+  "author": "Alexander Tepliuk",
+  "license": "MIT",
+  "homepage": "https://github.com/teolex2020/AuraSDK",
+  "repository": "https://github.com/teolex2020/AuraSDK",
+  "keywords": ["memory", "cognitive", "ai", "agents", "llm", "persistent-memory", "rag"],
+  "transport": ["stdio"],
+  "install": {
+    "pip": "pip install aura-memory"
+  },
+  "run": {
+    "command": "python",
+    "args": ["-m", "aura", "mcp", "{brainPath}"]
+  },
+  "tools": [
+    {
+      "name": "recall",
+      "description": "Retrieve relevant memories as context for a query. Call BEFORE answering to check existing knowledge."
+    },
+    {
+      "name": "recall_structured",
+      "description": "Retrieve memories as structured data with scores, levels, and metadata."
+    },
+    {
+      "name": "store",
+      "description": "Store a new memory. Levels: working (hours), decisions (days), domain (weeks), identity (months+)."
+    },
+    {
+      "name": "store_code",
+      "description": "Store a code snippet at DOMAIN level with language metadata."
+    },
+    {
+      "name": "store_decision",
+      "description": "Store a decision with reasoning and rejected alternatives at DECISIONS level."
+    },
+    {
+      "name": "search",
+      "description": "Search memory by filters (exact/tag-based). Use for browsing or counting."
+    },
+    {
+      "name": "insights",
+      "description": "Get memory health stats: decay risks, promotion candidates, conflicts, trends."
+    },
+    {
+      "name": "consolidate",
+      "description": "Merge similar memory records to reduce bloat."
+    }
+  ],
+  "config": {
+    "brainPath": {
+      "type": "string",
+      "description": "Path to brain data directory",
+      "default": "./aura_brain",
+      "required": false
+    },
+    "password": {
+      "type": "string",
+      "description": "Optional encryption password for encrypted brain",
+      "required": false,
+      "sensitive": true
+    }
+  },
+  "examples": [
+    {
+      "title": "Claude Desktop",
+      "description": "Add to claude_desktop_config.json",
+      "config": {
+        "mcpServers": {
+          "aura": {
+            "command": "python",
+            "args": ["-m", "aura", "mcp", "C:\\Users\\YOUR_NAME\\aura_brain"]
+          }
+        }
+      }
+    },
+    {
+      "title": "Cursor / VS Code",
+      "description": "Add to .cursor/mcp.json or .vscode/mcp.json",
+      "config": {
+        "servers": {
+          "aura": {
+            "command": "python",
+            "args": ["-m", "aura", "mcp", "./aura_brain"],
+            "type": "stdio"
+          }
+        }
+      }
+    }
+  ]
+}
