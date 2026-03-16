@@ -87,7 +87,7 @@ class AuraMcpServer:
         tags = params.get("tags")
         results = self.brain.search(query=query, level=level, tags=tags)
         items = [{"id": r.id, "content": r.content,
-                  "level": r.level, "tags": r.tags} for r in results]
+                  "level": str(r.level), "tags": r.tags} for r in results]
         return json.dumps(items)
 
     def tool_insights(self, params: dict) -> str:
