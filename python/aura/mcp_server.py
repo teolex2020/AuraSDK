@@ -218,7 +218,7 @@ class AuraMcpServer:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {
                     "name": "aura",
-                    "version": "1.5.0",
+                    "version": "1.5.1",
                 },
                 "instructions": (
                     "Aura is a cognitive memory layer for AI agents. "
