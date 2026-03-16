@@ -268,86 +268,57 @@ class AuraMcpServer:
 
     def run_stdio(self):
         """Main loop: read JSON-RPC from stdin, write responses to stdout."""
-        log = lambda msg: print(msg, file=sys.stderr, flush=True)
-        log("Aura MCP server started (stdio)")
+        self._stdin = sys.stdin.buffer
+        self._stdout = sys.stdout.buffer
+
+        print("Aura MCP server started (stdio)", file=sys.stderr, flush=True)
 
         while True:
             try:
-                line = self._read_message()
-                if line is None:
-                    log("EOF on stdin, shutting down")
+                msg_bytes = self._read_message()
+                if msg_bytes is None:
                     break
 
-                log(f"<< {line[:200]}")
-                msg = json.loads(line)
+                msg = json.loads(msg_bytes)
                 response = self.handle_request(msg)
                 if response is not None:
                     self._write_message(response)
-                    log(f">> id={response.get('id')}")
             except json.JSONDecodeError as e:
-                log(f"JSON parse error: {e}")
+                print(f"JSON parse error: {e}", file=sys.stderr, flush=True)
             except Exception as e:
-                log(f"Error: {e}")
+                print(f"Error: {e}", file=sys.stderr, flush=True)
                 import traceback
                 traceback.print_exc(file=sys.stderr)
 
         self.brain.close()
-        log("Aura MCP server stopped")
 
-    def _read_line(self) -> str | None:
-        """Read a single line from stdin, byte by byte to avoid buffering issues."""
-        buf = bytearray()
-        while True:
-            b = sys.stdin.buffer.read(1)
-            if not b:
-                return None if not buf else buf.decode("utf-8")
-            if b == b"\n":
-                return buf.decode("utf-8").rstrip("\r")
-            buf.extend(b)
-
-    def _read_message(self) -> str | None:
-        """Read a JSON-RPC message.
-
-        Supports both Content-Length header framing (spec) and bare JSON lines.
-        """
-        first_line = self._read_line()
-        if first_line is None:
-            return None
-
-        # If it starts with '{', it's a bare JSON message (no framing)
-        if first_line.startswith("{"):
-            return first_line
-
-        # Otherwise, parse as Content-Length header framing
+    def _read_message(self) -> bytes | None:
+        """Read a JSON-RPC message (Content-Length framing per MCP spec)."""
+        # Read headers
         headers = {}
-        if ":" in first_line:
-            key, value = first_line.split(":", 1)
-            headers[key.strip().lower()] = value.strip()
-
-        # Read remaining headers until empty line
         while True:
-            line = self._read_line()
-            if line is None:
+            line = self._stdin.readline()
+            if not line:
                 return None
-            if line == "":
-                break
-            if ":" in line:
-                key, value = line.split(":", 1)
+            line = line.rstrip(b"\r\n")
+            if line == b"":
+                break  # blank line ends headers
+            if b":" in line:
+                key, _, value = line.partition(b":")
                 headers[key.strip().lower()] = value.strip()
 
-        length = int(headers.get("content-length", 0))
+        length = int(headers.get(b"content-length", 0))
         if length == 0:
             return None
 
-        body = sys.stdin.buffer.read(length)
-        return body.decode("utf-8")
+        return self._stdin.read(length)
 
     def _write_message(self, msg: dict):
-        """Write a JSON-RPC message as a single JSON line."""
-        body = json.dumps(msg)
-        sys.stdout.buffer.write(body.encode("utf-8"))
-        sys.stdout.buffer.write(b"\n")
-        sys.stdout.buffer.flush()
+        body = json.dumps(msg, separators=(",", ":")).encode("utf-8")
+        header = f"Content-Length: {len(body)}\r\n\r\n".encode()
+        self._stdout.write(header + body)
+        self._stdout.flush()
+
 
 
 def run_mcp(path: str = "./aura_brain", password: str = None):
