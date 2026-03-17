@@ -244,14 +244,14 @@ impl Aura {
         let concept_engine = ConceptEngine::new();
 
         // Causal pattern discovery layer
-        // Same pattern as concepts: derived state, always start empty.
+        // Load persisted state so patterns accumulate across sessions.
         let causal_store = CausalStore::new(&path_buf);
-        let causal_engine = CausalEngine::new();
+        let causal_engine = causal_store.load().unwrap_or_else(|_| CausalEngine::new());
 
         // Policy hint layer
-        // Same pattern: derived state, always start empty.
+        // Load persisted state so hints accumulate across sessions.
         let policy_store = PolicyStore::new(&path_buf);
-        let policy_engine = PolicyEngine::new();
+        let policy_engine = policy_store.load().unwrap_or_else(|_| PolicyEngine::new());
 
         Ok(Self {
             sdr,
@@ -4616,6 +4616,12 @@ impl Aura {
         self.set_concept_surface_mode(ConceptSurfaceMode::Limited);
         self.set_causal_rerank_mode(CausalRerankMode::Limited);
         self.set_policy_rerank_mode(PolicyRerankMode::Limited);
+        // ExplicitTrusted: user-declared causal links are authoritative.
+        // This is the correct default for programmatic use — the strict mode
+        // was designed for long-running corpora where patterns emerge naturally
+        // over many maintenance cycles. ExplicitTrusted is better for all cases
+        // where users explicitly encode causality via link_records().
+        self.set_causal_evidence_mode(CausalEvidenceMode::ExplicitTrusted);
     }
 
     /// Disable all four cognitive recall reranking signals simultaneously.
@@ -7038,6 +7044,22 @@ impl Aura {
 
     /// Set causal pattern recall reranking mode (Python binding).
     /// mode: "off" | "limited"
+    /// Set causal evidence gating mode (Python binding).
+    /// mode: "strict" | "temporal_cluster_recovery" | "explicit_trusted"
+    ///
+    /// "explicit_trusted" — recommended when causality is user-declared via
+    /// link_records(). A single explicit link suffices for the repeated-evidence
+    /// gate; the effect-variants gate is bypassed for consistent-polarity outcomes.
+    #[pyo3(name = "set_causal_evidence_mode")]
+    fn py_set_causal_evidence_mode(&self, mode: &str) {
+        let m = match mode {
+            "explicit_trusted" => CausalEvidenceMode::ExplicitTrusted,
+            "temporal_cluster_recovery" => CausalEvidenceMode::TemporalClusterRecovery,
+            _ => CausalEvidenceMode::StrictRepeatedWindows,
+        };
+        self.set_causal_evidence_mode(m);
+    }
+
     #[pyo3(name = "set_causal_rerank_mode")]
     fn py_set_causal_rerank_mode(&self, mode: &str) {
         use crate::causal::CausalRerankMode;

@@ -258,12 +258,28 @@ impl PolicyEngine {
             .patterns
             .values()
             .filter(|p| {
+                // In ExplicitTrusted mode any Candidate or Stable pattern with explicit
+                // support is a valid seed — bypass the strength floor since the user
+                // already asserted the causal link.
                 let strength_ok = p.state == CausalState::Stable
                     || (p.state == CausalState::Candidate
-                        && p.causal_strength >= MIN_CAUSAL_STRENGTH_FOR_SEED);
-                let support_ok = p.support_count >= MIN_CAUSAL_SUPPORT_FOR_SEED;
+                        && p.causal_strength >= MIN_CAUSAL_STRENGTH_FOR_SEED)
+                    || (causal_engine.evidence_mode == CausalEvidenceMode::ExplicitTrusted
+                        && p.explicit_support_count >= 1
+                        && p.state != CausalState::Rejected);
+                // In ExplicitTrusted mode a single explicit link bypasses the support count
+                // requirement — the user explicitly declared the causal relationship.
+                let support_ok = p.support_count >= MIN_CAUSAL_SUPPORT_FOR_SEED
+                    || (causal_engine.evidence_mode == CausalEvidenceMode::ExplicitTrusted
+                        && p.explicit_support_count >= 1);
                 let evidence_ok =
                     if meets_evidence_gate(p, CausalEvidenceMode::StrictRepeatedWindows) {
+                        true
+                    } else if causal_engine.evidence_mode == CausalEvidenceMode::ExplicitTrusted
+                        && meets_evidence_gate(p, CausalEvidenceMode::ExplicitTrusted)
+                    {
+                        // ExplicitTrusted: user-declared links already passed the causal
+                        // gate — accept them as seeds without demanding strict repeated windows.
                         true
                     } else {
                         // Comparison-only recovery path for purely temporal clustered evidence.
@@ -279,21 +295,24 @@ impl PolicyEngine {
                             && p.negative_effect_signals == 0
                     };
                 let counterevidence_ok = meets_counterevidence_gate(p);
-                let counterfactual_ok = meets_counterfactual_gate(p);
-                // Gate: at least one cause-side belief must be Resolved or Singleton.
-                // This prevents orphan causal patterns (no stable belief backing) from
-                // producing policy hints.
+                let counterfactual_ok = meets_counterfactual_gate(p, causal_engine.evidence_mode);
+                // Gate: at least one cause-side belief must be Resolved or Singleton,
+                // OR in ExplicitTrusted mode the user-declared explicit link substitutes
+                // for stable belief backing (useful when corpus is too small for beliefs).
                 let has_stable_belief = p.cause_belief_ids.iter().any(|bid| {
                     belief_engine.beliefs.get(bid).is_some_and(|b| {
                         matches!(b.state, BeliefState::Resolved | BeliefState::Singleton)
                     })
                 });
+                let belief_gate_ok = has_stable_belief
+                    || (causal_engine.evidence_mode == CausalEvidenceMode::ExplicitTrusted
+                        && p.explicit_support_count >= 1);
                 strength_ok
                     && support_ok
                     && evidence_ok
                     && counterevidence_ok
                     && counterfactual_ok
-                    && has_stable_belief
+                    && belief_gate_ok
             })
             .collect();
 
@@ -535,8 +554,24 @@ impl PolicyEngine {
         // Scoring
         let causal_strength = pattern.causal_strength;
 
-        // Confidence: aggregate from beliefs
-        let confidence = self.aggregate_belief_confidence(&belief_ids, belief_engine);
+        // Confidence: aggregate from beliefs; fall back to record-level confidence when the
+        // pattern has no belief backing (orphan records in ExplicitTrusted mode).
+        let belief_confidence = self.aggregate_belief_confidence(&belief_ids, belief_engine);
+        let confidence = if belief_confidence > 0.0 {
+            belief_confidence
+        } else {
+            // Fallback: average confidence of backing records (trust encoded in record.confidence)
+            let vals: Vec<f32> = record_ids
+                .iter()
+                .filter_map(|rid| records.get(rid))
+                .map(|r| r.confidence)
+                .collect();
+            if vals.is_empty() {
+                0.50 // neutral default
+            } else {
+                vals.iter().sum::<f32>() / vals.len() as f32
+            }
+        };
 
         // Utility: based on pattern support and outcome consistency
         let utility_score = (pattern.outcome_stability * pattern.temporal_consistency).min(1.0);

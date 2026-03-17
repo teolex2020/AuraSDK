@@ -100,6 +100,36 @@ class AuraMcpServer:
             "checked": result.get("checked", 0),
         })
 
+    def tool_delete(self, params: dict) -> str:
+        record_id = params.get("id", "")
+        deleted = self.brain.delete(record_id)
+        return json.dumps({"deleted": deleted, "id": record_id})
+
+    def tool_get(self, params: dict) -> str:
+        record_id = params.get("id", "")
+        rec = self.brain.get(record_id)
+        if not rec:
+            return json.dumps({"found": False})
+        return json.dumps({
+            "found": True,
+            "id": rec.id,
+            "content": rec.content,
+            "level": str(rec.level),
+            "tags": rec.tags,
+            "strength": rec.strength,
+            "source_type": rec.source_type,
+        })
+
+    def tool_maintain(self, params: dict) -> str:
+        report = self.brain.run_maintenance()
+        return json.dumps({
+            "total_records": report.total_records,
+            "decayed": report.decay.decayed,
+            "promoted": report.reflect.promoted,
+            "archived": report.records_archived,
+            "merged": report.consolidation.native_merged,
+        })
+
     # ── Tool definitions for MCP ──
 
     TOOLS = [
@@ -190,6 +220,33 @@ class AuraMcpServer:
             "description": "Merge similar memory records (85%+ similarity) to reduce bloat.",
             "inputSchema": {"type": "object", "properties": {}},
         },
+        {
+            "name": "delete",
+            "description": "Delete a memory record by ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Record ID to delete."},
+                },
+                "required": ["id"],
+            },
+        },
+        {
+            "name": "get",
+            "description": "Retrieve a specific memory record by ID with full metadata.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Record ID to retrieve."},
+                },
+                "required": ["id"],
+            },
+        },
+        {
+            "name": "maintain",
+            "description": "Run a full maintenance cycle: decay, promote, consolidate, archive. Returns a summary report.",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
     ]
 
     TOOL_MAP = {
@@ -201,6 +258,9 @@ class AuraMcpServer:
         "search": "tool_search",
         "insights": "tool_insights",
         "consolidate": "tool_consolidate",
+        "delete": "tool_delete",
+        "get": "tool_get",
+        "maintain": "tool_maintain",
     }
 
     # ── JSON-RPC / MCP Protocol ──

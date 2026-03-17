@@ -119,6 +119,34 @@ def _handle_tool(name: str, args: dict) -> str:
         result = brain.consolidate()
         return json.dumps({"merged": result.get("merged", 0), "checked": result.get("checked", 0)})
 
+    if name == "delete":
+        deleted = brain.delete(args.get("id", ""))
+        return json.dumps({"deleted": deleted, "id": args.get("id", "")})
+
+    if name == "get":
+        rec = brain.get(args.get("id", ""))
+        if not rec:
+            return json.dumps({"found": False})
+        return json.dumps({
+            "found": True,
+            "id": rec.id,
+            "content": rec.content,
+            "level": str(rec.level),
+            "tags": rec.tags,
+            "strength": rec.strength,
+            "source_type": rec.source_type,
+        })
+
+    if name == "maintain":
+        report = brain.run_maintenance()
+        return json.dumps({
+            "total_records": report.total_records,
+            "decayed": report.decay.decayed,
+            "promoted": report.reflect.promoted,
+            "archived": report.records_archived,
+            "merged": report.consolidation.native_merged,
+        })
+
     raise ValueError(f"Unknown tool: {name}")
 
 
@@ -131,6 +159,9 @@ TOOLS = [
     {"name": "search", "description": "Search memory by filters.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "level": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}}}},
     {"name": "insights", "description": "Get memory health stats.", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "consolidate", "description": "Merge similar memory records.", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "delete", "description": "Delete a memory record by ID.", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
+    {"name": "get", "description": "Get a memory record by ID with full metadata.", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
+    {"name": "maintain", "description": "Run a full maintenance cycle (decay, promote, consolidate, archive).", "inputSchema": {"type": "object", "properties": {}}},
 ]
 
 

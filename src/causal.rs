@@ -130,6 +130,14 @@ pub enum CausalEvidenceMode {
     /// Experimental behavior: allow tightly consistent temporal clusters to
     /// qualify even when all temporal evidence lands inside one 24h bucket.
     TemporalClusterRecovery,
+    /// Trusted explicit mode: user-declared causal links (via link_records) are
+    /// treated as authoritative evidence. A single explicit link suffices for
+    /// the repeated-evidence gate, and the effect-variants gate is bypassed when
+    /// all declared effects share the same polarity (all negative or all
+    /// positive). Counterfactual ratio and support count gates still apply.
+    /// Recommended when the corpus is built programmatically or from structured
+    /// event logs where the user explicitly encodes causality.
+    ExplicitTrusted,
 }
 
 /// Recall reranking mode for causal-pattern-weighted influence.
@@ -447,9 +455,9 @@ impl CausalEngine {
 
         for mut pattern in raw_patterns {
             self.score_pattern(&mut pattern, records);
-            let support_gate_ok = meets_support_gate(&pattern);
+            let support_gate_ok = meets_support_gate(&pattern, self.evidence_mode);
             let repeated_gate_ok = meets_repeated_evidence_gate(&pattern, self.evidence_mode);
-            let counterfactual_gate_ok = meets_counterfactual_gate(&pattern);
+            let counterfactual_gate_ok = meets_counterfactual_gate(&pattern, self.evidence_mode);
             if support_gate_ok {
                 patterns_meeting_support_gate += 1;
             }
@@ -920,7 +928,21 @@ impl CausalEngine {
             .filter(|gap| *gap > 0.0)
             .count();
         let total_pairs = (pattern.cause_record_ids.len() * pattern.effect_record_ids.len()).max(1);
-        pattern.temporal_consistency = positive_gaps as f32 / total_pairs as f32;
+        let raw_temporal = positive_gaps as f32 / total_pairs as f32;
+        // Explicit causal links (user-declared via link_records) are trusted as
+        // directional regardless of timestamp precision. When explicit support
+        // meets MIN_SUPPORT, floor temporal_consistency at 0.60 so that
+        // same-session records (near-zero time gap) still score meaningfully.
+        // In ExplicitTrusted mode a single user-declared explicit link is sufficient
+        // to trust directionality, so floor at 0.60 even with explicit_support_count=1.
+        let explicit_trusted_floor = self.evidence_mode == CausalEvidenceMode::ExplicitTrusted
+            && pattern.explicit_support_count >= 1;
+        let strict_floor = pattern.explicit_support_count >= MIN_SUPPORT;
+        pattern.temporal_consistency = if (explicit_trusted_floor || strict_floor) && raw_temporal < 0.60 {
+            0.60_f32.max(raw_temporal)
+        } else {
+            raw_temporal
+        };
 
         // ── Outcome stability ──
         // 1 - coefficient_of_variation(effect_strengths)
@@ -963,8 +985,12 @@ impl CausalEngine {
         let support_score = ((n as f32 + 1.0).log2() / 21.0f32.log2()).min(1.0);
 
         // ── Composite causal strength ──
-        // Apply MIN_SUPPORT gate
-        if n < MIN_SUPPORT {
+        // Apply MIN_SUPPORT gate. In ExplicitTrusted mode a single user-declared
+        // explicit link bypasses the support count requirement.
+        let support_ok = n >= MIN_SUPPORT
+            || (self.evidence_mode == CausalEvidenceMode::ExplicitTrusted
+                && pattern.explicit_support_count >= 1);
+        if !support_ok {
             pattern.causal_strength = pattern.transition_lift * 0.3; // penalized
             return;
         }
@@ -980,7 +1006,12 @@ fn temporal_window_bucket(ts: f64) -> i64 {
     (ts / EVIDENCE_WINDOW_SECS).floor() as i64
 }
 
-pub(crate) fn meets_support_gate(pattern: &CausalPattern) -> bool {
+pub(crate) fn meets_support_gate(pattern: &CausalPattern, mode: CausalEvidenceMode) -> bool {
+    if mode == CausalEvidenceMode::ExplicitTrusted && pattern.explicit_support_count >= 1 {
+        // In ExplicitTrusted mode a single user-declared explicit link is sufficient
+        // to pass the support gate. The user explicitly encoded causality — we trust it.
+        return true;
+    }
     pattern.support_count >= MIN_SUPPORT
 }
 
@@ -1007,11 +1038,17 @@ pub(crate) fn meets_repeated_evidence_gate(
                 && pattern.negative_effect_signals == 0
                 && pattern.positive_effect_signals >= 1
         }
+        CausalEvidenceMode::ExplicitTrusted => {
+            // A single user-declared explicit link is sufficient evidence.
+            // The user explicitly encoded causality — we trust it.
+            // Still requires support_count >= MIN_SUPPORT (from meets_evidence_gate).
+            pattern.explicit_support_count >= 1
+        }
     }
 }
 
 pub(crate) fn meets_evidence_gate(pattern: &CausalPattern, mode: CausalEvidenceMode) -> bool {
-    meets_support_gate(pattern) && meets_repeated_evidence_gate(pattern, mode)
+    meets_support_gate(pattern, mode) && meets_repeated_evidence_gate(pattern, mode)
 }
 
 pub(crate) fn counterevidence_ratio(pattern: &CausalPattern) -> f32 {
@@ -1063,9 +1100,32 @@ pub(crate) fn meets_effect_polarity_consistency_gate(pattern: &CausalPattern) ->
         && pattern.negative_effect_signals >= 2)
 }
 
-pub(crate) fn meets_counterfactual_gate(pattern: &CausalPattern) -> bool {
-    counterfactual_ratio(pattern) <= MAX_COUNTERFACTUAL_RATIO
-        && meets_explicit_dominance_gate(pattern)
+pub(crate) fn meets_counterfactual_gate(
+    pattern: &CausalPattern,
+    mode: CausalEvidenceMode,
+) -> bool {
+    // Counterfactual ratio is always enforced — user-declared links cannot
+    // override a genuine contradiction signal.
+    if counterfactual_ratio(pattern) > MAX_COUNTERFACTUAL_RATIO {
+        return false;
+    }
+
+    if mode == CausalEvidenceMode::ExplicitTrusted && pattern.explicit_support_count >= 1 {
+        // In ExplicitTrusted mode the effect-variants gate is bypassed when all
+        // declared effects carry consistent polarity (all negative or all positive).
+        // Rationale: if the user linked multiple cause records to multiple effect
+        // records and every effect is "bad" (or every effect is "good"), the
+        // divergence in effect text is not contradictory — it is just multiple
+        // expressions of the same outcome type. We still block mixed polarity.
+        let mixed_polarity = pattern.positive_effect_signals >= 1
+            && pattern.negative_effect_signals >= 1;
+        if mixed_polarity {
+            return false; // genuinely ambiguous — do not bypass
+        }
+        return true; // consistent polarity → trust the explicit links
+    }
+
+    meets_explicit_dominance_gate(pattern)
         && meets_effect_signature_consistency_gate(pattern)
         && meets_effect_polarity_consistency_gate(pattern)
 }
@@ -1512,7 +1572,7 @@ mod tests {
             CausalState::Rejected
         };
 
-        assert!(!meets_support_gate(&pattern));
+        assert!(!meets_support_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows));
         assert_eq!(pattern.state, CausalState::Rejected);
     }
 
@@ -1585,7 +1645,7 @@ mod tests {
             "pattern should be strong enough on score alone before counterfactual gating"
         );
         assert!(counterfactual_ratio(&pattern) > 0.5);
-        assert!(!meets_counterfactual_gate(&pattern));
+        assert!(!meets_counterfactual_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows));
     }
 
     #[test]
@@ -1597,7 +1657,7 @@ mod tests {
 
         engine.score_pattern(&mut pattern, &records);
         assert!(counterfactual_ratio(&pattern) <= 0.5);
-        assert!(meets_counterfactual_gate(&pattern));
+        assert!(meets_counterfactual_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows));
     }
 
     #[test]
@@ -1613,7 +1673,7 @@ mod tests {
         engine.score_pattern(&mut pattern, &records);
         assert!(counterfactual_ratio(&pattern) <= 0.5);
         assert!(explicit_dominance_ratio(&pattern) < 0.70);
-        assert!(!meets_counterfactual_gate(&pattern));
+        assert!(!meets_counterfactual_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows));
     }
 
     #[test]
@@ -1649,14 +1709,14 @@ mod tests {
         pattern.explicit_effect_variants_for_cause = 1;
 
         engine.score_pattern(&mut pattern, &records);
-        assert!(meets_support_gate(&pattern));
+        assert!(meets_support_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows));
         assert!(meets_repeated_evidence_gate(
             &pattern,
             CausalEvidenceMode::StrictRepeatedWindows
         ));
         assert_eq!(pattern.effect_record_signature_variants, 3);
         assert!(!meets_effect_signature_consistency_gate(&pattern));
-        assert!(!meets_counterfactual_gate(&pattern));
+        assert!(!meets_counterfactual_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows));
     }
 
     #[test]
@@ -1696,7 +1756,7 @@ mod tests {
         assert!(pattern.positive_effect_signals >= 2);
         assert!(pattern.negative_effect_signals >= 2);
         assert!(!meets_effect_polarity_consistency_gate(&pattern));
-        assert!(!meets_counterfactual_gate(&pattern));
+        assert!(!meets_counterfactual_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows));
     }
 
     // ── 12. Serialization roundtrip ──

@@ -47,6 +47,18 @@
     {
       "name": "consolidate",
       "description": "Merge similar memory records to reduce bloat."
+    },
+    {
+      "name": "delete",
+      "description": "Delete a memory record by ID."
+    },
+    {
+      "name": "get",
+      "description": "Get a specific memory record by ID with full metadata (level, tags, strength)."
+    },
+    {
+      "name": "maintain",
+      "description": "Run a full maintenance cycle: decay, promote, consolidate, archive. Returns a summary report."
     }
   ],
   "config": {
