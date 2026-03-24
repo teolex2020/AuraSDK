@@ -102,6 +102,8 @@ pub enum CausalState {
     Stable,
     /// Below threshold — discarded at end of cycle.
     Rejected,
+    /// Manually invalidated tombstone retained for audit and explainability.
+    Invalidated,
 }
 
 impl Default for CausalState {
@@ -217,6 +219,12 @@ pub struct CausalPattern {
     pub causal_strength: f32,
     /// Current lifecycle state.
     pub state: CausalState,
+    /// Optional manual invalidation reason preserved across rebuilds.
+    #[serde(default)]
+    pub invalidation_reason: Option<String>,
+    /// Timestamp of manual invalidation, if any.
+    #[serde(default)]
+    pub invalidated_at: Option<f64>,
     /// Timestamp of last rebuild.
     pub last_updated: f64,
 }
@@ -321,7 +329,9 @@ pub struct CausalEngine {
 }
 
 impl CausalEngine {
-    /// Create a fresh empty engine. Called on startup — never loaded from disk.
+    /// Create a fresh empty engine.
+    ///
+    /// Used when no persisted causal state exists or when loading fails.
     pub fn new() -> Self {
         Self {
             patterns: HashMap::new(),
@@ -333,6 +343,27 @@ impl CausalEngine {
             last_explicit_edges_found: 0,
             last_temporal_edges_found: 0,
         }
+    }
+
+    /// Remove a single causal pattern from the persisted engine state.
+    pub fn invalidate_pattern(&mut self, pattern_id: &str, reason: &str) -> bool {
+        let Some(pattern) = self.patterns.get_mut(pattern_id) else {
+            return false;
+        };
+        pattern.state = CausalState::Invalidated;
+        pattern.invalidation_reason = Some(reason.to_string());
+        pattern.invalidated_at = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64(),
+        );
+        true
+    }
+
+    /// Legacy compatibility: invalidation now preserves a tombstone instead of removing.
+    pub fn retract_pattern(&mut self, pattern_id: &str) -> bool {
+        self.invalidate_pattern(pattern_id, "manual_retraction")
     }
 
     /// Compute a deterministic fingerprint over the causal-relevant fields of
@@ -398,11 +429,23 @@ impl CausalEngine {
         let fingerprint = Self::corpus_fingerprint(records);
         if fingerprint != 0 && fingerprint == self.last_corpus_fingerprint {
             // Re-derive summary counters from cached patterns (no rebuild)
-            let stable_count = self.patterns.values().filter(|p| p.state == CausalState::Stable).count();
-            let rejected_count = self.patterns.values().filter(|p| p.state == CausalState::Rejected).count();
+            let stable_count = self
+                .patterns
+                .values()
+                .filter(|p| p.state == CausalState::Stable)
+                .count();
+            let rejected_count = self
+                .patterns
+                .values()
+                .filter(|p| p.state == CausalState::Rejected)
+                .count();
             let candidates_found = self.patterns.len();
             let avg_causal_strength = if candidates_found > 0 {
-                self.patterns.values().map(|p| p.causal_strength).sum::<f32>() / candidates_found as f32
+                self.patterns
+                    .values()
+                    .map(|p| p.causal_strength)
+                    .sum::<f32>()
+                    / candidates_found as f32
             } else {
                 0.0
             };
@@ -419,6 +462,14 @@ impl CausalEngine {
                 ..CausalReport::default()
             };
         }
+
+        // Preserve manual invalidations as tombstones across rebuilds.
+        let prior_invalidated: HashMap<String, CausalPattern> = self
+            .patterns
+            .values()
+            .filter(|pattern| pattern.state == CausalState::Invalidated)
+            .map(|pattern| (pattern.key.clone(), pattern.clone()))
+            .collect();
 
         // Full rebuild — clear previous state
         self.patterns.clear();
@@ -453,44 +504,64 @@ impl CausalEngine {
         let mut rejected_count = 0;
         let mut strength_sum = 0.0f32;
 
+        let mut invalidated_keys_seen = HashSet::new();
         for mut pattern in raw_patterns {
-            self.score_pattern(&mut pattern, records);
-            let support_gate_ok = meets_support_gate(&pattern, self.evidence_mode);
-            let repeated_gate_ok = meets_repeated_evidence_gate(&pattern, self.evidence_mode);
-            let counterfactual_gate_ok = meets_counterfactual_gate(&pattern, self.evidence_mode);
-            if support_gate_ok {
-                patterns_meeting_support_gate += 1;
-            }
-            if repeated_gate_ok {
-                patterns_meeting_repeated_window_gate += 1;
-            }
-            if counterfactual_gate_ok {
-                patterns_meeting_counterfactual_gate += 1;
-            }
-            pattern.state = if !meets_evidence_gate(&pattern, self.evidence_mode) {
-                patterns_blocked_by_evidence_gates += 1;
-                CausalState::Rejected
-            } else if !counterfactual_gate_ok {
-                patterns_blocked_by_counterfactual_gate += 1;
-                CausalState::Rejected
+            if let Some(previous) = prior_invalidated.get(&pattern.key) {
+                pattern.id = previous.id.clone();
+                pattern.state = CausalState::Invalidated;
+                pattern.invalidation_reason = previous.invalidation_reason.clone();
+                pattern.invalidated_at = previous.invalidated_at;
+                invalidated_keys_seen.insert(pattern.key.clone());
             } else {
-                if pattern.causal_strength >= STABLE_THRESHOLD {
-                    CausalState::Stable
-                } else if pattern.causal_strength >= CANDIDATE_THRESHOLD {
-                    CausalState::Candidate
-                } else {
-                    CausalState::Rejected
+                self.score_pattern(&mut pattern, records);
+                let support_gate_ok = meets_support_gate(&pattern, self.evidence_mode);
+                let repeated_gate_ok = meets_repeated_evidence_gate(&pattern, self.evidence_mode);
+                let counterfactual_gate_ok =
+                    meets_counterfactual_gate(&pattern, self.evidence_mode);
+                if support_gate_ok {
+                    patterns_meeting_support_gate += 1;
                 }
-            };
+                if repeated_gate_ok {
+                    patterns_meeting_repeated_window_gate += 1;
+                }
+                if counterfactual_gate_ok {
+                    patterns_meeting_counterfactual_gate += 1;
+                }
+                pattern.state = if !meets_evidence_gate(&pattern, self.evidence_mode) {
+                    patterns_blocked_by_evidence_gates += 1;
+                    CausalState::Rejected
+                } else if !counterfactual_gate_ok {
+                    patterns_blocked_by_counterfactual_gate += 1;
+                    CausalState::Rejected
+                } else {
+                    if pattern.causal_strength >= STABLE_THRESHOLD {
+                        CausalState::Stable
+                    } else if pattern.causal_strength >= CANDIDATE_THRESHOLD {
+                        CausalState::Candidate
+                    } else {
+                        CausalState::Rejected
+                    }
+                };
+            }
 
             match pattern.state {
                 CausalState::Stable => stable_count += 1,
                 CausalState::Candidate => {}
                 CausalState::Rejected => rejected_count += 1,
+                CausalState::Invalidated => {}
             }
 
             candidates_found += 1;
             strength_sum += pattern.causal_strength;
+            self.key_index
+                .insert(pattern.key.clone(), pattern.id.clone());
+            self.patterns.insert(pattern.id.clone(), pattern);
+        }
+
+        for (key, pattern) in prior_invalidated {
+            if invalidated_keys_seen.contains(&key) {
+                continue;
+            }
             self.key_index
                 .insert(pattern.key.clone(), pattern.id.clone());
             self.patterns.insert(pattern.id.clone(), pattern);
@@ -847,6 +918,8 @@ impl CausalEngine {
                 temporal_consistency: 0.0,
                 outcome_stability: 0.0,
                 causal_strength: 0.0,
+                invalidation_reason: None,
+                invalidated_at: None,
                 state: CausalState::Candidate,
                 last_updated: now,
             });
@@ -938,11 +1011,12 @@ impl CausalEngine {
         let explicit_trusted_floor = self.evidence_mode == CausalEvidenceMode::ExplicitTrusted
             && pattern.explicit_support_count >= 1;
         let strict_floor = pattern.explicit_support_count >= MIN_SUPPORT;
-        pattern.temporal_consistency = if (explicit_trusted_floor || strict_floor) && raw_temporal < 0.60 {
-            0.60_f32.max(raw_temporal)
-        } else {
-            raw_temporal
-        };
+        pattern.temporal_consistency =
+            if (explicit_trusted_floor || strict_floor) && raw_temporal < 0.60 {
+                0.60_f32.max(raw_temporal)
+            } else {
+                raw_temporal
+            };
 
         // ── Outcome stability ──
         // 1 - coefficient_of_variation(effect_strengths)
@@ -1100,10 +1174,7 @@ pub(crate) fn meets_effect_polarity_consistency_gate(pattern: &CausalPattern) ->
         && pattern.negative_effect_signals >= 2)
 }
 
-pub(crate) fn meets_counterfactual_gate(
-    pattern: &CausalPattern,
-    mode: CausalEvidenceMode,
-) -> bool {
+pub(crate) fn meets_counterfactual_gate(pattern: &CausalPattern, mode: CausalEvidenceMode) -> bool {
     // Counterfactual ratio is always enforced — user-declared links cannot
     // override a genuine contradiction signal.
     if counterfactual_ratio(pattern) > MAX_COUNTERFACTUAL_RATIO {
@@ -1117,8 +1188,8 @@ pub(crate) fn meets_counterfactual_gate(
         // records and every effect is "bad" (or every effect is "good"), the
         // divergence in effect text is not contradictory — it is just multiple
         // expressions of the same outcome type. We still block mixed polarity.
-        let mixed_polarity = pattern.positive_effect_signals >= 1
-            && pattern.negative_effect_signals >= 1;
+        let mixed_polarity =
+            pattern.positive_effect_signals >= 1 && pattern.negative_effect_signals >= 1;
         if mixed_polarity {
             return false; // genuinely ambiguous — do not bypass
         }
@@ -1208,10 +1279,12 @@ fn deterministic_id(key: &str) -> String {
     format!("ca-{:012x}", hash)
 }
 
-// ── CausalStore (persistence — write-only cache for inspection) ──
+// ── CausalStore (persistence for startup + inspection) ──
 
-/// Persistent store for causal patterns. Same pattern as ConceptStore:
-/// write-only cache for debugging/inspection. Never loaded on startup.
+/// Persistent store for causal patterns.
+///
+/// Unlike concepts, causal patterns are loaded on startup so the advisory layer
+/// survives restart and remains available before the next maintenance cycle.
 #[derive(Debug)]
 pub struct CausalStore {
     path: std::path::PathBuf,
@@ -1225,7 +1298,6 @@ impl CausalStore {
     }
 
     /// Save current engine state to causal.cog (best-effort).
-    /// This is a write-only inspection cache — NOT loaded on startup.
     pub fn save(&self, engine: &CausalEngine) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.path)?;
         let file_path = self.path.join("causal.cog");
@@ -1234,8 +1306,9 @@ impl CausalStore {
         Ok(())
     }
 
-    /// Load from disk. Inspection-only utility — NOT called on startup.
-    /// The Aura orchestrator always creates a fresh CausalEngine::new().
+    /// Load causal runtime state from disk for startup restore.
+    ///
+    /// If the file is absent, returns a fresh empty engine.
     pub fn load(&self) -> anyhow::Result<CausalEngine> {
         let file_path = self.path.join("causal.cog");
         if !file_path.exists() {
@@ -1297,6 +1370,8 @@ mod tests {
             temporal_consistency: 0.0,
             outcome_stability: 0.0,
             causal_strength: 0.0,
+            invalidation_reason: None,
+            invalidated_at: None,
             state: CausalState::Candidate,
             last_updated: 0.0,
         }
@@ -1572,7 +1647,10 @@ mod tests {
             CausalState::Rejected
         };
 
-        assert!(!meets_support_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows));
+        assert!(!meets_support_gate(
+            &pattern,
+            CausalEvidenceMode::StrictRepeatedWindows
+        ));
         assert_eq!(pattern.state, CausalState::Rejected);
     }
 
@@ -1612,6 +1690,56 @@ mod tests {
     }
 
     #[test]
+    fn invalidated_pattern_persists_across_rebuild() {
+        let mut engine = CausalEngine::new();
+        let belief_engine = BeliefEngine::default();
+        let sdr = empty_sdr_lookup();
+
+        let mut records = HashMap::new();
+        let cause = make_record("aaa", "gate enabled", "default", 1000.0);
+        let mut effect = make_record("bbb", "deploy health improved", "default", 1001.0);
+        effect.caused_by_id = Some("aaa".to_string());
+        records.insert("aaa".to_string(), cause);
+        records.insert("bbb".to_string(), effect);
+
+        let _ = engine.discover(&belief_engine, &records, &sdr);
+        let (pattern_id, pattern_key) = engine
+            .patterns
+            .values()
+            .next()
+            .map(|pattern| (pattern.id.clone(), pattern.key.clone()))
+            .expect("pattern should be discovered");
+
+        assert!(engine.invalidate_pattern(&pattern_id, "spurious_correlation"));
+        let invalidated_before = engine
+            .patterns
+            .get(&pattern_id)
+            .cloned()
+            .expect("invalidated pattern should exist");
+        assert_eq!(invalidated_before.state, CausalState::Invalidated);
+        assert_eq!(
+            invalidated_before.invalidation_reason.as_deref(),
+            Some("spurious_correlation")
+        );
+
+        engine.last_corpus_fingerprint = 0;
+        let _ = engine.discover(&belief_engine, &records, &sdr);
+
+        let invalidated_after = engine
+            .patterns
+            .get(&pattern_id)
+            .cloned()
+            .expect("invalidated tombstone should survive rebuild");
+        assert_eq!(invalidated_after.key, pattern_key);
+        assert_eq!(invalidated_after.state, CausalState::Invalidated);
+        assert_eq!(
+            invalidated_after.invalidation_reason.as_deref(),
+            Some("spurious_correlation")
+        );
+        assert!(invalidated_after.invalidated_at.is_some());
+    }
+
+    #[test]
     fn explicit_repeated_support_can_reach_candidate_without_temporal_spread() {
         let engine = CausalEngine::new();
         let records = default_scoring_records();
@@ -1645,7 +1773,10 @@ mod tests {
             "pattern should be strong enough on score alone before counterfactual gating"
         );
         assert!(counterfactual_ratio(&pattern) > 0.5);
-        assert!(!meets_counterfactual_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows));
+        assert!(!meets_counterfactual_gate(
+            &pattern,
+            CausalEvidenceMode::StrictRepeatedWindows
+        ));
     }
 
     #[test]
@@ -1657,7 +1788,10 @@ mod tests {
 
         engine.score_pattern(&mut pattern, &records);
         assert!(counterfactual_ratio(&pattern) <= 0.5);
-        assert!(meets_counterfactual_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows));
+        assert!(meets_counterfactual_gate(
+            &pattern,
+            CausalEvidenceMode::StrictRepeatedWindows
+        ));
     }
 
     #[test]
@@ -1673,7 +1807,10 @@ mod tests {
         engine.score_pattern(&mut pattern, &records);
         assert!(counterfactual_ratio(&pattern) <= 0.5);
         assert!(explicit_dominance_ratio(&pattern) < 0.70);
-        assert!(!meets_counterfactual_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows));
+        assert!(!meets_counterfactual_gate(
+            &pattern,
+            CausalEvidenceMode::StrictRepeatedWindows
+        ));
     }
 
     #[test]
@@ -1709,14 +1846,20 @@ mod tests {
         pattern.explicit_effect_variants_for_cause = 1;
 
         engine.score_pattern(&mut pattern, &records);
-        assert!(meets_support_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows));
+        assert!(meets_support_gate(
+            &pattern,
+            CausalEvidenceMode::StrictRepeatedWindows
+        ));
         assert!(meets_repeated_evidence_gate(
             &pattern,
             CausalEvidenceMode::StrictRepeatedWindows
         ));
         assert_eq!(pattern.effect_record_signature_variants, 3);
         assert!(!meets_effect_signature_consistency_gate(&pattern));
-        assert!(!meets_counterfactual_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows));
+        assert!(!meets_counterfactual_gate(
+            &pattern,
+            CausalEvidenceMode::StrictRepeatedWindows
+        ));
     }
 
     #[test]
@@ -1756,7 +1899,10 @@ mod tests {
         assert!(pattern.positive_effect_signals >= 2);
         assert!(pattern.negative_effect_signals >= 2);
         assert!(!meets_effect_polarity_consistency_gate(&pattern));
-        assert!(!meets_counterfactual_gate(&pattern, CausalEvidenceMode::StrictRepeatedWindows));
+        assert!(!meets_counterfactual_gate(
+            &pattern,
+            CausalEvidenceMode::StrictRepeatedWindows
+        ));
     }
 
     // ── 12. Serialization roundtrip ──

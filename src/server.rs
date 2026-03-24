@@ -116,11 +116,71 @@ pub fn start_server(port: u16, storage_path: &str) -> anyhow::Result<()> {
             .route("/health", get(handlers::health))
             .route("/process", post(handlers::process))
             .route("/retrieve", post(handlers::retrieve))
+            .route("/memory-health", get(handlers::memory_health))
+            .route("/belief-instability", get(handlers::belief_instability))
+            .route("/policy-lifecycle", get(handlers::policy_lifecycle))
             .route("/delete", post(handlers::delete_memory))
             .route("/update", post(handlers::update_memory))
             .route("/stats", get(handlers::stats))
             .route("/memories", get(handlers::list_memories))
             .route("/analytics", get(handlers::analytics))
+            .route("/explain-record", get(handlers::explain_record))
+            .route("/explain-recall", get(handlers::explain_recall))
+            .route(
+                "/explainability-bundle",
+                get(handlers::explainability_bundle),
+            )
+            .route("/correction-log", get(handlers::correction_log))
+            .route(
+                "/correction-review-queue",
+                get(handlers::correction_review_queue),
+            )
+            .route(
+                "/contradiction-review-queue",
+                get(handlers::contradiction_review_queue),
+            )
+            .route(
+                "/suggested-corrections",
+                get(handlers::suggested_corrections),
+            )
+            .route(
+                "/namespace-governance-status",
+                get(handlers::namespace_governance_status),
+            )
+            .route(
+                "/cross-namespace-digest",
+                get(handlers::cross_namespace_digest),
+            )
+            .route("/operator/memory-health", get(handlers::memory_health))
+            .route(
+                "/operator/belief-instability",
+                get(handlers::belief_instability),
+            )
+            .route(
+                "/operator/policy-lifecycle",
+                get(handlers::policy_lifecycle),
+            )
+            .route("/operator/correction-log", get(handlers::correction_log))
+            .route(
+                "/operator/correction-review-queue",
+                get(handlers::correction_review_queue),
+            )
+            .route(
+                "/operator/contradiction-review-queue",
+                get(handlers::contradiction_review_queue),
+            )
+            .route(
+                "/operator/suggested-corrections",
+                get(handlers::suggested_corrections),
+            )
+            .route(
+                "/operator/namespace-governance-status",
+                get(handlers::namespace_governance_status),
+            )
+            .route(
+                "/operator/cross-namespace-digest",
+                get(handlers::cross_namespace_digest),
+            )
             .route("/batch-delete", post(handlers::batch_delete))
             .route("/ingest-batch", post(handlers::ingest_batch))
             .route("/predict", post(handlers::predict))

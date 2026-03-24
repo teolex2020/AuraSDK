@@ -67,7 +67,18 @@ impl CognitiveStore {
 
         // 1. Load snapshot if exists
         let snap_end_pos = if self.snap_path.exists() {
-            self.load_snapshot(&mut records)?
+            match self.load_snapshot(&mut records) {
+                Ok(pos) => pos,
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to load cognitive snapshot from {:?}: {}. Falling back to log replay from start.",
+                        self.snap_path,
+                        err
+                    );
+                    records.clear();
+                    5 // Skip log magic(4) + version(1)
+                }
+            }
         } else {
             5 // Skip magic(4) + version(1)
         };
@@ -211,19 +222,25 @@ impl CognitiveStore {
             file.metadata()?.len()
         };
 
-        let mut writer = BufWriter::new(File::create(&self.snap_path)?);
-        writer.write_all(SNAP_MAGIC)?;
-        writer.write_u8(VERSION)?;
-        writer.write_u64::<LittleEndian>(log_pos)?;
-        writer.write_u32::<LittleEndian>(records.len() as u32)?;
+        let temp_path = self.snap_path.with_extension("snap.tmp");
+        {
+            let file = File::create(&temp_path)?;
+            let mut writer = BufWriter::new(file);
+            writer.write_all(SNAP_MAGIC)?;
+            writer.write_u8(VERSION)?;
+            writer.write_u64::<LittleEndian>(log_pos)?;
+            writer.write_u32::<LittleEndian>(records.len() as u32)?;
 
-        for rec in records.values() {
-            let payload = self.serialize_record(rec)?;
-            writer.write_u32::<LittleEndian>(payload.len() as u32)?;
-            writer.write_all(&payload)?;
+            for rec in records.values() {
+                let payload = self.serialize_record(rec)?;
+                writer.write_u32::<LittleEndian>(payload.len() as u32)?;
+                writer.write_all(&payload)?;
+            }
+
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
         }
-
-        writer.flush()?;
+        fs::rename(&temp_path, &self.snap_path)?;
         Ok(())
     }
 
@@ -252,6 +269,7 @@ impl CognitiveStore {
             }
 
             f.flush()?;
+            f.sync_all()?;
         }
 
         fs::rename(&temp_path, &self.log_path)?;
@@ -274,6 +292,7 @@ impl CognitiveStore {
         let mut writer = self.writer.lock();
         if let Some(w) = writer.as_mut() {
             w.flush()?;
+            w.get_ref().sync_all()?;
         }
         Ok(())
     }
@@ -356,6 +375,24 @@ mod tests {
 
         let records2 = store.load_all()?;
         assert_eq!(records2.len(), 10);
+        Ok(())
+    }
+
+    #[test]
+    fn test_corrupted_snapshot_falls_back_to_log_replay() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = CognitiveStore::new(dir.path())?;
+
+        let rec = Record::new("snapshot fallback".into(), Level::Working);
+        store.append_store(&rec)?;
+        let records = store.load_all()?;
+        store.write_snapshot(&records)?;
+
+        std::fs::write(dir.path().join("brain.snap"), b"bad-snapshot")?;
+
+        let recovered = store.load_all()?;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[&rec.id].content, "snapshot fallback");
         Ok(())
     }
 

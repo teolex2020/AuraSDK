@@ -28,7 +28,7 @@ impl GateRegistry {
     pub const CONCEPT_REPLAY_COUNT_DRIFT_MAX: usize = 1;
     pub const CONCEPT_REPLAY_CHURN_BASELINE_MAX: usize = 4;
     pub const CONCEPT_REPLAY_CHURN_ADAPTIVE_MAX: usize = 7;
-    pub const CONCEPT_REPLAY_DISTINCT_LATE_MAX: usize = 6;
+    pub const CONCEPT_REPLAY_DISTINCT_LATE_MAX: usize = 8;
     pub const CONCEPT_REPLAY_DOMINANT_LATE_MIN: usize = 2;
     pub const SURFACED_CONCEPT_REPLAY_COUNT_DRIFT_MAX: usize = 1;
     pub const SURFACED_CONCEPT_REPLAY_DISTINCT_LATE_MAX: usize = 4;

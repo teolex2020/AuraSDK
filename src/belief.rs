@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::causal::{CausalEngine, CausalState};
+use crate::policy::{PolicyActionKind, PolicyEngine, PolicyState};
 use crate::record::Record;
 use crate::sdr::SDRInterpreter;
 
@@ -52,6 +54,11 @@ const CLAIM_SIMILARITY_THRESHOLD: f32 = 0.15;
 /// Minimum Tanimoto overlap between tag SDR fingerprints in `SdrTagPool`.
 /// Slightly lower than content threshold because tag strings are much shorter.
 const TAG_FINGERPRINT_SIMILARITY_THRESHOLD: f32 = 0.08;
+const MAX_TOTAL_FEEDBACK_BOOST: f32 = 0.08;
+const MAX_TOTAL_FEEDBACK_DAMPING: f32 = 0.18;
+const MIN_FEEDBACK_CONFIDENCE: f32 = 0.05;
+const MAX_TOTAL_VOLATILITY_INCREASE: f32 = 0.20;
+const MAX_TOTAL_VOLATILITY_RELIEF: f32 = 0.06;
 
 /// Maximum records per hypothesis before pruning weakest.
 /// Reserved for large-scale belief groups.
@@ -287,6 +294,9 @@ pub struct Belief {
     pub conflict_mass: f32,
     /// Stability — how many cycles the winner has remained the same.
     pub stability: f32,
+    /// Epistemic instability caused by contradictory top-down pressure.
+    #[serde(default)]
+    pub volatility: f32,
     /// Unix timestamp of last update.
     pub last_updated: f64,
 }
@@ -305,6 +315,7 @@ impl Belief {
             support_mass: 0.0,
             conflict_mass: 0.0,
             stability: 0.0,
+            volatility: 0.0,
             last_updated: now_secs(),
         }
     }
@@ -1246,6 +1257,214 @@ impl BeliefEngine {
         self.beliefs.get(&hyp.belief_id)
     }
 
+    /// Soft-deprecate a belief without deleting its provenance.
+    ///
+    /// This is a targeted correction path for cases where a belief should no
+    /// longer dominate downstream reasoning, but should remain inspectable.
+    pub fn deprecate_belief(&mut self, belief_id: &str) -> bool {
+        let Some(belief) = self.beliefs.get_mut(belief_id) else {
+            return false;
+        };
+
+        let new_confidence = (belief.confidence * 0.5).clamp(MIN_FEEDBACK_CONFIDENCE, 1.0);
+        belief.score = if belief.confidence > 0.0 {
+            belief.score * (new_confidence / belief.confidence)
+        } else {
+            new_confidence
+        };
+        belief.confidence = new_confidence;
+        belief.state = BeliefState::Unresolved;
+        belief.winner_id = None;
+        belief.stability = 0.0;
+        belief.last_updated = now_secs();
+        true
+    }
+
+    /// Apply bounded top-down feedback from causal and policy layers.
+    ///
+    /// This adjusts belief-level confidence and score only. The next belief
+    /// rebuild still derives hypotheses deterministically from records.
+    pub fn apply_layer_feedback(
+        &mut self,
+        causal_engine: &CausalEngine,
+        policy_engine: &PolicyEngine,
+    ) -> BeliefFeedbackReport {
+        struct FeedbackSignal {
+            source_kind: String,
+            source_id: String,
+            reason: String,
+            confidence_delta: f32,
+            volatility_delta: f32,
+        }
+
+        let mut pending: HashMap<String, Vec<FeedbackSignal>> = HashMap::new();
+
+        for hint in policy_engine.hints.values() {
+            let state_weight = match hint.state {
+                PolicyState::Stable => 1.0,
+                PolicyState::Candidate => 0.6,
+                PolicyState::Suppressed | PolicyState::Rejected => continue,
+            };
+            let direction = match hint.action_kind {
+                PolicyActionKind::Avoid => -0.10,
+                PolicyActionKind::VerifyFirst => -0.06,
+                PolicyActionKind::Warn => -0.03,
+                PolicyActionKind::Prefer => 0.05,
+                PolicyActionKind::Recommend => 0.03,
+            };
+            let delta = direction * hint.policy_strength.max(0.0) * state_weight;
+            for belief_id in &hint.trigger_belief_ids {
+                pending
+                    .entry(belief_id.clone())
+                    .or_default()
+                    .push(FeedbackSignal {
+                        source_kind: "policy".to_string(),
+                        source_id: hint.id.clone(),
+                        reason: format!("{:?}:{:?}", hint.state, hint.action_kind).to_lowercase(),
+                        confidence_delta: delta,
+                        // Stability is managed exclusively by resolve() (counts consecutive
+                        // stable cycles). Layer feedback must not modify it — doing so creates
+                        // an oscillation that permanently caps stability, blocking concept seeding.
+                        volatility_delta: if delta < 0.0 {
+                            0.01 * hint.policy_strength.max(0.0)
+                        } else {
+                            -0.005 * hint.policy_strength.max(0.0)
+                        },
+                    });
+            }
+        }
+
+        for pattern in causal_engine.patterns.values() {
+            let (raw_delta, volatility_delta, reason) = match pattern.state {
+                CausalState::Stable => (
+                    0.03 * pattern.causal_strength.max(0.0),
+                    -0.02 * pattern.causal_strength.max(0.0),
+                    "stable_pattern".to_string(),
+                ),
+                CausalState::Candidate => (
+                    0.015 * pattern.causal_strength.max(0.0),
+                    -0.01 * pattern.causal_strength.max(0.0),
+                    "candidate_pattern".to_string(),
+                ),
+                CausalState::Rejected => {
+                    let denom = (pattern.support_count + pattern.counterevidence).max(1) as f32;
+                    let pressure = (pattern.counterevidence as f32 / denom).clamp(0.0, 1.0);
+                    (
+                        -(0.02 + 0.04 * pressure),
+                        0.03 + 0.12 * pressure,
+                        format!(
+                            "rejected_pattern:counterevidence={}",
+                            pattern.counterevidence
+                        ),
+                    )
+                }
+                CausalState::Invalidated => continue,
+            };
+
+            let mut belief_ids = pattern.cause_belief_ids.clone();
+            for belief_id in &pattern.effect_belief_ids {
+                if !belief_ids.contains(belief_id) {
+                    belief_ids.push(belief_id.clone());
+                }
+            }
+
+            for belief_id in belief_ids {
+                pending.entry(belief_id).or_default().push(FeedbackSignal {
+                    source_kind: "causal".to_string(),
+                    source_id: pattern.id.clone(),
+                    reason: reason.clone(),
+                    confidence_delta: raw_delta,
+                    volatility_delta,
+                });
+            }
+        }
+
+        let mut report = BeliefFeedbackReport::default();
+        for (belief_id, raw_entries) in pending {
+            let raw_delta: f32 = raw_entries.iter().map(|entry| entry.confidence_delta).sum();
+            let delta = raw_delta.clamp(-MAX_TOTAL_FEEDBACK_DAMPING, MAX_TOTAL_FEEDBACK_BOOST);
+            let raw_volatility_delta: f32 =
+                raw_entries.iter().map(|entry| entry.volatility_delta).sum();
+            let volatility_delta = raw_volatility_delta
+                .clamp(-MAX_TOTAL_VOLATILITY_RELIEF, MAX_TOTAL_VOLATILITY_INCREASE);
+            let Some(belief) = self.beliefs.get_mut(&belief_id) else {
+                continue;
+            };
+
+            let old_confidence = belief.confidence;
+            let new_confidence = (old_confidence + delta).clamp(MIN_FEEDBACK_CONFIDENCE, 1.0);
+            let applied_delta = new_confidence - old_confidence;
+            let old_volatility = belief.volatility;
+            let new_volatility = (old_volatility + volatility_delta).clamp(0.0, 1.0);
+            let applied_volatility_delta = new_volatility - old_volatility;
+            // Stability is NOT modified by layer feedback — it is a cycle-count
+            // metric owned exclusively by resolve().
+            let old_stability = belief.stability;
+            let new_stability = old_stability;
+
+            if applied_delta.abs() < f32::EPSILON
+                && applied_volatility_delta.abs() < f32::EPSILON
+            {
+                continue;
+            }
+
+            belief.confidence = new_confidence;
+            belief.score = if old_confidence > 0.0 {
+                belief.score * (new_confidence / old_confidence)
+            } else {
+                new_confidence
+            };
+            belief.volatility = new_volatility;
+            belief.stability = new_stability;
+            // Do NOT change belief.state or winner_id here — those are owned
+            // by resolve() which recomputes them from records each cycle.
+            // Changing state here would cause prev_winner to be None on the
+            // next resolve() call, permanently resetting stability to 1.0 and
+            // blocking concept seeding.
+            belief.last_updated = now_secs();
+
+            report.beliefs_touched += 1;
+            report.net_confidence_delta += applied_delta;
+            report.net_volatility_delta += applied_volatility_delta;
+            if applied_delta > 0.0 {
+                report.beliefs_boosted += 1;
+            } else {
+                report.beliefs_dampened += 1;
+            }
+
+            for entry in raw_entries {
+                let proportional_applied = if raw_delta.abs() > f32::EPSILON {
+                    applied_delta * (entry.confidence_delta / raw_delta)
+                } else {
+                    0.0
+                };
+                let proportional_volatility_applied = if raw_volatility_delta.abs() > f32::EPSILON {
+                    applied_volatility_delta * (entry.volatility_delta / raw_volatility_delta)
+                } else {
+                    0.0
+                };
+                report.entries.push(BeliefFeedbackEntry {
+                    belief_id: belief_id.clone(),
+                    source_kind: entry.source_kind,
+                    source_id: entry.source_id,
+                    reason: entry.reason,
+                    delta_requested: entry.confidence_delta,
+                    delta_applied: proportional_applied,
+                    confidence_before: old_confidence,
+                    confidence_after: new_confidence,
+                    volatility_before: old_volatility,
+                    volatility_after: new_volatility,
+                    volatility_delta_applied: proportional_volatility_applied,
+                    stability_before: old_stability,
+                    stability_after: new_stability,
+                    stability_delta_applied: 0.0,
+                });
+            }
+        }
+
+        report
+    }
+
     /// Get all unresolved beliefs.
     pub fn unresolved_beliefs(&self) -> Vec<&Belief> {
         self.beliefs
@@ -1309,6 +1528,35 @@ pub struct BeliefReport {
     /// Churn rate = revisions / max(total_beliefs, 1).
     /// A churn rate > 0.10 on stable data indicates belief layer instability.
     pub churn_rate: f32,
+}
+
+/// Report from a bounded top-down feedback pass.
+#[derive(Debug, Clone, Default)]
+pub struct BeliefFeedbackReport {
+    pub beliefs_touched: usize,
+    pub beliefs_boosted: usize,
+    pub beliefs_dampened: usize,
+    pub net_confidence_delta: f32,
+    pub net_volatility_delta: f32,
+    pub entries: Vec<BeliefFeedbackEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BeliefFeedbackEntry {
+    pub belief_id: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub reason: String,
+    pub delta_requested: f32,
+    pub delta_applied: f32,
+    pub confidence_before: f32,
+    pub confidence_after: f32,
+    pub volatility_before: f32,
+    pub volatility_after: f32,
+    pub volatility_delta_applied: f32,
+    pub stability_before: f32,
+    pub stability_after: f32,
+    pub stability_delta_applied: f32,
 }
 
 /// Summary statistics for the belief engine.
@@ -2206,5 +2454,181 @@ mod tests {
             (sim_disjoint).abs() < 0.001,
             "disjoint vectors should have similarity 0.0"
         );
+    }
+
+    #[test]
+    fn test_layer_feedback_dampens_belief_from_negative_policy_hint() {
+        use crate::policy::{PolicyActionKind, PolicyHint, PolicyState};
+
+        let mut engine = BeliefEngine::new();
+        let mut belief = Belief::new("default:deploy:safety".into());
+        belief.id = "belief-1".into();
+        belief.state = BeliefState::Resolved;
+        belief.confidence = 0.82;
+        belief.score = 0.82;
+        engine
+            .key_index
+            .insert(belief.key.clone(), belief.id.clone());
+        engine.beliefs.insert(belief.id.clone(), belief);
+
+        let mut policy_engine = PolicyEngine::new();
+        policy_engine.hints.insert(
+            "hint-1".into(),
+            PolicyHint {
+                id: "hint-1".into(),
+                key: "default:avoid:deploy".into(),
+                namespace: "default".into(),
+                domain: "deploy".into(),
+                action_kind: PolicyActionKind::Avoid,
+                recommendation: "Avoid unsafe deploy path".into(),
+                trigger_causal_ids: vec!["causal-1".into()],
+                trigger_concept_ids: Vec::new(),
+                trigger_belief_ids: vec!["belief-1".into()],
+                supporting_record_ids: vec!["r1".into()],
+                cause_record_ids: vec!["r1".into()],
+                confidence: 0.8,
+                utility_score: 0.6,
+                risk_score: 0.7,
+                policy_strength: 0.9,
+                state: PolicyState::Stable,
+                last_updated: 0.0,
+            },
+        );
+
+        let feedback = engine.apply_layer_feedback(&CausalEngine::new(), &policy_engine);
+        let updated = engine.beliefs.get("belief-1").unwrap();
+
+        assert_eq!(feedback.beliefs_touched, 1);
+        assert_eq!(feedback.beliefs_dampened, 1);
+        assert_eq!(feedback.entries.len(), 1);
+        assert_eq!(feedback.entries[0].belief_id, "belief-1");
+        assert_eq!(feedback.entries[0].source_kind, "policy");
+        assert_eq!(feedback.entries[0].source_id, "hint-1");
+        assert!(updated.confidence < 0.82);
+        assert!(updated.confidence >= 0.64);
+    }
+
+    #[test]
+    fn test_layer_feedback_boost_is_bounded_for_repeated_stable_causals() {
+        use crate::causal::{CausalPattern, CausalState};
+
+        let mut engine = BeliefEngine::new();
+        let mut belief = Belief::new("default:ops:decision".into());
+        belief.id = "belief-a".into();
+        belief.state = BeliefState::Resolved;
+        belief.confidence = 0.70;
+        belief.score = 0.70;
+        engine
+            .key_index
+            .insert(belief.key.clone(), belief.id.clone());
+        engine.beliefs.insert(belief.id.clone(), belief);
+
+        let mut causal_engine = CausalEngine::new();
+        for idx in 0..8 {
+            causal_engine.patterns.insert(
+                format!("causal-{idx}"),
+                CausalPattern {
+                    id: format!("causal-{idx}"),
+                    key: format!("default:belief-a->effect-{idx}"),
+                    namespace: "default".into(),
+                    cause_belief_ids: vec!["belief-a".into()],
+                    effect_belief_ids: vec![format!("effect-{idx}")],
+                    cause_record_ids: vec!["c1".into()],
+                    effect_record_ids: vec![format!("e{idx}")],
+                    support_count: 3,
+                    explicit_support_count: 1,
+                    temporal_support_count: 2,
+                    unique_temporal_windows: 2,
+                    effect_record_signature_variants: 1,
+                    positive_effect_signals: 2,
+                    negative_effect_signals: 0,
+                    counterevidence: 0,
+                    explicit_support_total_for_cause: 1,
+                    explicit_effect_variants_for_cause: 1,
+                    transition_lift: 0.8,
+                    temporal_consistency: 0.9,
+                    outcome_stability: 0.85,
+                    causal_strength: 0.95,
+                    invalidation_reason: None,
+                    invalidated_at: None,
+                    state: CausalState::Stable,
+                    last_updated: 0.0,
+                },
+            );
+        }
+
+        let feedback = engine.apply_layer_feedback(&causal_engine, &PolicyEngine::new());
+        let updated = engine.beliefs.get("belief-a").unwrap();
+
+        assert_eq!(feedback.beliefs_touched, 1);
+        assert_eq!(feedback.beliefs_boosted, 1);
+        assert!((updated.confidence - 0.78).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_rejected_causal_feedback_increases_volatility_and_reduces_stability() {
+        use crate::causal::{CausalPattern, CausalState};
+
+        let mut engine = BeliefEngine::new();
+        let mut belief = Belief::new("default:ops:risk".into());
+        belief.id = "belief-risk".into();
+        belief.state = BeliefState::Resolved;
+        belief.confidence = 0.74;
+        belief.score = 0.74;
+        belief.stability = 4.0;
+        belief.volatility = 0.02;
+        engine
+            .key_index
+            .insert(belief.key.clone(), belief.id.clone());
+        engine.beliefs.insert(belief.id.clone(), belief);
+
+        let mut causal_engine = CausalEngine::new();
+        causal_engine.patterns.insert(
+            "causal-risk".into(),
+            CausalPattern {
+                id: "causal-risk".into(),
+                key: "default:ops:risk-pattern".into(),
+                namespace: "default".into(),
+                cause_belief_ids: vec!["belief-risk".into()],
+                effect_belief_ids: Vec::new(),
+                cause_record_ids: vec!["r1".into()],
+                effect_record_ids: vec!["r2".into()],
+                support_count: 2,
+                explicit_support_count: 1,
+                temporal_support_count: 1,
+                unique_temporal_windows: 1,
+                effect_record_signature_variants: 2,
+                positive_effect_signals: 0,
+                negative_effect_signals: 1,
+                counterevidence: 4,
+                explicit_support_total_for_cause: 1,
+                explicit_effect_variants_for_cause: 2,
+                transition_lift: 0.7,
+                temporal_consistency: 0.4,
+                outcome_stability: 0.3,
+                causal_strength: 0.41,
+                invalidation_reason: None,
+                invalidated_at: None,
+                state: CausalState::Rejected,
+                last_updated: 0.0,
+            },
+        );
+
+        let feedback = engine.apply_layer_feedback(&causal_engine, &PolicyEngine::new());
+        let updated = engine.beliefs.get("belief-risk").unwrap();
+
+        assert_eq!(feedback.beliefs_touched, 1);
+        assert_eq!(feedback.beliefs_dampened, 1);
+        assert!(feedback.net_volatility_delta > 0.0);
+        assert!(updated.confidence < 0.74);
+        assert!(updated.volatility > 0.02);
+        // Stability is NOT modified by layer feedback — it is managed exclusively by resolve().
+        assert_eq!(updated.stability, 4.0);
+        assert_eq!(feedback.entries.len(), 1);
+        assert_eq!(feedback.entries[0].source_kind, "causal");
+        assert!(feedback.entries[0].reason.contains("rejected_pattern"));
+        assert!(feedback.entries[0].volatility_after > feedback.entries[0].volatility_before);
+        // stability_after == stability_before because feedback no longer modifies stability.
+        assert_eq!(feedback.entries[0].stability_after, feedback.entries[0].stability_before);
     }
 }

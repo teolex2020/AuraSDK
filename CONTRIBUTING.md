@@ -32,6 +32,7 @@ pytest tests/ -v
 - If `maturin build` fails with "File overwrote existing tracked file", delete `.pyd` files from `python/aura/` first (leftover from `maturin develop`)
 - The `full` feature flag enables everything: `cargo test --features full`
 - For minimal builds: `cargo test --no-default-features --features encryption`
+- On Windows, if `cargo test` intermittently fails with `LNK1104` on `target\\debug\\deps\\aura-...exe`, run `powershell -ExecutionPolicy Bypass -File .\\scripts\\cleanup_windows_test_lock.ps1` and rerun the test
 
 ## How to Contribute
 

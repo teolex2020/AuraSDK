@@ -69,6 +69,11 @@ pub struct Record {
     /// Range: 0.0+ (higher = more actively trending). Default: 0.0.
     #[serde(default)]
     pub activation_velocity: f32,
+    /// Durable importance weighting independent from raw access frequency.
+    /// Used for bounded significance-aware ranking and preservation surfaces.
+    /// Range: 0.0–1.0. Default: 0.0.
+    #[serde(default)]
+    pub salience: f32,
 
     // ── Epistemic fields (Belief layer support) ──
     /// Epistemic confidence — how reliable this record is.
@@ -161,6 +166,7 @@ impl Record {
             source_type: DEFAULT_SOURCE_TYPE.to_string(),
             semantic_type: DEFAULT_SEMANTIC_TYPE.to_string(),
             activation_velocity: 0.0,
+            salience: 0.0,
             confidence: Self::default_confidence_for_source(DEFAULT_SOURCE_TYPE),
             support_mass: 0,
             conflict_mass: 0,
@@ -176,12 +182,17 @@ impl Record {
     /// Composite importance score (0.0–1.0+).
     ///
     /// Formula: strength(40%) + level(25%) + connections(20%) + activations(15%)
+    /// + bounded salience hint (10%).
     pub fn importance(&self) -> f32 {
         let level_score = self.level.value() as f32 / 4.0;
         let conn_score = (self.connections.len() as f32 / 50.0).min(1.0);
         let act_score = (self.activation_count as f32 / 20.0).min(1.0);
 
-        0.40 * self.strength + 0.25 * level_score + 0.20 * conn_score + 0.15 * act_score
+        0.40 * self.strength
+            + 0.25 * level_score
+            + 0.20 * conn_score
+            + 0.15 * act_score
+            + 0.10 * self.salience.clamp(0.0, 1.0)
     }
 
     /// Activate this record (boost strength, update timestamp, update velocity).
@@ -210,10 +221,13 @@ impl Record {
     /// as activation_count grows (ceiling effect for frequently used records).
     /// Retention is driven by Level (Identity=0.99 .. Working=0.80) and activation frequency.
     /// semantic_type does not influence decay — Level already encodes information importance.
+    /// Salience adds only a bounded retention bias.
     pub fn apply_decay(&mut self) {
         let base_rate = self.level.decay_rate();
         let ceiling_factor = (self.activation_count as f32 / 10.0).min(1.0);
-        let effective_rate = (base_rate + (0.999 - base_rate) * ceiling_factor).min(0.999);
+        let activation_rate = (base_rate + (0.999 - base_rate) * ceiling_factor).min(0.999);
+        let salience_bias = 0.03 * self.salience.clamp(0.0, 1.0);
+        let effective_rate = (activation_rate + salience_bias).min(0.999);
 
         self.strength *= effective_rate;
     }
@@ -508,6 +522,7 @@ mod tests {
         assert_eq!(rec.level, Level::Working);
         assert_eq!(rec.strength, 1.0);
         assert_eq!(rec.activation_count, 0);
+        assert!((rec.salience).abs() < 0.001);
         assert!(rec.is_alive());
         assert!(!rec.can_promote());
     }
@@ -539,6 +554,20 @@ mod tests {
     }
 
     #[test]
+    fn test_salience_reduces_decay_pressure() {
+        let mut baseline = Record::new("baseline".into(), Level::Working);
+        baseline.strength = 1.0;
+        baseline.apply_decay();
+
+        let mut salient = Record::new("salient".into(), Level::Working);
+        salient.strength = 1.0;
+        salient.salience = 1.0;
+        salient.apply_decay();
+
+        assert!(salient.strength > baseline.strength);
+    }
+
+    #[test]
     fn test_promotion() {
         let mut rec = Record::new("test".into(), Level::Working);
         rec.activation_count = 5;
@@ -551,8 +580,16 @@ mod tests {
     #[test]
     fn test_importance() {
         let rec = Record::new("test".into(), Level::Identity);
-        // strength=1.0 (0.4) + level=4/4 (0.25) + conn=0 (0) + act=0 (0) = 0.65
+        // strength=1.0 (0.4) + level=4/4 (0.25) + conn=0 (0) + act=0 (0) + salience=0 = 0.65
         assert!((rec.importance() - 0.65).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_salience_increases_importance() {
+        let mut rec = Record::new("test".into(), Level::Identity);
+        let baseline = rec.importance();
+        rec.salience = 0.8;
+        assert!(rec.importance() > baseline);
     }
 
     #[test]
@@ -646,11 +683,13 @@ mod tests {
         json_val.as_object_mut().unwrap().remove("support_mass");
         json_val.as_object_mut().unwrap().remove("conflict_mass");
         json_val.as_object_mut().unwrap().remove("volatility");
+        json_val.as_object_mut().unwrap().remove("salience");
         let restored: Record = serde_json::from_value(json_val).unwrap();
         assert!((restored.confidence - 0.90).abs() < 0.001);
         assert_eq!(restored.support_mass, 0);
         assert_eq!(restored.conflict_mass, 0);
         assert!((restored.volatility).abs() < 0.001);
+        assert!((restored.salience).abs() < 0.001);
     }
 
     #[test]

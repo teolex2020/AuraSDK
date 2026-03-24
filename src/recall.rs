@@ -14,10 +14,10 @@ use crate::belief::{BeliefEngine, BeliefState};
 use crate::causal::{CausalEngine, CausalState};
 use crate::concept::{ConceptEngine, ConceptState};
 use crate::graph::SessionTracker;
-use crate::policy::{PolicyActionKind, PolicyEngine, PolicyState};
 use crate::index::InvertedIndex;
 use crate::levels::Level;
 use crate::ngram::NGramIndex;
+use crate::policy::{PolicyActionKind, PolicyEngine, PolicyState};
 use crate::record::Record;
 use crate::record::DEFAULT_NAMESPACE;
 use crate::sdr::SDRInterpreter;
@@ -48,6 +48,34 @@ pub struct RecallResult {
     pub scored: Vec<(f32, Record)>,
     /// Timing breakdown in microseconds.
     pub timings: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SignalTrace {
+    pub raw_score: f32,
+    pub rank: usize,
+    pub rrf_share: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RecallScoreTrace {
+    pub record_id: String,
+    pub sdr: Option<SignalTrace>,
+    pub ngram: Option<SignalTrace>,
+    pub tags: Option<SignalTrace>,
+    pub embedding: Option<SignalTrace>,
+    pub rrf_score: f32,
+    pub graph_score: f32,
+    pub causal_score: f32,
+    pub pre_trust_score: f32,
+    pub trust_multiplier: f32,
+    pub pre_rerank_score: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RecallTraceResult {
+    pub scored: Vec<(f32, Record)>,
+    pub traces: HashMap<String, RecallScoreTrace>,
 }
 
 // ── Signal Collection ──
@@ -304,6 +332,83 @@ pub fn graph_walk(
     }
 }
 
+fn graph_walk_with_trace(
+    matched: &mut Vec<(f32, Record)>,
+    records: &HashMap<String, Record>,
+    min_strength: f32,
+    namespaces: &[&str],
+    traces: &mut HashMap<String, RecallScoreTrace>,
+) {
+    let mut matched_ids: HashSet<String> = matched.iter().map(|(_, r)| r.id.clone()).collect();
+    let mut expanded_count = 0;
+
+    let mut frontier: Vec<(f32, String)> = matched
+        .iter()
+        .map(|(score, rec)| (*score, rec.id.clone()))
+        .collect();
+
+    for _hop in 0..GRAPH_WALK_MAX_HOPS {
+        let mut next_frontier: Vec<(f32, String)> = Vec::new();
+
+        for (parent_score, parent_id) in &frontier {
+            if let Some(parent) = records.get(parent_id) {
+                for (conn_id, conn_weight) in &parent.connections {
+                    if matched_ids.contains(conn_id) {
+                        continue;
+                    }
+
+                    let score = parent_score * conn_weight * GRAPH_WALK_DAMPING;
+                    if score < GRAPH_WALK_MIN_SCORE {
+                        continue;
+                    }
+
+                    next_frontier.push((score, conn_id.clone()));
+                }
+            }
+        }
+
+        let mut deduped: HashMap<String, f32> = HashMap::new();
+        for (score, rid) in next_frontier {
+            let entry = deduped.entry(rid).or_insert(0.0);
+            if score > *entry {
+                *entry = score;
+            }
+        }
+
+        let mut new_frontier = Vec::new();
+        let mut sorted: Vec<_> = deduped.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (rid, score) in sorted {
+            if expanded_count >= GRAPH_WALK_MAX_EXPANDED {
+                break;
+            }
+            if let Some(rec) = records.get(&rid) {
+                if rec.strength >= min_strength && in_namespace(rec, namespaces) {
+                    matched.push((score, rec.clone()));
+                    matched_ids.insert(rid.clone());
+                    traces
+                        .entry(rid.clone())
+                        .or_insert_with(|| RecallScoreTrace {
+                            record_id: rid.clone(),
+                            ..RecallScoreTrace::default()
+                        });
+                    if let Some(trace) = traces.get_mut(&rid) {
+                        trace.graph_score = score;
+                    }
+                    new_frontier.push((score, rid));
+                    expanded_count += 1;
+                }
+            }
+        }
+
+        frontier = new_frontier;
+        if frontier.is_empty() {
+            break;
+        }
+    }
+}
+
 /// Follow caused_by_id chains to discover causal context.
 pub fn causal_walk(
     matched: &mut Vec<(f32, Record)>,
@@ -338,6 +443,55 @@ pub fn causal_walk(
             let causal_score = overlap * 0.8 * 0.9f32.powi(depth as i32);
             additions.push((causal_score, parent.clone()));
             matched_ids.insert(parent_id);
+
+            current = parent.clone();
+        }
+    }
+
+    matched.extend(additions);
+}
+
+fn causal_walk_with_trace(
+    matched: &mut Vec<(f32, Record)>,
+    records: &HashMap<String, Record>,
+    min_strength: f32,
+    namespaces: &[&str],
+    traces: &mut HashMap<String, RecallScoreTrace>,
+) {
+    let mut matched_ids: HashSet<String> = matched.iter().map(|(_, r)| r.id.clone()).collect();
+    let mut additions = Vec::new();
+
+    for (overlap, rec) in matched.iter() {
+        let mut current = rec.clone();
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(current.id.clone());
+
+        for depth in 0..CAUSAL_MAX_DEPTH {
+            let parent_id = match &current.caused_by_id {
+                Some(id) => id.clone(),
+                None => break,
+            };
+
+            if matched_ids.contains(&parent_id) || visited.contains(&parent_id) {
+                break;
+            }
+
+            let parent = match records.get(&parent_id) {
+                Some(p) if p.strength >= min_strength && in_namespace(p, namespaces) => p,
+                _ => break,
+            };
+
+            visited.insert(parent_id.clone());
+            let causal_score = overlap * 0.8 * 0.9f32.powi(depth as i32);
+            additions.push((causal_score, parent.clone()));
+            matched_ids.insert(parent_id.clone());
+            traces
+                .entry(parent_id.clone())
+                .or_insert_with(|| RecallScoreTrace {
+                    record_id: parent_id.clone(),
+                    ..RecallScoreTrace::default()
+                })
+                .causal_score = causal_score;
 
             current = parent.clone();
         }
@@ -635,6 +789,131 @@ pub fn recall_pipeline(
     apply_recency_scoring(&mut matched, top_k, trust_config);
 
     matched
+}
+
+pub fn recall_pipeline_with_trace(
+    query: &str,
+    top_k: usize,
+    min_strength: f32,
+    expand_connections: bool,
+    sdr: &SDRInterpreter,
+    inverted_index: &InvertedIndex,
+    storage: &AuraStorage,
+    ngram_index: &NGramIndex,
+    tag_index: &HashMap<String, HashSet<String>>,
+    aura_index: &HashMap<String, String>,
+    records: &HashMap<String, Record>,
+    embedding_ranked: Option<Vec<(String, f32)>>,
+    trust_config: Option<&TrustConfig>,
+    namespaces: Option<&[&str]>,
+) -> RecallTraceResult {
+    let default_ns = [DEFAULT_NAMESPACE];
+    let ns = namespaces.unwrap_or(&default_ns);
+
+    let sdr_ranked = collect_sdr(
+        sdr,
+        inverted_index,
+        storage,
+        aura_index,
+        records,
+        query,
+        top_k,
+        ns,
+    );
+    let ngram_ranked = collect_ngram(ngram_index, records, query, top_k, ns);
+    let tag_ranked = collect_tags(tag_index, records, query, top_k, ns);
+
+    let mut named_lists: Vec<(&str, Vec<(String, f32)>)> = Vec::new();
+    if !sdr_ranked.is_empty() {
+        named_lists.push(("sdr", sdr_ranked));
+    }
+    if !ngram_ranked.is_empty() {
+        named_lists.push(("ngram", ngram_ranked));
+    }
+    if !tag_ranked.is_empty() {
+        named_lists.push(("tags", tag_ranked));
+    }
+    if let Some(emb) = embedding_ranked {
+        if !emb.is_empty() {
+            named_lists.push(("embedding", emb));
+        }
+    }
+
+    if named_lists.is_empty() {
+        return RecallTraceResult::default();
+    }
+
+    let num_lists = named_lists.len();
+    let max_possible = num_lists as f32 / (RRF_K as f32 + 1.0);
+    let mut traces: HashMap<String, RecallScoreTrace> = HashMap::new();
+    for (name, list) in &named_lists {
+        for (rank, (rid, raw_score)) in list.iter().enumerate() {
+            let rrf_share = if max_possible > 0.0 {
+                (1.0 / (RRF_K as f32 + rank as f32 + 1.0)) / max_possible
+            } else {
+                0.0
+            };
+            let trace = traces
+                .entry(rid.clone())
+                .or_insert_with(|| RecallScoreTrace {
+                    record_id: rid.clone(),
+                    ..RecallScoreTrace::default()
+                });
+            trace.rrf_score += rrf_share;
+            let signal = SignalTrace {
+                raw_score: *raw_score,
+                rank,
+                rrf_share,
+            };
+            match *name {
+                "sdr" => trace.sdr = Some(signal),
+                "ngram" => trace.ngram = Some(signal),
+                "tags" => trace.tags = Some(signal),
+                "embedding" => trace.embedding = Some(signal),
+                _ => {}
+            }
+        }
+    }
+
+    let lists: Vec<Vec<(String, f32)>> = named_lists.into_iter().map(|(_, list)| list).collect();
+    let mut matched = rrf_fuse(records, &lists, min_strength, top_k, ns);
+
+    if expand_connections {
+        graph_walk_with_trace(&mut matched, records, min_strength, ns, &mut traces);
+        causal_walk_with_trace(&mut matched, records, min_strength, ns, &mut traces);
+    }
+
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let default_config = TrustConfig::default();
+    let config = trust_config.unwrap_or(&default_config);
+    for (score, rec) in matched.iter_mut() {
+        let effective_trust =
+            trust::compute_effective_trust(&rec.metadata, now_unix, config, &rec.source_type);
+        let multiplier = rec.strength * effective_trust;
+        let pre_trust_score = *score;
+        *score = *score * multiplier;
+
+        let trace = traces
+            .entry(rec.id.clone())
+            .or_insert_with(|| RecallScoreTrace {
+                record_id: rec.id.clone(),
+                ..RecallScoreTrace::default()
+            });
+        trace.pre_trust_score = pre_trust_score;
+        trace.trust_multiplier = multiplier;
+        trace.pre_rerank_score = *score;
+    }
+
+    matched.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    matched.truncate(top_k);
+
+    RecallTraceResult {
+        scored: matched,
+        traces,
+    }
 }
 
 // ── Belief Reranking (Phase 4 — Limited Influence Activation) ──
@@ -1126,9 +1405,7 @@ impl LimitedConceptRerankReport {
 /// Build an index: record_id → (best_multiplier, concept_state_label).
 ///
 /// For each record, we find the best concept it belongs to (Stable beats Candidate).
-fn build_concept_membership_index(
-    concept_engine: &ConceptEngine,
-) -> HashMap<String, f32> {
+fn build_concept_membership_index(concept_engine: &ConceptEngine) -> HashMap<String, f32> {
     let mut index: HashMap<String, f32> = HashMap::new();
 
     for concept in concept_engine.concepts.values() {
@@ -1373,7 +1650,7 @@ fn build_causal_membership_index(causal_engine: &CausalEngine) -> HashMap<String
             CausalState::Candidate if pattern.causal_strength >= 0.65 => {
                 CAUSAL_RERANK_EFFECT_CANDIDATE
             }
-            _ => continue, // weak pattern — skip
+            _ => continue, // weak, rejected, or invalidated pattern — skip
         };
         let cause_multiplier = match pattern.state {
             CausalState::Stable => CAUSAL_RERANK_CAUSE_STABLE,
@@ -1703,7 +1980,11 @@ pub fn apply_policy_rerank(
         for i in 0..matched.len() {
             let id = &matched[i].1.id;
             if let Some(orig_pos) = baseline_ids.iter().position(|x| x == id) {
-                let shift = if i > orig_pos { i - orig_pos } else { orig_pos - i };
+                let shift = if i > orig_pos {
+                    i - orig_pos
+                } else {
+                    orig_pos - i
+                };
                 if shift > POLICY_RERANK_MAX_POS_SHIFT {
                     let target = if i > orig_pos {
                         (i - 1).max(orig_pos)
@@ -1739,8 +2020,16 @@ pub fn apply_policy_rerank(
     }
 
     let effective_k = n.min(top_k);
-    let baseline_top: HashSet<&str> = baseline_ids.iter().take(effective_k).map(|s| s.as_str()).collect();
-    let final_top: HashSet<&str> = final_ids.iter().take(effective_k).map(|s| s.as_str()).collect();
+    let baseline_top: HashSet<&str> = baseline_ids
+        .iter()
+        .take(effective_k)
+        .map(|s| s.as_str())
+        .collect();
+    let final_top: HashSet<&str> = final_ids
+        .iter()
+        .take(effective_k)
+        .map(|s| s.as_str())
+        .collect();
     let overlap = if effective_k > 0 {
         baseline_top.intersection(&final_top).count() as f32 / effective_k as f32
     } else {
@@ -1755,7 +2044,11 @@ pub fn apply_policy_rerank(
         records_moved,
         max_up_shift: max_up,
         max_down_shift: max_down,
-        avg_policy_multiplier: if n > 0 { multiplier_sum / n as f32 } else { 1.0 },
+        avg_policy_multiplier: if n > 0 {
+            multiplier_sum / n as f32
+        } else {
+            1.0
+        },
         policy_coverage,
         top_k_overlap: overlap,
         rerank_latency_us: latency,
@@ -1803,6 +2096,7 @@ mod tests {
     // ── Shadow Belief Scoring Tests ──
 
     use crate::belief::{Belief, Hypothesis};
+    use crate::concept::{ConceptCandidate, ConceptEngine};
 
     /// Helper: build a BeliefEngine with specific beliefs and record→hypothesis mappings.
     fn make_belief_engine_with_records(
@@ -1831,6 +2125,37 @@ mod tests {
             engine.hypotheses.insert(hid.clone(), hyp);
             engine.beliefs.insert(bid, belief);
             engine.record_index.insert(record_id.to_string(), hid);
+        }
+        engine
+    }
+
+    fn make_concept_engine_with_records(
+        entries: &[(&str, ConceptState, f32)], // (record_id, state, abstraction_score)
+    ) -> ConceptEngine {
+        let mut engine = ConceptEngine::new();
+        for (record_id, state, abstraction_score) in entries {
+            let concept = ConceptCandidate {
+                id: Record::generate_id(),
+                key: format!("concept_{}", record_id),
+                namespace: "default".to_string(),
+                semantic_type: "fact".to_string(),
+                belief_ids: vec![format!("belief_{}", record_id)],
+                record_ids: vec![record_id.to_string()],
+                core_terms: vec!["test".to_string()],
+                shell_terms: vec![],
+                tags: vec!["test".to_string()],
+                support_mass: 1.0,
+                confidence: 0.9,
+                stability: 3.0,
+                cohesion: 1.0,
+                abstraction_score: *abstraction_score,
+                state: state.clone(),
+                last_updated: 1.0,
+            };
+            engine
+                .key_index
+                .insert(concept.key.clone(), concept.id.clone());
+            engine.concepts.insert(concept.id.clone(), concept);
         }
         engine
     }
@@ -2254,6 +2579,57 @@ mod tests {
         assert!(report.avg_belief_multiplier > 0.99);
         assert!(report.top_k_overlap >= 0.0 && report.top_k_overlap <= 1.0);
         assert!(report.rerank_latency_us < 10_000); // should be fast
+    }
+
+    #[test]
+    fn test_concept_rerank_no_coverage_skipped() {
+        let mut matched: Vec<(f32, Record)> = (0..5)
+            .map(|i| {
+                let mut r = Record::new(format!("rec_{}", i), Level::Working);
+                r.id = format!("r{}", i);
+                (0.90 - i as f32 * 0.02, r)
+            })
+            .collect();
+
+        let engine = ConceptEngine::new();
+        let report = apply_concept_rerank(&mut matched, &engine, 10);
+
+        assert!(!report.was_applied);
+        assert_eq!(report.skip_reason, "no concept coverage");
+        assert!((matched[0].0 - 0.90).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_concept_rerank_limited_is_active_and_bounded() {
+        let mut r0 = Record::new("a".into(), Level::Working);
+        r0.id = "r0".to_string();
+        let mut r1 = Record::new("b".into(), Level::Working);
+        r1.id = "r1".to_string();
+        let mut r2 = Record::new("c".into(), Level::Working);
+        r2.id = "r2".to_string();
+        let mut r3 = Record::new("d".into(), Level::Working);
+        r3.id = "r3".to_string();
+
+        let mut matched = vec![(0.500, r0), (0.497, r1), (0.30, r2), (0.20, r3)];
+        let engine = make_concept_engine_with_records(&[("r1", ConceptState::Stable, 0.90)]);
+
+        let report = apply_concept_rerank(&mut matched, &engine, 10);
+
+        assert!(report.was_applied);
+        assert_eq!(
+            matched[0].1.id, "r1",
+            "stable concept member should be promoted"
+        );
+        assert_eq!(matched[1].1.id, "r0");
+
+        let r1_score = matched.iter().find(|(_, r)| r.id == "r1").unwrap().0;
+        assert!(
+            (r1_score - 0.51688).abs() < 0.001,
+            "expected bounded concept rerank score, got {}",
+            r1_score
+        );
+        assert!(report.records_moved >= 2);
+        assert!((report.concept_coverage - 0.25).abs() < 0.01);
     }
 
     #[test]

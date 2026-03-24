@@ -275,6 +275,8 @@ pub struct ConceptPhaseReport {
     pub tanimoto_avg: f32,
     /// Avg centroid size (bits).
     pub avg_centroid_size: f32,
+    /// Seeds dropped due to MAX_PARTITION_SIZE cap.
+    pub seeds_capped: usize,
 }
 
 /// Causal phase report — causal pattern discovery stats from a single maintenance cycle.
@@ -335,6 +337,74 @@ pub struct PolicyPhaseReport {
     pub rejected_hints: usize,
     /// Average policy_strength across all hints.
     pub avg_policy_strength: f32,
+}
+
+/// Single feedback audit event emitted by the belief feedback pass.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default)]
+pub struct FeedbackAuditEntry {
+    pub belief_id: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub reason: String,
+    pub delta_requested: f32,
+    pub delta_applied: f32,
+    pub confidence_before: f32,
+    pub confidence_after: f32,
+    pub volatility_before: f32,
+    pub volatility_after: f32,
+    pub volatility_delta_applied: f32,
+    pub stability_before: f32,
+    pub stability_after: f32,
+    pub stability_delta_applied: f32,
+}
+
+/// Feedback audit summary for a maintenance cycle.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default)]
+pub struct FeedbackAuditReport {
+    pub beliefs_touched: usize,
+    pub beliefs_boosted: usize,
+    pub beliefs_dampened: usize,
+    pub net_confidence_delta: f32,
+    pub net_volatility_delta: f32,
+    pub entries: Vec<FeedbackAuditEntry>,
+}
+
+/// Persisted bounded maintenance trend snapshot for one cycle.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MaintenanceTrendSnapshot {
+    pub timestamp: String,
+    pub total_records: usize,
+    pub records_archived: usize,
+    pub insights_found: usize,
+    pub volatile_records: usize,
+    pub belief_churn: f32,
+    pub causal_rejection_rate: f32,
+    pub policy_suppression_rate: f32,
+    pub feedback_beliefs_touched: usize,
+    pub feedback_net_confidence_delta: f32,
+    pub feedback_net_volatility_delta: f32,
+    pub correction_events: usize,
+    pub cumulative_corrections: usize,
+    pub cycle_time_ms: f64,
+    pub dominant_phase: String,
+}
+
+/// Bounded trend summary across recent maintenance cycles.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MaintenanceTrendSummary {
+    pub snapshot_count: usize,
+    pub recent: Vec<MaintenanceTrendSnapshot>,
+    pub avg_belief_churn: f32,
+    pub avg_causal_rejection_rate: f32,
+    pub avg_policy_suppression_rate: f32,
+    pub avg_cycle_time_ms: f64,
+    pub avg_correction_events: f32,
+    pub total_corrections_in_window: usize,
+    pub latest_dominant_phase: String,
 }
 
 /// Per-phase timing in milliseconds.
@@ -483,6 +553,66 @@ pub struct ConceptSurfaceTelemetry {
     pub record_annotations_returned_since_last_cycle: u64,
 }
 
+/// Single bounded reflection finding emitted during maintenance.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ReflectionFinding {
+    pub kind: String,
+    pub namespace: String,
+    pub title: String,
+    pub detail: String,
+    pub related_ids: Vec<String>,
+    pub score: f32,
+    pub severity: String,
+}
+
+/// Compact report about reflection jobs executed in one cycle.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ReflectionJobReport {
+    pub jobs_run: usize,
+    pub blocker_findings: usize,
+    pub contradiction_findings: usize,
+    pub trend_findings: usize,
+    pub total_findings: usize,
+    pub capped: bool,
+}
+
+/// Aggregated rollup for one reflection finding kind across recent summaries.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ReflectionKindSummary {
+    pub kind: String,
+    pub count: usize,
+    pub high_severity_count: usize,
+    pub avg_score: f32,
+}
+
+/// Bounded maintenance-time synthesis summary over one cycle.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ReflectionSummary {
+    pub timestamp: String,
+    pub digest: String,
+    pub dominant_phase: String,
+    pub report: ReflectionJobReport,
+    pub findings: Vec<ReflectionFinding>,
+}
+
+/// Aggregated digest across recent reflection summaries.
+#[cfg_attr(feature = "python", pyclass(get_all))]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ReflectionDigest {
+    pub summary_count: usize,
+    pub total_findings: usize,
+    pub high_severity_findings: usize,
+    pub latest_timestamp: String,
+    pub latest_dominant_phase: String,
+    pub kinds: Vec<ReflectionKindSummary>,
+    pub namespaces: Vec<String>,
+    pub top_findings: Vec<ReflectionFinding>,
+}
+
 /// Full maintenance cycle report.
 #[cfg_attr(feature = "python", pyclass(get_all))]
 #[derive(Debug, Clone)]
@@ -496,17 +626,24 @@ pub struct MaintenanceReport {
     pub concept: ConceptPhaseReport,
     pub causal: CausalPhaseReport,
     pub policy: PolicyPhaseReport,
+    pub feedback: FeedbackAuditReport,
     pub consolidation: ConsolidationReport,
     pub cross_connections: usize,
     pub task_reminders: Vec<String>,
     pub records_archived: usize,
     pub total_records: usize,
+    /// Phase 3.6: records injected from the experience queue this cycle.
+    pub experience_injected: usize,
     /// Per-phase timing breakdown.
     pub timings: PhaseTimings,
     /// Cross-cycle identity stability.
     pub stability: LayerStability,
     /// Audit/telemetry for the bounded concept inspection surface.
     pub concept_surface: ConceptSurfaceTelemetry,
+    /// Bounded maintenance-time synthesis emitted for this cycle.
+    pub reflection: ReflectionSummary,
+    /// Bounded trend summary across recent maintenance cycles.
+    pub trend_summary: MaintenanceTrendSummary,
     /// Scalability-oriented load and hot-spot accounting.
     pub hotspots: MaintenanceHotspots,
 }
@@ -887,15 +1024,24 @@ pub fn check_scheduled_tasks(records: &HashMap<String, Record>, task_tag: &str) 
         let description = rec.metadata.get("description").unwrap_or(&rec.content);
 
         if due_naive == now_naive {
-            reminders.push(format!("Due today: {}", description));
+            reminders.push((0u8, rec.salience, format!("Due today: {}", description)));
         } else if due_naive == tomorrow_naive {
-            reminders.push(format!("Due tomorrow: {}", description));
+            reminders.push((1u8, rec.salience, format!("Due tomorrow: {}", description)));
         } else if due_naive < now_naive {
-            reminders.push(format!("Overdue: {} (was due {})", description, due_naive));
+            reminders.push((
+                0u8,
+                rec.salience + 0.25,
+                format!("Overdue: {} (was due {})", description, due_naive),
+            ));
         }
     }
 
-    reminders
+    reminders.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    reminders.into_iter().map(|(_, _, text)| text).collect()
 }
 
 /// Phase 7: Archive old transient records.
@@ -938,6 +1084,9 @@ pub fn archive_old_records(
             if ts.is_empty() || ts.as_str() < cutoff.as_str() {
                 // Check archive protection
                 if let Some(rec) = records.get(id) {
+                    if rec.salience >= 0.70 {
+                        continue;
+                    }
                     if !crate::guards::is_archive_protected(&rec.tags, taxonomy) {
                         records.remove(id);
                         total_archived += 1;
@@ -970,6 +1119,7 @@ pub fn archive_old_records(
                     .unwrap_or("");
                 completed_at.is_empty() || completed_at < cutoff.as_str()
             })
+            .filter(|r| r.salience < 0.70)
             .map(|r| r.id.clone())
             .collect();
 
@@ -1040,6 +1190,179 @@ impl Drop for BackgroundBrain {
     }
 }
 
+// ── Phase 2.2: Autonomous Experience Loop ────────────────────────────────────
+
+/// Configuration for the autonomous experience loop.
+///
+/// The loop drains `ExperienceCapture`s queued by `ingest_experience_batch()`
+/// and runs `run_maintenance()` so they enter the full cognitive cycle.
+#[derive(Debug, Clone)]
+pub struct ExperienceLoopConfig {
+    /// How often to drain the queue and run maintenance (seconds).
+    /// Default: 120.
+    pub interval_secs: u64,
+    /// If true, run maintenance even when the queue is empty (keeps the
+    /// cognitive cycle alive for decay/reflect/etc.).  Default: false.
+    pub run_maintenance_when_idle: bool,
+    /// Maximum number of maintenance cycles.  0 = unlimited.  Default: 0.
+    pub max_cycles: u64,
+}
+
+impl Default for ExperienceLoopConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: 120,
+            run_maintenance_when_idle: false,
+            max_cycles: 0,
+        }
+    }
+}
+
+/// Telemetry emitted each time the experience loop runs a cycle.
+#[derive(Debug, Clone, Default)]
+pub struct ExperienceLoopCycleStat {
+    pub cycle: u64,
+    pub captures_drained: usize,
+    pub experience_injected: usize,
+    pub maintenance_ran: bool,
+}
+
+/// Handle to a running autonomous experience loop thread.
+///
+/// Drop or call `stop()` to shut down the loop gracefully.
+pub struct ExperienceLoopHandle {
+    running: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    /// Incrementing counter of completed cycles.
+    pub cycle_count: Arc<AtomicU64>,
+}
+
+impl ExperienceLoopHandle {
+    /// Is the loop thread currently running?
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    /// Total cycles completed since the loop started.
+    pub fn cycles(&self) -> u64 {
+        self.cycle_count.load(Ordering::Relaxed)
+    }
+
+    /// Signal the loop to stop and wait for the thread to exit.
+    pub fn stop(mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for ExperienceLoopHandle {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Spawn the autonomous experience loop on a background thread.
+///
+/// The loop:
+/// 1. Sleeps `config.interval_secs`.
+/// 2. Drains the experience queue (`drain_experience_queue()`).
+/// 3. If captures were drained (or `run_maintenance_when_idle`), calls
+///    `run_maintenance()`.
+/// 4. Logs a `ExperienceLoopCycleStat` via `tracing::debug!`.
+/// 5. Repeats until stopped or `max_cycles` reached.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::sync::Arc;
+/// use aura::Aura;
+/// use aura::background_brain::{ExperienceLoopConfig, start_experience_loop};
+///
+/// let aura = Arc::new(Aura::open("/tmp/my_aura").unwrap());
+/// aura.set_plasticity_mode(aura::experience::PlasticityMode::Limited);
+///
+/// let handle = start_experience_loop(Arc::clone(&aura), ExperienceLoopConfig::default());
+///
+/// // ... agent work — captures are automatically processed in the background ...
+///
+/// handle.stop();
+/// ```
+pub fn start_experience_loop(
+    aura: Arc<crate::aura::Aura>,
+    config: ExperienceLoopConfig,
+) -> ExperienceLoopHandle {
+    let running = Arc::new(AtomicBool::new(true));
+    let cycle_count = Arc::new(AtomicU64::new(0));
+
+    let running_clone = Arc::clone(&running);
+    let cycle_count_clone = Arc::clone(&cycle_count);
+
+    let thread = std::thread::spawn(move || {
+        let interval = std::time::Duration::from_secs(config.interval_secs);
+        let mut cycles_done: u64 = 0;
+
+        loop {
+            // Sleep before each cycle (interruptible by stop()).
+            // With interval_secs==0 this is a no-op — the loop fires immediately.
+            let sleep_step = std::time::Duration::from_millis(100);
+            let mut slept = std::time::Duration::ZERO;
+            while slept < interval && running_clone.load(Ordering::Relaxed) {
+                std::thread::sleep(sleep_step);
+                slept += sleep_step;
+            }
+
+            // If stop() was called during sleep AND we are not in bounded mode,
+            // exit without doing work.  In bounded mode (max_cycles > 0) we always
+            // complete the remaining cycles — stop() only prevents new cycles
+            // beyond the bound.
+            let is_bounded = config.max_cycles > 0;
+            if !running_clone.load(Ordering::Relaxed) && !is_bounded {
+                break;
+            }
+
+            let captures_drained = aura.experience_queue_len();
+            let should_run = captures_drained > 0 || config.run_maintenance_when_idle;
+
+            let experience_injected = if should_run {
+                let report = aura.run_maintenance();
+                report.experience_injected
+            } else {
+                0
+            };
+
+            cycles_done += 1;
+            cycle_count_clone.store(cycles_done, Ordering::Relaxed);
+
+            tracing::debug!(
+                cycle = cycles_done,
+                captures_drained,
+                experience_injected,
+                maintenance_ran = should_run,
+                "ExperienceLoop: cycle complete"
+            );
+
+            // Exit after max_cycles, or if stop() was called (unbounded mode).
+            let hit_max = is_bounded && cycles_done >= config.max_cycles;
+            if hit_max || !running_clone.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+
+        running_clone.store(false, Ordering::Relaxed);
+    });
+
+    ExperienceLoopHandle {
+        running,
+        cycle_count,
+        thread: Some(thread),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1099,6 +1422,52 @@ mod tests {
         let archived = archive_old_records(&mut records, &config, &taxonomy);
         assert_eq!(archived, 1);
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn test_high_salience_record_resists_archival() {
+        let config = MaintenanceConfig::default();
+        let taxonomy = TagTaxonomy::default();
+        let mut records = HashMap::new();
+
+        let mut r = Record::new("critical cached result".into(), Level::Working);
+        r.tags.push("web-search-cache".into());
+        r.salience = 0.9;
+        r.metadata
+            .insert("timestamp".into(), "2020-01-01T00:00:00Z".into());
+        records.insert(r.id.clone(), r);
+
+        let archived = archive_old_records(&mut records, &config, &taxonomy);
+        assert_eq!(archived, 0);
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn test_scheduled_task_reminders_prioritize_salience_within_same_urgency() {
+        let mut records = HashMap::new();
+        let due_today = chrono::Utc::now().date_naive().to_string();
+
+        let mut low = Record::new("low salience task".into(), Level::Working);
+        low.tags.push("scheduled-task".into());
+        low.salience = 0.1;
+        low.metadata.insert("status".into(), "active".into());
+        low.metadata.insert("due_date".into(), due_today.clone());
+        low.metadata.insert("description".into(), "Low".into());
+
+        let mut high = Record::new("high salience task".into(), Level::Working);
+        high.tags.push("scheduled-task".into());
+        high.salience = 0.9;
+        high.metadata.insert("status".into(), "active".into());
+        high.metadata.insert("due_date".into(), due_today);
+        high.metadata.insert("description".into(), "High".into());
+
+        records.insert(low.id.clone(), low);
+        records.insert(high.id.clone(), high);
+
+        let reminders = check_scheduled_tasks(&records, "scheduled-task");
+        assert_eq!(reminders.len(), 2);
+        assert!(reminders[0].contains("High"));
+        assert!(reminders[1].contains("Low"));
     }
 
     #[test]

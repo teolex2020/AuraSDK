@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "aura-memory"
-version = "1.5.3"
+version = "1.5.4"
 authors = [{name = "Alexander Tepliuk", email = "aura@aurasdk.dev"}]
 description = "Adaptive cognitive layer for AI agents. Sub-millisecond recall, zero LLM calls, pure Rust."
 readme = "README.md"

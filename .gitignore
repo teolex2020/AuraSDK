@@ -54,6 +54,10 @@ aura-server-bin/
 # Runtime brain data
 aura_brain/
 
+# Architecture diagram + roadmap (internal)
+ARCHITECTURE.md
+ROADMAP.md
+
 # Internal docs (not for public)
 SPEC.md
 docs/
@@ -73,9 +77,11 @@ LAUNCH.md
 COMMERCIAL_NOTES.md
 COGNITIVE_ROADMAP.md
 V2_POSITIONING.md
+V5_ROADMAP.md
 COMMERCIAL.md
 MONETIZATION.md
 RELEASE_PROTOCOL_PRIVATE.md
+POSITIONING_PRIVATE.md
 plans/
 reports/
 tests/

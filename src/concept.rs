@@ -52,6 +52,11 @@ const CANDIDATE_THRESHOLD: f32 = 0.50;
 /// from cross-topic (0.00-0.08).
 const CANONICAL_SIMILARITY_THRESHOLD: f32 = 0.12;
 
+/// Maximum seeds per partition before capping.
+/// Keeps per-partition pairwise comparison cost at most O(80²/2) = 3160 pairs.
+/// When exceeded, the most stable seeds are retained (stability desc, then id asc).
+const MAX_PARTITION_SIZE: usize = 80;
+
 // ── ConceptSimilarityMode ──
 
 /// Controls how beliefs are clustered into concepts.
@@ -133,17 +138,19 @@ impl Default for ConceptUnionMode {
 
 // —— ConceptSurfaceMode ——
 
-/// Controls whether bounded surfaced concept output is exposed at runtime.
+/// Controls whether bounded concept surfaces and bounded concept reranking are
+/// exposed at runtime.
 ///
 /// This is a runtime rollout control only. It does not affect concept
-/// discovery, recall ranking, compression, or behavior.
+/// discovery or compression. In `Limited` mode it does apply bounded concept
+/// reranking during recall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConceptSurfaceMode {
-    /// Default-safe: no surfaced concept output.
+    /// Default-safe: no surfaced concept output and no concept reranking.
     Off,
     /// Allow bounded inspection-only surfaced concepts.
     Inspect,
-    /// Reserved for future controlled promotion work. Not active yet.
+    /// Allow bounded surfaced concepts plus bounded concept-aware reranking.
     Limited,
 }
 
@@ -253,6 +260,8 @@ pub struct ConceptReport {
     pub tanimoto_p95: f32,
     /// Average centroid size (number of bits).
     pub avg_centroid_size: f32,
+    /// Seeds dropped due to MAX_PARTITION_SIZE cap across all partitions.
+    pub seeds_capped: usize,
 }
 
 // ── ConceptEngine ──
@@ -295,7 +304,7 @@ impl ConceptEngine {
             concepts: HashMap::new(),
             key_index: HashMap::new(),
             seed_mode: ConceptSeedMode::Standard,
-            similarity_mode: ConceptSimilarityMode::SdrTanimoto,
+            similarity_mode: ConceptSimilarityMode::CanonicalFeature,
             partition_mode: ConceptPartitionMode::Standard,
             union_mode: ConceptUnionMode::Standard,
         }
@@ -307,7 +316,7 @@ impl ConceptEngine {
             concepts: HashMap::new(),
             key_index: HashMap::new(),
             seed_mode: mode,
-            similarity_mode: ConceptSimilarityMode::SdrTanimoto,
+            similarity_mode: ConceptSimilarityMode::CanonicalFeature,
             partition_mode: ConceptPartitionMode::Standard,
             union_mode: ConceptUnionMode::Standard,
         }
@@ -421,11 +430,45 @@ impl ConceptEngine {
             ConceptSimilarityMode::CanonicalFeature => CANONICAL_SIMILARITY_THRESHOLD,
         };
 
-        for (partition_key, partition_seeds) in &partitions {
-            if partition_seeds.len() < 2 {
+        for (partition_key, partition_seeds_raw) in &partitions {
+            if partition_seeds_raw.len() < 2 {
                 // Single-belief partitions can't form concepts
                 continue;
             }
+
+            // Cap partition size to keep O(n²) pairwise cost bounded.
+            // When over the limit, retain the most stable seeds (stability desc,
+            // then id asc for determinism). Record dropped count for telemetry.
+            let partition_seeds_owned;
+            let partition_seeds: &Vec<String> = if partition_seeds_raw.len() > MAX_PARTITION_SIZE {
+                let dropped = partition_seeds_raw.len() - MAX_PARTITION_SIZE;
+                report.seeds_capped += dropped;
+                let mut ranked: Vec<(f32, &String)> = partition_seeds_raw
+                    .iter()
+                    .map(|bid| {
+                        let stability = belief_engine
+                            .beliefs
+                            .get(bid)
+                            .map_or(0.0, |b| b.stability);
+                        (stability, bid)
+                    })
+                    .collect();
+                // Sort descending by stability, then ascending by id for determinism.
+                ranked.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.cmp(b.1))
+                });
+                partition_seeds_owned = ranked
+                    .into_iter()
+                    .take(MAX_PARTITION_SIZE)
+                    .map(|(_, bid)| bid.clone())
+                    .collect::<Vec<_>>();
+                &partition_seeds_owned
+            } else {
+                partition_seeds_raw
+            };
+
             report.partitions_with_multiple_seeds += 1;
             report
                 .multi_seed_partition_sizes
@@ -563,11 +606,17 @@ impl ConceptEngine {
                 cluster_beliefs.len(),
             );
 
-            // Determine namespace and semantic_type from first belief's key.
+            // Determine namespace and semantic_type from first belief's key
+            // (sorted ascending by key to ensure deterministic identity across
+            // cycles — HashMap iteration order is non-deterministic).
             // Normalize away belief subcluster suffixes like `decision#3` so
             // concept identity does not drift with lower-layer subcluster slot
             // numbering.
-            let first_key = &cluster_beliefs[0].key;
+            let first_key = cluster_beliefs
+                .iter()
+                .map(|b| &b.key)
+                .min()
+                .expect("cluster non-empty");
             let (namespace, semantic_type) = parse_belief_key_ns_st(first_key);
 
             // Compute metrics (Phase D)
@@ -1136,12 +1185,11 @@ impl ConceptStore {
         }
     }
 
-    /// Load concept engine state from disk (inspection/debugging only).
+    /// Load concept engine state from disk.
     ///
-    /// NOTE: Aura startup does NOT call this — it always creates a fresh
-    /// ConceptEngine. This method exists for external tooling, CLI inspection,
-    /// and the round-trip test. The loaded state is always stale until the
-    /// next maintenance cycle rebuilds it.
+    /// Called on Aura startup. If concepts.cog is missing or empty, returns a
+    /// fresh empty ConceptEngine (same fallback behaviour as beliefs.cog).
+    /// The loaded state reflects the last completed maintenance cycle.
     pub fn load(&self) -> anyhow::Result<ConceptEngine> {
         let file_path = self.path.join("concepts.cog");
         if !file_path.exists() {

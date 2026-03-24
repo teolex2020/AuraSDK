@@ -41,6 +41,13 @@ pub enum AuditAction {
         source_ids: Vec<String>,
         result_id: String,
     },
+    /// Manual or explicit epistemic correction
+    Correction {
+        target_kind: String,
+        target_id: String,
+        operation: String,
+        reason: String,
+    },
     /// Data flushed to disk
     Flush,
     /// Memory closed
@@ -216,6 +223,25 @@ impl AuditLog {
             AuditAction::Synthesize {
                 source_ids,
                 result_id: result_id.to_string(),
+            },
+            None,
+        )
+    }
+
+    /// Log a targeted correction operation.
+    pub fn log_correction(
+        &self,
+        target_kind: &str,
+        target_id: &str,
+        operation: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.log(
+            AuditAction::Correction {
+                target_kind: target_kind.to_string(),
+                target_id: target_id.to_string(),
+                operation: operation.to_string(),
+                reason: reason.to_string(),
             },
             None,
         )

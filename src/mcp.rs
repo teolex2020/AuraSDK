@@ -117,6 +117,106 @@ pub struct SearchParams {
     semantic_type: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct CrossNamespaceDigestParams {
+    /// Optional subset of namespaces to include. Omit for all namespaces.
+    namespaces: Option<Vec<String>>,
+    /// Maximum concepts returned per namespace. Clamped to 1..10.
+    top_concepts_limit: Option<usize>,
+    /// Minimum record count required for a namespace to appear.
+    min_record_count: Option<usize>,
+    /// Minimum pairwise similarity required for a pair entry to appear.
+    pairwise_similarity_threshold: Option<f32>,
+    /// Which dimensions to include. Supported: concepts,tags,structural,causal,belief_states,corrections.
+    include_dimensions: Option<Vec<String>>,
+    /// When true, omit bulky detail lists while keeping summaries and scores.
+    compact_summary: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExplainRecordParams {
+    /// Record ID to explain.
+    record_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExplainRecallParams {
+    /// Natural-language query to explain.
+    query: String,
+    /// Maximum number of results to explain.
+    top_k: Option<usize>,
+    /// Minimum record strength required for inclusion.
+    min_strength: Option<f32>,
+    /// Whether graph/context expansion is enabled.
+    expand_connections: Option<bool>,
+    /// Namespace to search in (default: "default").
+    namespace: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CorrectionLogParams {
+    /// Optional target kind filter: belief, causal_pattern, policy_hint, record.
+    target_kind: Option<String>,
+    /// Optional target ID filter; only applied together with target_kind.
+    target_id: Option<String>,
+    /// Maximum entries returned, newest first.
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CorrectionReviewQueueParams {
+    /// Maximum review candidates returned, ordered by priority.
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ContradictionReviewQueueParams {
+    /// Optional namespace filter.
+    namespace: Option<String>,
+    /// Maximum review candidates returned, ordered by priority.
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SuggestedCorrectionsParams {
+    /// Maximum suggested corrections returned, ordered by priority.
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct NamespaceGovernanceParams {
+    /// Optional subset of namespaces to include. Omit for all namespaces.
+    namespaces: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PolicyLifecycleParams {
+    /// Optional namespace filter for list-style policy tools.
+    namespace: Option<String>,
+    /// Maximum number of returned items.
+    limit: Option<usize>,
+    /// Maximum action summary rows.
+    action_limit: Option<usize>,
+    /// Maximum domain summary rows.
+    domain_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BeliefInstabilityParams {
+    /// Minimum volatility threshold for high-volatility beliefs.
+    min_volatility: Option<f32>,
+    /// Maximum stability threshold for low-stability beliefs.
+    max_stability: Option<f32>,
+    /// Maximum number of returned items.
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MemoryHealthParams {
+    /// Maximum top issues returned.
+    limit: Option<usize>,
+}
+
 // ── Helper ──
 
 fn parse_level(s: &str) -> Option<Level> {
@@ -357,6 +457,228 @@ impl AuraMcpServer {
     async fn insights(&self) -> Result<CallToolResult, McpError> {
         let stats = self.brain.stats();
         let json = serde_json::to_string(&stats).map_err(|e| err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Return a read-only digest across namespaces: top concepts, shared tags, structural overlap, and canonical causal-signature overlap."
+    )]
+    async fn cross_namespace_digest(
+        &self,
+        Parameters(p): Parameters<CrossNamespaceDigestParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let namespaces_ref = p
+            .namespaces
+            .as_ref()
+            .map(|items| items.iter().map(String::as_str).collect::<Vec<_>>());
+        let include_dimensions_ref = p
+            .include_dimensions
+            .as_ref()
+            .map(|items| items.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut options = crate::aura::CrossNamespaceDigestOptions {
+            min_record_count: p.min_record_count.unwrap_or(1),
+            top_concepts_limit: p.top_concepts_limit.unwrap_or(5).clamp(1, 10),
+            pairwise_similarity_threshold: p
+                .pairwise_similarity_threshold
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
+            compact_summary: p.compact_summary.unwrap_or(false),
+            ..crate::aura::CrossNamespaceDigestOptions::default()
+        };
+        crate::aura::apply_cross_namespace_dimension_flags(
+            &mut options,
+            include_dimensions_ref.as_deref(),
+        );
+        let digest = self
+            .brain
+            .cross_namespace_digest_with_options(namespaces_ref.as_deref(), options);
+        let json = serde_json::to_string(&digest).map_err(|e| err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Explain one record through belief, concept, causal, and policy provenance. Use for operator debugging of a specific memory item."
+    )]
+    async fn explain_record(
+        &self,
+        Parameters(p): Parameters<ExplainRecordParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let item = self
+            .brain
+            .explain_record(&p.record_id)
+            .ok_or_else(|| err(format!("record not found: {}", p.record_id)))?;
+        let json = serde_json::to_string(&item).map_err(|e| err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Explain recall scoring and provenance for a query. Returns bounded trace-scoring output for the retrieved results."
+    )]
+    async fn explain_recall(
+        &self,
+        Parameters(p): Parameters<ExplainRecallParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ns_vec: Option<Vec<&str>> = p.namespace.as_ref().map(|s| vec![s.as_str()]);
+        let ns_slice: Option<&[&str]> = ns_vec.as_deref();
+        let explanation = self.brain.explain_recall(
+            &p.query,
+            p.top_k,
+            p.min_strength,
+            p.expand_connections,
+            ns_slice,
+        );
+        let json = serde_json::to_string(&explanation).map_err(|e| err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Return one bounded explainability bundle for a record: direct explanation, provenance chain, correction excerpts, instability, and maintenance-trend summary."
+    )]
+    async fn explainability_bundle(
+        &self,
+        Parameters(p): Parameters<ExplainRecordParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let bundle = self
+            .brain
+            .explainability_bundle(&p.record_id)
+            .ok_or_else(|| err(format!("record not found: {}", p.record_id)))?;
+        let json = serde_json::to_string(&bundle).map_err(|e| err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Read correction-log entries globally or for a specific target. Use to audit manual deprecations, invalidations, and retractions."
+    )]
+    async fn correction_log(
+        &self,
+        Parameters(p): Parameters<CorrectionLogParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let max = p.limit.unwrap_or(50).min(200);
+        let mut entries = if let (Some(target_kind), Some(target_id)) =
+            (p.target_kind.as_deref(), p.target_id.as_deref())
+        {
+            self.brain
+                .get_correction_log_for_target(target_kind, target_id)
+        } else {
+            self.brain.get_correction_log()
+        };
+        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        entries.truncate(max);
+        let json = serde_json::to_string(&entries).map_err(|e| err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Return a prioritized correction review queue using recency, repeated corrections, and downstream causal/policy impact."
+    )]
+    async fn correction_review_queue(
+        &self,
+        Parameters(p): Parameters<CorrectionReviewQueueParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let queue = self.brain.get_correction_review_queue(p.limit);
+        let json = serde_json::to_string(&queue).map_err(|e| err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Return a prioritized contradiction review queue using unstable belief clusters, conflict mass, and downstream causal/policy impact."
+    )]
+    async fn contradiction_review_queue(
+        &self,
+        Parameters(p): Parameters<ContradictionReviewQueueParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let queue = self
+            .brain
+            .get_contradiction_review_queue(p.namespace.as_deref(), p.limit);
+        let json = serde_json::to_string(&queue).map_err(|e| err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Return advisory suggested corrections without auto-application. Uses instability, rejected causal patterns, suppressed policy hints, and review pressure."
+    )]
+    async fn suggested_corrections(
+        &self,
+        Parameters(p): Parameters<SuggestedCorrectionsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let report = self.brain.get_suggested_corrections_report(p.limit);
+        let json = serde_json::to_string(&report).map_err(|e| err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Return read-only per-namespace governance summaries: record count, belief count, correction pressure, instability level, and latest maintenance cycle."
+    )]
+    async fn namespace_governance_status(
+        &self,
+        Parameters(p): Parameters<NamespaceGovernanceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let namespaces_ref = p
+            .namespaces
+            .as_ref()
+            .map(|items| items.iter().map(String::as_str).collect::<Vec<_>>());
+        let statuses = self
+            .brain
+            .get_namespace_governance_status_filtered(namespaces_ref.as_deref());
+        let json = serde_json::to_string(&statuses).map_err(|e| err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Return bounded policy lifecycle summaries and advisory-pressure areas for operator inspection."
+    )]
+    async fn policy_lifecycle(
+        &self,
+        Parameters(p): Parameters<PolicyLifecycleParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let summary = self
+            .brain
+            .get_policy_lifecycle_summary(p.action_limit, p.domain_limit);
+        let pressure = self
+            .brain
+            .get_policy_pressure_report(p.namespace.as_deref(), p.limit);
+        let suppressed = self
+            .brain
+            .get_suppressed_policy_hints(p.namespace.as_deref(), p.limit);
+        let rejected = self
+            .brain
+            .get_rejected_policy_hints(p.namespace.as_deref(), p.limit);
+        let payload = serde_json::json!({
+            "summary": summary,
+            "pressure": pressure,
+            "suppressed": suppressed,
+            "rejected": rejected,
+        });
+        let json = serde_json::to_string(&payload).map_err(|e| err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Return bounded belief-instability inspection output: summary, high-volatility beliefs, low-stability beliefs, and recently corrected beliefs."
+    )]
+    async fn belief_instability(
+        &self,
+        Parameters(p): Parameters<BeliefInstabilityParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let payload = serde_json::json!({
+            "summary": self.brain.get_belief_instability_summary(),
+            "high_volatility": self.brain.get_high_volatility_beliefs(p.min_volatility, p.limit),
+            "low_stability": self.brain.get_low_stability_beliefs(p.max_stability, p.limit),
+            "recently_corrected": self.brain.get_recently_corrected_beliefs(p.limit),
+        });
+        let json = serde_json::to_string(&payload).map_err(|e| err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Return one compact operator-facing memory health digest: corrections, instability, policy pressure, startup recovery warnings, and maintenance trend direction."
+    )]
+    async fn memory_health(
+        &self,
+        Parameters(p): Parameters<MemoryHealthParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let digest = self.brain.get_memory_health_digest(p.limit);
+        let json = serde_json::to_string(&digest).map_err(|e| err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 

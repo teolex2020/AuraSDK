@@ -42,6 +42,9 @@ pub mod storage;
 mod types;
 pub mod versioning;
 
+// ── v5: Autonomous Cognitive Plasticity ──
+pub mod experience;
+
 #[cfg(feature = "encryption")]
 pub mod crypto;
 
@@ -82,6 +85,7 @@ pub mod crypto {
 }
 
 pub mod audit;
+mod aura_state;
 pub mod tenant;
 
 pub mod sync {
@@ -146,6 +150,7 @@ pub mod insights;
 pub mod levels;
 pub mod ngram;
 pub mod recall;
+mod recall_service;
 pub mod record;
 pub mod retention;
 pub mod scheduler;
@@ -166,7 +171,9 @@ pub mod trust;
 pub mod embedding;
 
 // ── Living Memory (Background Brain) ──
+pub mod api_groups;
 pub mod background_brain;
+mod maintenance_service;
 
 // ── Epistemic Belief Layer ──
 pub mod belief;
@@ -178,7 +185,10 @@ pub mod concept;
 pub mod causal;
 
 // ── Policy Hint Layer ──
+pub mod epistemic_runtime;
+pub mod persistence_contract;
 pub mod policy;
+pub mod startup_validation;
 
 // ── Main orchestrator (merges both) ──
 pub mod aura;
@@ -227,8 +237,29 @@ fn _core(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<background_brain::ConceptPhaseReport>()?;
     m.add_class::<background_brain::CausalPhaseReport>()?;
     m.add_class::<background_brain::PolicyPhaseReport>()?;
+    m.add_class::<background_brain::MaintenanceTrendSnapshot>()?;
+    m.add_class::<background_brain::MaintenanceTrendSummary>()?;
+    m.add_class::<background_brain::ReflectionFinding>()?;
+    m.add_class::<background_brain::ReflectionJobReport>()?;
+    m.add_class::<background_brain::ReflectionKindSummary>()?;
+    m.add_class::<background_brain::ReflectionDigest>()?;
+    m.add_class::<background_brain::ReflectionSummary>()?;
     m.add_class::<background_brain::PhaseTimings>()?;
     m.add_class::<background_brain::LayerStability>()?;
+    m.add_class::<persistence_contract::PersistenceManifest>()?;
+    m.add_class::<startup_validation::StartupValidationEvent>()?;
+    m.add_class::<startup_validation::StartupValidationReport>()?;
+    m.add_class::<aura::OperatorReviewIssue>()?;
+    m.add_class::<aura::MemoryHealthDigest>()?;
+    m.add_class::<aura::SalienceBands>()?;
+    m.add_class::<aura::SalienceSummary>()?;
+    m.add_class::<epistemic_runtime::BeliefVolatilityBands>()?;
+    m.add_class::<epistemic_runtime::BeliefInstabilitySummary>()?;
+    m.add_class::<epistemic_runtime::ContradictionCluster>()?;
+    m.add_class::<epistemic_runtime::PolicyActionSummary>()?;
+    m.add_class::<epistemic_runtime::PolicyDomainSummary>()?;
+    m.add_class::<epistemic_runtime::PolicyPressureArea>()?;
+    m.add_class::<epistemic_runtime::PolicyLifecycleSummary>()?;
     m.add_class::<concept::SurfacedConcept>()?;
     m.add_class::<policy::SurfacedPolicyHint>()?;
     m.add_class::<relation::StructuralRelation>()?;

@@ -1,8 +1,8 @@
 <p align="center">
   <h1 align="center">AuraSDK</h1>
-  <p align="center"><strong>Cognitive Layer That Makes Your AI Model Smarter Over Time</strong></p>
+  <p align="center"><strong>Local Cognitive Runtime For Frozen AI Models</strong></p>
   <p align="center">
-    Self-learning · No fine-tuning · No cloud training · <1ms recall · ~3 MB
+    Deterministic · No fine-tuning · No cloud training · <1ms recall · ~3 MB
   </p>
 </p>
 
@@ -24,9 +24,9 @@
 
 ---
 
-Your AI model is smart. But it forgets everything after every conversation — and it never gets smarter from experience.
+Your AI model is smart. But it forgets everything after every conversation.
 
-AuraSDK is a cognitive layer that runs alongside any LLM. It observes every interaction, builds beliefs from patterns, discovers causal relationships, and derives behavioral policies — all locally, without fine-tuning or cloud training. The longer it runs, the smarter your agent becomes.
+AuraSDK is a local cognitive runtime that runs alongside any frozen model. It gives agents durable memory, explainability, governed correction, bounded recall reranking, and bounded self-adaptation through experience — all locally, without fine-tuning or cloud training.
 
 ```bash
 pip install aura-memory
@@ -36,21 +36,21 @@ pip install aura-memory
 from aura import Aura, Level
 
 brain = Aura("./agent_memory")
-brain.enable_full_cognitive_stack()  # activate all 5 cognitive layers
+brain.enable_full_cognitive_stack()  # activate all four bounded reranking overlays
 
 # store what happens
 brain.store("User always deploys to staging first", level=Level.Domain, tags=["workflow"])
 brain.store("Staging deploy prevented 3 production incidents", level=Level.Domain, tags=["workflow"])
 
-# recall — cognitive layer automatically surfaces relevant patterns
+# recall — local retrieval with optional bounded cognitive reranking
 context = brain.recall("deployment decision")  # <1ms, no API call
 
-# after enough interactions, the system derives this on its own:
+# inspect advisory hints produced from stored evidence
 hints = brain.get_surfaced_policy_hints()
 # → [{"action": "Prefer", "domain": "workflow", "description": "deploy to staging first"}]
 ```
 
-No API keys. No embeddings. No cloud. The model stays the same — your agent gets smarter.
+No API keys. No embeddings required. No cloud. The model stays the same — the cognitive layer becomes more structured, more inspectable, and more useful over time.
 
 > **⭐ If AuraSDK is useful to you, a [GitHub star](https://github.com/teolex2020/AuraSDK) helps us get funding to continue development from Kyiv.**
 
@@ -61,8 +61,11 @@ No API keys. No embeddings. No cloud. The model stays the same — your agent ge
 | | **Aura** | Mem0 | Zep | Cognee | Letta/MemGPT |
 |---|---|---|---|---|---|
 | **Architecture** | **5-layer cognitive engine** | Vector + LLM | Vector + LLM | Graph + LLM | LLM orchestration |
-| **Self-learning without LLM** | **Yes — Belief→Causal→Policy** | No | No | No | No |
-| **Behavioral policies from experience** | **Yes — automatic** | No | No | No | No |
+| **Derived cognitive layers without LLM** | **Yes — Belief→Concept→Causal→Policy** | No | No | No | No |
+| **Advisory policy hints from experience** | **Yes — bounded and non-executing** | No | No | No | No |
+| **Learns from agent's own responses** | **Yes — bounded, auditable, no fine-tuning** | No | No | No | No |
+| **Salience weighting** | **Yes — what matters persists longer** | No | No | No | No |
+| **Contradiction governance** | **Yes — explicit, operator-visible** | No | No | No | No |
 | **LLM required** | **No** | Yes | Yes | Yes | Yes |
 | **Recall latency** | **<1ms** | ~200ms+ | ~200ms | LLM-bound | LLM-bound |
 | **Works offline** | **Fully** | Partial | No | No | With local LLM |
@@ -77,20 +80,21 @@ No API keys. No embeddings. No cloud. The model stays the same — your agent ge
 
 Fine-tuning costs thousands of dollars and weeks of work. RAG requires embeddings and a vector database. Context windows are expensive per token.
 
-Aura gives you a third path: **a cognitive layer that accumulates experience between conversations** — free, local, sub-millisecond.
+Aura gives you a third path: **a local cognitive runtime that accumulates structured experience between conversations** — free, local, sub-millisecond.
 
 ```
 Week 1: GPT-4o-mini + Aura                Week 1: GPT-4 alone
   → average answers                          → average answers
 
 Week 4: GPT-4o-mini + Aura                Week 4: GPT-4 alone
-  → knows your workflow                      → still forgets everything
+  → recalls your workflow                    → still forgets everything
   → surfaces patterns you repeat             → same cost per token
-  → warns before risky actions               → no improvement
+  → exposes explainability + correction      → no improvement
+  → boundedly adapts from experience         → no durable learning
   → $0 compute cost                          → still billing per call
 ```
 
-The model stays the same. The agent gets smarter. That's Aura.
+The model stays the same. The cognitive layer gets stronger. That's Aura.
 
 ### Performance
 
@@ -124,7 +128,7 @@ Or configure individual phases:
 
 ```python
 brain.set_belief_rerank_mode("limited")   # belief-aware ranking
-brain.set_concept_surface_mode("inspect") # concept annotations, no ranking change
+brain.set_concept_surface_mode("limited") # concept annotations + bounded concept reranking
 brain.set_causal_rerank_mode("limited")   # causal chain boost
 brain.set_policy_rerank_mode("limited")   # policy hint shaping
 ```
@@ -133,8 +137,44 @@ Higher layers also expose advisory surfaced output:
 
 - `get_surfaced_concepts()` — stable concept abstractions over repeated beliefs
 - `get_surfaced_causal_patterns()` — learned cause→effect patterns
-- `get_surfaced_policy_hints()` — behavioral recommendations (Prefer / Avoid / Warn)
+- `get_surfaced_policy_hints()` — advisory recommendations (Prefer / Avoid / Warn)
 - no automatic behavior influence — all output is advisory and read-only
+
+Aura also ships operator-facing and plasticity-facing surfaces:
+
+- explainability:
+  - `explain_recall()`
+  - `explain_record()`
+  - `provenance_chain()`
+  - `explainability_bundle()`
+- governed correction:
+  - targeted retract/deprecate APIs
+  - persistent correction log
+  - correction review queue
+  - suggested corrections without auto-apply
+- bounded autonomous plasticity:
+  - `capture_experience()`
+  - `ingest_experience_batch()`
+  - maintenance-phase integration
+  - anti-hallucination guards
+  - plasticity risk scoring
+  - purge / freeze controls
+- bounded v6 cognitive guidance:
+  - salience:
+    - `mark_record_salience()`
+    - `get_high_salience_records()`
+    - `get_salience_summary()`
+  - reflection:
+    - `get_reflection_summaries()`
+    - `get_latest_reflection_digest()`
+    - `get_reflection_digest()`
+  - contradiction and instability:
+    - `get_belief_instability_summary()`
+    - `get_contradiction_clusters()`
+    - `get_contradiction_review_queue()`
+  - honest explainability support:
+    - unresolved-evidence markers in recall explanations
+    - bounded answer-support phrasing for agent / UI layers
 
 ---
 
@@ -170,7 +210,7 @@ report = brain.run_maintenance()  # background memory maintenance
 
 ## Key Features
 
-**Core Memory Engine**
+**Core Cognitive Runtime**
 - **Fast Local Recall** - Multi-signal ranking with optional embedding support
 - **Two-Tier Memory** — Cognitive (ephemeral) + Core (permanent) with decay, promotion, and archival
 - **Semantic Memory Types** — 6 roles (`fact`, `decision`, `trend`, `preference`, `contradiction`, `serendipity`) that influence memory behavior and insighting
@@ -203,8 +243,21 @@ report = brain.run_maintenance()  # background memory maintenance
 
 **Advisory Cognitive Overlays**
 - **Belief-Aware Recall Rerank** — bounded production influence with strict guardrails
-- **Concept Inspect Surface** — surfaced concepts and per-record annotations for inspection only
+- **Concept Overlay** — surfaced concepts, per-record annotations, and optional bounded concept-aware reranking
 - **Causal / Policy Overlays** — advisory surfaced output only, no automatic control path
+- **Cross-Namespace Analytics** — read-only digest for tags, concepts, structural overlap, and canonical causal signatures across namespaces
+
+**Explainability & Governed Adaptation**
+- **Explainability APIs** — `explain_recall()`, `explain_record()`, `provenance_chain()`, `explainability_bundle()`
+- **Correction Governance** — correction log, correction review queue, suggested corrections, namespace governance status
+- **Autonomous Cognitive Plasticity** — extraction → ingest → maintenance loop for bounded self-adaptation without changing model weights
+- **Plasticity Safety Bounds** — generated-confidence ceiling, risk throttling, purge/freeze controls, operator-visible risk state
+
+**Cognitive Guidance**
+- **Salience Layer** — bounded significance weighting for preservation, reminders, ranking, and operator review
+- **Maintenance Reflection** — bounded reflection summaries and digests produced inside the normal maintenance pipeline
+- **Contradiction Governance** — instability summaries, contradiction clusters, and bounded operator review queues for unresolved evidence
+- **Honest Answer Support** — non-anthropomorphic phrasing hints for significance, uncertainty, contradiction, and reflection context
 
 ## Quick Start
 
@@ -288,6 +341,91 @@ brain.store("Test: user likes light mode", namespace="sandbox")
 # Recall only sees "default" namespace — sandbox is invisible
 results = brain.recall_structured("user preference", top_k=5)
 ```
+
+### Cross-Namespace Digest
+
+Use this when you need inspection-only analytics across isolated namespaces without changing recall behavior.
+
+```python
+brain = Aura("./data")
+
+digest = brain.cross_namespace_digest(
+    namespaces=["default", "sandbox"],
+    top_concepts_limit=3,
+)
+
+# Top concepts per namespace
+print(digest["namespaces"][0]["top_concepts"])
+
+# Pairwise overlap
+print(digest["pairs"][0]["shared_tags"])
+print(digest["pairs"][0]["shared_concept_signatures"])
+print(digest["pairs"][0]["shared_causal_signatures"])
+```
+
+HTTP server:
+
+```text
+GET /cross-namespace-digest?namespaces=default,sandbox&top_concepts_limit=3
+```
+
+MCP tool:
+
+```json
+{
+  "tool": "cross_namespace_digest",
+  "arguments": {
+    "namespaces": ["default", "sandbox"],
+    "top_concepts_limit": 3
+  }
+}
+```
+
+The digest is read-only. It does not bypass namespace isolation in recall and does not feed training or inference by default.
+
+For richer operator-facing workflows, see [`examples/V3_OPERATOR_WORKFLOWS.md`](examples/V3_OPERATOR_WORKFLOWS.md).
+
+### Autonomous Cognitive Plasticity
+
+Aura can also observe model output and feed bounded experience back into the cognitive substrate, without retraining the model.
+
+```python
+from aura import Aura
+
+brain = Aura("./data")
+brain.set_plasticity_mode("limited")
+
+capture = brain.capture_experience(
+    prompt="How should we deploy this release?",
+    retrieved_context=[],
+    model_response="Deploy to staging first, then verify health checks before production.",
+    session_id="deploy-session-1",
+    source="model_inference",
+)
+
+brain.ingest_experience_batch([capture])
+brain.run_maintenance()  # queued experience enters the normal cognitive pipeline
+```
+
+This stays bounded and operator-visible:
+
+- the model remains frozen
+- generated claims stay capped and guarded
+- adaptation can be inspected, restricted, purged, or frozen per namespace
+
+Recent operator HTTP endpoints:
+
+- `GET /explain-record`
+- `GET /explain-recall`
+- `GET /explainability-bundle`
+- `GET /correction-log`
+- `GET /cross-namespace-digest`
+- `GET /memory-health`
+- `GET /belief-instability`
+- `GET /policy-lifecycle`
+- `GET /correction-review-queue`
+- `GET /suggested-corrections`
+- `GET /namespace-governance-status`
 
 ---
 
@@ -380,6 +518,16 @@ Once connected, Claude automatically has 11 tools:
 
 > After connecting, tell Claude: *"Before answering, always recall relevant context from memory. After our conversation, store key facts."*
 
+### Windows test note
+
+If `cargo test` intermittently fails on Windows with `LNK1104` for `target\debug\deps\aura-...exe`, a stale test process is usually holding the file open. Run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\cleanup_windows_test_lock.ps1
+```
+
+Then rerun the test command.
+
 ---
 
 ## Dashboard UI
@@ -435,7 +583,7 @@ Publicly documented concepts are:
 - Trust, provenance, and namespace isolation
 - Maintenance, insights, consolidation, and versioning
 
-Higher cognitive layers may be present in the SDK as advisory inspection surfaces. They are not default runtime decision-making or behavior control.
+Higher cognitive layers may be present in the SDK as bounded reranking overlays and advisory inspection surfaces. They are not default runtime decision-making or behavior control.
 
 The public repository documents the user-facing behavior and integration surface. Detailed internal architecture, tuning, and research notes are intentionally not published.
 

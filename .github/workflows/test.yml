@@ -5,14 +5,40 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
 jobs:
+  rust-checks:
+    name: Rust Checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Cleanup stale Windows test locks
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\cleanup_windows_test_lock.ps1
+      - name: Cargo check
+        run: cargo check --lib --tests --no-default-features --features "encryption,audit"
+      - name: Cleanup stale Windows test locks (post)
+        if: always() && runner.os == 'Windows'
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\cleanup_windows_test_lock.ps1
+
   rust-tests:
-    name: Rust Tests
+    name: Rust Unit Tests (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -25,8 +51,26 @@ jobs:
         run: cargo test --lib --no-default-features --features "encryption,audit" --no-run 2>&1 | tail -5
       - name: Run library tests
         run: cargo test --lib --no-default-features --features "encryption,audit" -- --test-threads=2
-      - name: Cargo check
-        run: cargo check --no-default-features --features "encryption,audit"
+
+  rust-windows-smoke:
+    name: Rust Smoke (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Cleanup stale Windows test locks
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\cleanup_windows_test_lock.ps1
+      - name: Run bounded Windows smoke test
+        run: cargo test test_startup_validation_report_captures_recovery_fallbacks --lib --no-default-features --features "encryption,audit"
+      - name: Cleanup stale Windows test locks (post)
+        if: always()
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\cleanup_windows_test_lock.ps1
 
   python-tests:
     name: Python Tests (${{ matrix.os }}, ${{ matrix.python-version }})
@@ -54,6 +98,10 @@ jobs:
           python -m venv .venv
           .venv\Scripts\pip install maturin pytest pytest-timeout
         if: runner.os == 'Windows'
+      - name: Cleanup stale Windows test locks
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\cleanup_windows_test_lock.ps1
       - name: Build and install
         run: .venv/bin/maturin develop --release --features "pyo3/extension-module,encryption"
         if: runner.os != 'Windows'
@@ -68,3 +116,7 @@ jobs:
         run: |
           .venv\Scripts\python -c "from aura import Aura, Level; b = Aura('./ci_smoke_brain'); b.store('User prefers dark mode', level=Level.Identity, tags=['ui'], semantic_type='preference'); r = b.recall('dark mode'); assert r and 'dark mode' in r.lower()"
         if: runner.os == 'Windows'
+      - name: Cleanup stale Windows test locks (post)
+        if: always() && runner.os == 'Windows'
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\cleanup_windows_test_lock.ps1

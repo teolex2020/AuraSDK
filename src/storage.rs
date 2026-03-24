@@ -912,7 +912,16 @@ impl AuraStorage {
 impl Drop for AuraStorage {
     fn drop(&mut self) {
         if let Err(e) = self.close() {
-            eprintln!("AuraStorage: failed to close on drop: {}", e);
+            // os error 3 (path not found) is expected when a tempdir is dropped
+            // before the Aura instance — suppress it to avoid test noise.
+            let is_path_gone = e
+                .downcast_ref::<std::io::Error>()
+                .and_then(|io| io.raw_os_error())
+                .map(|code| code == 3)
+                .unwrap_or(false);
+            if !is_path_gone {
+                eprintln!("AuraStorage: failed to close on drop: {}", e);
+            }
         }
     }
 }

@@ -222,12 +222,23 @@ pub struct PolicyEngine {
 }
 
 impl PolicyEngine {
-    /// Create a fresh empty engine. Called on startup — never loaded from disk.
+    /// Create a fresh empty engine.
+    ///
+    /// Used when no persisted policy state exists or when loading fails.
     pub fn new() -> Self {
         Self {
             hints: HashMap::new(),
             key_index: HashMap::new(),
         }
+    }
+
+    /// Remove a single policy hint from the persisted engine state.
+    pub fn retract_hint(&mut self, hint_id: &str) -> bool {
+        let Some(hint) = self.hints.remove(hint_id) else {
+            return false;
+        };
+        self.key_index.remove(&hint.key);
+        true
     }
 
     /// Full rebuild: discover policy hints from causal patterns, concepts, and beliefs.
@@ -266,7 +277,8 @@ impl PolicyEngine {
                         && p.causal_strength >= MIN_CAUSAL_STRENGTH_FOR_SEED)
                     || (causal_engine.evidence_mode == CausalEvidenceMode::ExplicitTrusted
                         && p.explicit_support_count >= 1
-                        && p.state != CausalState::Rejected);
+                        && p.state != CausalState::Rejected
+                        && p.state != CausalState::Invalidated);
                 // In ExplicitTrusted mode a single explicit link bypasses the support count
                 // requirement — the user explicitly declared the causal relationship.
                 let support_ok = p.support_count >= MIN_CAUSAL_SUPPORT_FOR_SEED
@@ -817,8 +829,10 @@ fn truncate(s: &str, max_chars: usize) -> String {
 
 // ── PolicyStore ──
 
-/// Persistent store for policy hints. Write-only cache for debugging/inspection.
-/// Never loaded on startup.
+/// Persistent store for policy hints.
+///
+/// Policy hints are loaded on startup so advisory state survives restart and
+/// remains available before the next maintenance cycle.
 #[derive(Debug)]
 pub struct PolicyStore {
     path: std::path::PathBuf,
@@ -840,7 +854,9 @@ impl PolicyStore {
         Ok(())
     }
 
-    /// Load from disk. Inspection-only utility — NOT called on startup.
+    /// Load policy runtime state from disk for startup restore.
+    ///
+    /// If the file is absent, returns a fresh empty engine.
     pub fn load(&self) -> anyhow::Result<PolicyEngine> {
         let file_path = self.path.join("policies.cog");
         if !file_path.exists() {
@@ -1147,6 +1163,8 @@ mod tests {
             temporal_consistency: 0.9,
             outcome_stability: 0.8,
             causal_strength: strength,
+            invalidation_reason: None,
+            invalidated_at: None,
             state,
             last_updated: 0.0,
         }
