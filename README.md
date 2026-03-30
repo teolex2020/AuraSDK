@@ -429,6 +429,10 @@ Recent operator HTTP endpoints:
 
 ---
 
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/teolex2020-aurasdk).
+
 ## Cookbook: Personal Assistant That Remembers
 
 The killer use case: an agent that remembers your preferences after a week offline, with zero API calls.
