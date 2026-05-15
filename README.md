@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">AuraSDK</h1>
-  <p align="center"><strong>Local Cognitive Runtime For Frozen AI Models</strong></p>
+  <p align="center"><strong>AuraSDK turns fragile prompt-only agents into auditable, memory-aware, production-ready systems</strong></p>
   <p align="center">
     Deterministic · No fine-tuning · No cloud training · <1ms recall · ~3 MB
   </p>
